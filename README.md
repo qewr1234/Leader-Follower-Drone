@@ -214,19 +214,22 @@ C3(공중 착륙 판정) · C4(깊이 범위) · C6(PX4 경로) · H2(호버 정
 # 의존성 (requirements.txt 없음 — 수동 설치)
 pip install numpy opencv-python pymavlink ultralytics pyrealsense2 pyserial
 
-# 회귀 테스트 — numpy만 있으면 됨 (하드웨어 불필요)
+# 단위 회귀 — numpy만 있으면 됨 (하드웨어 불필요)
 python3 test_fixes.py
 
-python3 main.py
+# SITL 회귀 — 드론 없이 실제 main.main()을 비행시킴 (sitl/README.md 참조)
+python3 sitl/harness.py --all
 
-# SITL 회귀: FC 포트를 환경변수로 바꿀 수 있습니다
-MARS_FC_PORT=udpin:0.0.0.0:14550 python3 main.py
+python3 main.py
 ```
+
+`MARS_FC_PORT` 환경변수로 FC 포트를 바꿀 수 있습니다(기본 `/dev/ttyACM0`).
+SITL에 직접 붙이려면 `MARS_FC_PORT=udpin:0.0.0.0:14551 python3 main.py`.
 
 키: `q`/`ESC` 종료 · `m` MARS-IMM 토글 · `v` MAVLink 송신 토글 · `l` LAND · `h` HOLD
 (모두 `SHOW_WINDOW`가 True인 GUI 창에서만 동작)
 
-**CLI 인자도 환경변수도 없습니다.** 모든 설정은 `main.py` 상단 상수와 `config.py`를 직접 편집합니다.
+**CLI 인자가 없습니다.** `MARS_FC_PORT` 외의 모든 설정은 `main.py` 상단 상수와 `config.py`를 직접 편집합니다.
 
 주요 기본값 (`main.py`):
 
@@ -258,7 +261,8 @@ MARS_FC_PORT=udpin:0.0.0.0:14550 python3 main.py
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회) |
 | `utils_geometry.py` | 순수 기하 헬퍼 (intrinsics 누락 시 조용히 기본값 사용에 주의) |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | C1~C6 + H2 회귀 테스트 (하드웨어·FC 불필요) |
+| `test_fixes.py` | C1~C6 + H2 단위 회귀 테스트 (하드웨어·FC 불필요) |
+| `sitl/` | ArduCopter SITL 회귀 하네스 + 실행 안내 |
 | `controller.py` | **죽은 코드** — 아무도 import하지 않음. 모터 직접 제어(FC 자세 안정화 우회)라 되살리지 말 것 |
 
 ## 검증 방법
@@ -266,9 +270,9 @@ MARS_FC_PORT=udpin:0.0.0.0:14550 python3 main.py
 드론 없이 4층으로 검증 가능합니다: 순수함수/프레임 단위 → `main.main()` 폐루프 시뮬
 (`cv2`/`ultralytics`/`pyrealsense2`만 스텁) → MAVLink 와이어 → ArduCopter SITL 실비행.
 
-`test_fixes.py`(1층)는 저장소에 있습니다. **SITL 하네스(4층)는 아직 포함되어 있지 않습니다** —
-ArduCopter SITL을 `--serial0 udpclient:127.0.0.1:14551`로 띄우고 `MARS_FC_PORT`로 연결하면
-재구성할 수 있습니다.
+둘 다 저장소에 있습니다 — `test_fixes.py`(1층)와 [`sitl/`](sitl/)(4층). SITL 하네스는 드론도
+카메라도 없이 `numpy`와 `pymavlink`만으로 돌고, ArduCopter 빌드부터 차등 검증까지
+[`sitl/README.md`](sitl/README.md)에 적어뒀습니다.
 
 하드웨어 없이 검증 불가한 항목: 실제 RealSense 깊이 품질 · 드론 표적에 대한 YOLO 성능(현재
 `person` 대용, 5m에서 X500은 약 50×50px) · ESP32 송신 펌웨어(미존재) · 실제 공력/바람/프롭워시 ·
