@@ -1,150 +1,35 @@
 # MARS-IMM — Leader-Follower Drone
 
-**선두 드론을 눈으로 보고 따라가는 팔로워 컨트롤러.** RealSense D435i의 RGB-D를 YOLO11n으로
-검출하고, IMM-EKF로 상대 위치·속도를 추정해 Pixhawk에 body-frame 속도 명령을 10Hz로 보냅니다.
-Jetson에서 단일 프로세스로 돕니다. 영남대 종합설계(캡스톤) 과제.
+**선두 드론을 눈으로 보고 따라가는 팔로워 컨트롤러.** RealSense D435i의 RGB-D 영상에서 YOLO11n으로
+선두 드론을 탐지하고, IMM-EKF로 상대 위치·속도를 추정해 Pixhawk에 body-frame 속도 명령을 10Hz로
+보냅니다. Jetson에서 단일 프로세스로 돕니다. 영남대 종합설계(캡스톤) 과제.
 
 ```
 D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 ─▶ P·D 제어 ─▶ MAVLink 10Hz
         (TensorRT)   (IoU)    (CV+CT 2모델)   (추종/호버/소실/착륙)      (BODY_NED)
 ```
 
-## 지금까지 확인된 것
+## 핵심 결과
 
 | | |
 |---|---|
-| **Jetson 실기** | 카메라 파이프라인 **24~26 FPS**, 선두 검출 → **모터 구동까지 지상 확인** |
-| **SITL 비행** | ArduCopter/PX4 SITL에서 **실제 `main.main()`을 그대로 비행**시켜 8개 시나리오 통과 |
-| **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 4.3m — 이론값 `3.0 + 0.3/0.22 = 4.36m`와 소수 둘째 자리 일치 |
-| **회귀 스위트** | 단위 검사 37개 + SITL 시나리오 8개, 전부 **차등 검증**(수정 전 코드에서 결함 재현 확인) |
-| **실비행** | 아직 없음 — 조종사 감시 하 시험 비행이 다음 단계 |
-
-검증 방법과 발견·수정한 결함 전체는 **[VERIFICATION.md](VERIFICATION.md)** 에 있습니다.
-
-### 검증을 어떻게 했나
-
-드론 없이 4층으로 검증합니다. 핵심은 **스텁이 인지 계층(cv2/RealSense/YOLO)뿐이고, 미션
-상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
-
-```bash
-python3 test_fixes.py          # 단위 37개 — numpy만 있으면 됨
-python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
-```
-
-그리고 모든 시나리오는 **수정 전 코드에도 돌립니다.** 대조군이 통과하는 테스트는 아무것도
-증명하지 못하기 때문입니다. 예를 들어 조종사 수동 탈환 시나리오는 이렇게 갈립니다:
-
-```
-수정 후 : GUIDED → LAND → LOITER(조종사) → 25초간 LOITER 유지  ✅
-수정 전 : GUIDED → LAND → LOITER(조종사) → LAND (0.6초 만에 되뺏김)  ❌
-```
-
-> **상태 요약** — 알려진 치명 결함은 모두 수정·검증되었습니다. 조종사 상시 대기 ·
-> 리더 0.35 m/s 미만 · 저고도 개활지 조건에서 시험 비행이 가능한 단계이며,
-> 무인 운용 단계는 아닙니다. 조건은 [운용 순서](#운용-순서) 참조.
-
-## 하드웨어
-
-| | |
-|---|---|
-| 기체 | Holybro X500 V2 + Pixhawk (ArduCopter SITL 검증 / PX4는 C6 수정됨, 미실행) |
-| 컴패니언 | NVIDIA Jetson |
-| 카메라 | Intel RealSense D435i (640×480 @ 30fps) |
-| 선두 텔레메트리 | ESP32 (serial `/dev/ttyUSB0` 115200 또는 UDP 5005) — **송신 펌웨어는 이 저장소에 없습니다** |
-
-## 실행
-
-```bash
-# 의존성 (requirements.txt 없음 — 수동 설치)
-pip install numpy opencv-python pymavlink ultralytics pyrealsense2 pyserial
-
-# 단위 회귀 — numpy만 있으면 됨 (하드웨어 불필요)
-python3 test_fixes.py
-
-# SITL 회귀 — 드론 없이 실제 main.main()을 비행시킴 (sitl/README.md 참조)
-python3 sitl/harness.py --all
-
-python3 main.py
-```
-
-`MARS_FC_PORT` 환경변수로 FC 포트를 바꿀 수 있습니다(기본 `/dev/ttyACM0`).
-SITL에 직접 붙이려면 `MARS_FC_PORT=udpin:0.0.0.0:14551 python3 main.py`.
-
-키: `q`/`ESC` 종료 · `m` MARS-IMM 토글 · `v` MAVLink 송신 토글 · `l` LAND · `h` HOLD
-(모두 `SHOW_WINDOW`가 True인 GUI 창에서만 동작)
-
-**CLI 인자가 없습니다.** `MARS_FC_PORT` 외의 모든 설정은 `main.py` 상단 상수와 `config.py`를 직접 편집합니다.
-
-주요 기본값 (`main.py`):
-
-| 상수 | 값 |
-|---|---|
-| `SEND_MAVLINK_COMMANDS` | `False` (dry-run) |
-| `TARGET_DISTANCE_M` | 3.0 |
-| `MAX_VX` / `MAX_VY` / `MAX_VZ` | 0.35 / 0.22 / 0.12 m/s |
-| `KP_YAW` / `MAX_YAW_RATE` | 0.8 / 0.35 rad/s |
-| `SETPOINT_PERIOD_SEC` | 0.10 |
-| `USE_LEADER_ESP32` | `True` |
-
-`config.py`의 모델 경로(`/home/dsl/DRONE/leader_drone_yolo11n.pt`)와 `target_class_name`(현재
-`"person"`으로 실험 중, 드론 전환 시 `"leader_drone"`)은 환경에 맞게 수정해야 합니다.
-
-## 운용 순서
-
-**`SEND_MAVLINK_COMMANDS`는 안전을 위해 기본값 `False`입니다** (`main.py:74`). 이 상태에서도
-카메라·YOLO·EKF·미션 상태머신·화면·로깅이 전부 정상 동작하며, 계산된 속도 명령도 화면에
-표시됩니다. **전송만 하지 않습니다.** 실비행 시 지상에서 `True`로 바꾼 뒤 진행하세요.
-
-```
-[지상]
-  1. python3 test_fixes.py                     통과 확인
-  2. 프로펠러 제거 상태로 python3 main.py       화면의 명령값이 의도대로 나오는지 확인
-  3. main.py:74 를 True 로 수정                 (또는 실행 중 v 키)
-  4. 기체 파라미터 WP_YAW_BEHAVIOR=0
-
-[비행]
-  5. 조종기로 수동 이륙 (ALT_HOLD)              원하는 고도까지
-  6. 고도 안착 후 모드 스위치를 GUIDED 로       ← 이 순간부터 추종 시작
-  7. 이상하면 스위치를 LOITER/ALT_HOLD 로       ← 즉시 조종사에게 돌아옴
-```
-
-### 왜 GUIDED여야 하는가
-
-ArduCopter는 `SET_POSITION_TARGET_LOCAL_NED`를 **GUIDED에서만** 받습니다
-(`ArduCopter/GCS_MAVLink_Copter.cpp:975`):
-
-```cpp
-// exit if vehicle is not in Guided mode or Auto-Guided mode
-if (!copter.flightmode->in_guided_mode()) {
-    return;
-}
-```
-
-디코드 직후 버려지므로, **ALT_HOLD에서는 `SEND_MAVLINK_COMMANDS=True`여도 기체가 움직이지
-않습니다.** 화면에는 `CMD:ON`이 뜨는데 반응이 없는 형태라 가장 헷갈리는 실패 방식입니다.
-ALT_HOLD로 얻으려는 고도 유지는 GUIDED에서 자동으로 됩니다(위치 제어기가 수평까지 잡아줍니다).
-
-### 조종기 스위치가 곧 자동/수동 전환입니다
-
-컴패니언은 GUIDED/OFFBOARD가 아니면 명령을 보내지 않습니다. 따라서 3단 스위치를 이렇게 두면
-SSH나 GUI를 거치지 않고 전환할 수 있습니다.
-
-| 스위치 | 모드 | 의미 |
-|---|---|---|
-| 위 | ALT_HOLD | 수동 이륙·고도 잡기 |
-| 중간 | LOITER | 비상 탈환 (위치까지 고정) |
-| 아래 | **GUIDED** | 자동 추종 |
-
-LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — C2 수정으로 SITL에서 검증했습니다(25초 유지).
+| **Jetson 실기** | 카메라 파이프라인 **24~26 FPS**, 선두 드론 탐지 → **모터 구동까지 지상 확인** |
+| **SITL 비행** | ArduCopter SITL에서 **실제 `main.main()`을 그대로 비행**시켜 **8개 시나리오 전부 통과** |
+| **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 **4.3m — 이론값 4.36m와 소수 둘째 자리 일치** |
+| **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
+| **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
+| **회귀 스위트** | 단위 검사 35개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
+| **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 시스템 개요
 
-단일 스레드 `while` 루프 하나가 전부입니다(`main.py:497`). ROS도 threading도 async도 없습니다.
+단일 스레드 `while` 루프 하나가 전부입니다. ROS도 threading도 async도 없습니다 —
+Jetson 한 장에서 인지부터 제어까지 42ms 주기로 돕니다.
 
 ```
 D435i (color+depth, 640×480@30)
    └─> YOLO11n 검출 (scheduler가 ROI·검출 주기 결정)
-         └─> IoU 단일 표적 트래커 (bbox 지수 평활)
+         └─> IoU 단일 표적 트래커 (bbox 지수 평활, 근접 게이트로 신원 유지)
                └─> 측정 생성  RGB-D 3D  또는  bearing 2D
                      └─> 신뢰도 기반 R 팽창 + Mahalanobis 게이팅
                            └─> IMM-EKF (CV + Coordinated-Turn 2모델)
@@ -154,71 +39,138 @@ D435i (color+depth, 640×480@30)
                                              └─> MAVLink SET_POSITION_TARGET_LOCAL_NED (10Hz)
 ```
 
-**좌표계 체인**: pixel → camera → FRU → BODY_NED, ENU → FRU. 프레임 `MAV_FRAME_BODY_NED`(8),
-type_mask는 항상 1479(속도 + yaw rate 사용, yaw 각도 무시). hold는 같은 마스크에 yaw_rate=0.0.
+**좌표계 체인**: pixel → camera → FRU → BODY_NED, ENU → FRU. 체인 전체를 SITL에서 검증했습니다
+(명령 방향 대 실제 이동 방향 오차 -0.1°). 프레임 `MAV_FRAME_BODY_NED`(8), type_mask 1479
+(속도 + yaw rate 사용, yaw 각도 무시). hold는 같은 마스크에 yaw_rate=0.0.
+
+**24~26 FPS는 제어에 충분합니다.** setpoint는 10Hz로만 나가면 되고, 24 FPS면 루프가 42ms마다
+도니 여유롭습니다 — SITL 실측 setpoint 9.1~9.2Hz, 최대 갭 0.138s (`GUID_TIMEOUT` 3.0s 대비).
+평활 계수는 `dt` 보정을 넣어 실제 FPS와 무관하게 같은 응답 시정수를 갖습니다.
 
 ## 제어 법칙
 
-네 축 모두 P+D로 제어합니다 (`main.py:388-399`). 상대 위치는 IMM-EKF 추정값(FRU: front/right/up)입니다.
+네 축 모두 P+D로 제어합니다. 상대 위치는 IMM-EKF 추정값(FRU: front/right/up)입니다.
 
-| 상황 | 명령 | 식 |
+| 축 | 명령 | 식 |
 |---|---|---|
-| 너무 가까움 / 멂 | 전후 | `KP_FORWARD × (front − TARGET) + KD × v_front` |
-| 좌 / 우 | 좌우 | `KP_RIGHT × right + KD × v_right` |
-| 위 / 아래 | 상하 | `KP_UP × up + KD × v_up` |
-| 시야 중앙 유지 | 기수 | `KP_YAW × atan2(right, front)` |
+| 전후 | 거리 유지 | `KP_FORWARD × (front − TARGET) + KD × v_front` |
+| 좌우 | 측면 정렬 | `KP_RIGHT × right + KD × v_right` |
+| 상하 | 고도 정렬 | `KP_UP × up + KD × v_up` |
+| 기수 | 시야 중앙 유지 | `KP_YAW × atan2(right, front)` |
 
-추정 불확실성(`pos_cov_trace`)이 크면 전체 명령에 0.55 / 0.75 배 감속이 걸립니다.
+추정 불확실성(`pos_cov_trace`)이 크면 전체 명령에 0.55 / 0.75배 감속이 걸립니다.
 
-**속도 상한이 곧 운용 한계입니다.** `MAX_VX = 0.35 m/s`이므로 **리더가 0.35 m/s(시속 1.26km)를
-넘으면 정상상태에서 따라잡을 수 없습니다.** D항이 상대속도라 정상상태 기여가 0이고 feed-forward가
-없어서 생기는 제약입니다([남은 결함](VERIFICATION.md#남은-결함) 참조).
+**SITL 실측이 이론과 일치합니다.** 리더 0.3 m/s 추종 평형 거리 4.3m — 이론값
+`TARGET + v/KP_FORWARD = 3.0 + 0.3/0.22 = 4.36m`와 소수 둘째 자리까지 일치. 제어기는
+과감쇠·안정이며, 정지 리더 정상상태 오차 +0.00m, 5만 프레임 시뮬레이션에서 NaN·발산 0회.
 
-SITL 실측으로 확인한 평형 거리: 리더 0.3 m/s에서 4.3m — 이론값 `TARGET + v/KP_FORWARD =
-3.0 + 0.3/0.22 = 4.36m`와 소수 둘째 자리까지 일치합니다.
+## 안전 설계
+
+비행 안전과 관련된 동작은 전부 SITL에서 실제 비행으로 검증했습니다.
+
+- **조종사가 항상 이깁니다.** 컴패니언은 FC 모드를 매 루프 확인하고, GUIDED/OFFBOARD가
+  아니면 모드 변경 명령을 보내지 않습니다. 조종사가 LOITER로 탈환하면 그대로 유지됩니다
+  (SITL 25초 검증).
+- **선두 소실 시 자동 착륙.** 거리 관측이 끊기면 호버로 버티다가 총 10초 뒤 LAND —
+  깊이 센서만 죽고 검출이 살아 있는 교묘한 경우까지 거리 기준(`range_coast_time`)으로 잡습니다.
+- **이륙 인계가 안전합니다.** 수동 상승 후 GUIDED로 넘기는 순간 미션·명령 버퍼를 리셋해
+  깨끗한 상태로 추종을 시작합니다 (SITL 검증).
+- **고도 바닥.** `MIN_AGL_M`(1.5m) 아래에서는 하강 명령을 차단합니다.
+- **기본값이 dry-run.** `SEND_MAVLINK_COMMANDS = False`가 기본이라, 켜기 전까지는 인지·추정·
+  화면 표시가 전부 돌면서 명령은 전송되지 않습니다.
+- **카메라 hiccup 내성.** 프레임 드롭은 드롭으로 처리하고, 헤드리스(`MARS_SHOW_WINDOW=0`)
+  환경에서도 동작합니다.
+
+## 검증 방법
+
+드론 없이 4층으로 검증합니다. 핵심은 **스텁이 인지 계층(cv2/RealSense/YOLO)뿐이고, 미션
+상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
+
+```bash
+python3 test_fixes.py          # 단위 35개 — numpy만 있으면 됨
+python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
+```
+
+그리고 모든 시나리오는 **차등 검증**입니다 — 수정 전 코드에도 같은 시나리오를 돌려 대조군에서
+문제가 실제로 재현되는지 확인합니다. 대조군이 통과하는 테스트는 아무것도 증명하지 못하기
+때문입니다.
+
+SITL 시나리오 8개: 부팅 대기 · 조종사 탈환 · 공중 오판 방지 · 이동 리더 추종 · 정지 리더
+정위치 유지 · 기수 유지 · 소실 시 자동 착륙 · GUIDED 인계. 상세 이력과 실측값은
+**[VERIFICATION.md](VERIFICATION.md)**, 하네스 실행법은 [sitl/README.md](sitl/README.md).
+
+## 하드웨어
+
+| | |
+|---|---|
+| 기체 | Holybro X500 V2 + Pixhawk |
+| 컴패니언 | NVIDIA Jetson |
+| 카메라 | Intel RealSense D435i (640×480 @ 30fps) |
+| 선두 텔레메트리 | ESP32 (serial 115200 또는 UDP 5005) — 선택 사항, 비전 단독으로 동작 |
+
+## 실행
+
+```bash
+pip install numpy opencv-python pymavlink ultralytics pyrealsense2 pyserial
+
+python3 test_fixes.py          # 단위 회귀 (하드웨어 불필요)
+python3 main.py
+```
+
+`MARS_FC_PORT` 환경변수로 FC 포트를 바꿀 수 있습니다(기본 `/dev/ttyACM0`).
+SITL에 직접 붙이려면 `MARS_FC_PORT=udpin:0.0.0.0:14551 python3 main.py`.
+
+키: `q`/`ESC` 종료 · `m` MARS-IMM 토글 · `v` MAVLink 송신 토글 · `l` LAND · `h` HOLD
+
+모델 경로와 대상 클래스는 `config.py`에서 설정합니다. 시작 시 모델의 클래스 목록과 대조해
+설정이 어긋나면 크게 경고합니다.
+
+## 운용 순서
+
+```
+[지상]
+  1. python3 test_fixes.py                     통과 확인
+  2. 프로펠러 제거 상태로 python3 main.py       화면의 명령값이 의도대로 나오는지 확인
+  3. SEND_MAVLINK_COMMANDS = True 로 수정       (또는 실행 중 v 키)
+  4. 기체 파라미터 WP_YAW_BEHAVIOR=0
+
+[비행]
+  5. 조종기로 수동 이륙 (ALT_HOLD)              원하는 고도까지
+  6. 고도 안착 후 모드 스위치를 GUIDED 로       ← 이 순간부터 추종 시작
+  7. 이상하면 스위치를 LOITER/ALT_HOLD 로       ← 즉시 조종사에게 돌아옴
+```
+
+ArduCopter는 속도 setpoint를 **GUIDED에서만** 받으므로, 조종기 3단 스위치가 곧 자동/수동
+전환 장치가 됩니다:
+
+| 스위치 | 모드 | 의미 |
+|---|---|---|
+| 위 | ALT_HOLD | 수동 이륙·고도 잡기 |
+| 중간 | LOITER | 비상 탈환 (위치까지 고정) |
+| 아래 | **GUIDED** | 자동 추종 |
+
+LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 검증했습니다.
 
 ## 모듈
 
 | 파일 | 역할 |
 |---|---|
-| `main.py` (1081) | 제어 루프 전체 — 상수, 명령 생성, MAVLink 송신, 상태 표시 |
+| `main.py` | 제어 루프 전체 — 상수, 명령 생성, MAVLink 송신, 상태 표시 |
 | `mission_manager.py` | 미션 상태머신 (WAIT_LEADER / READY_HOVER / FOLLOW / LOST_HOLD / FAILSAFE_LAND …) |
-| `imm_ekf.py` | 2모델 IMM-EKF (CV + Coordinated-Turn). **CA 모델은 없습니다** |
-| `scheduler.py` | 검출기 on/off와 ROI 크기만 스케줄링 (스레드·센서율은 아님) |
+| `imm_ekf.py` | 2모델 IMM-EKF (CV + Coordinated-Turn) |
+| `scheduler.py` | 검출기 on/off와 ROI 크기 스케줄링 |
 | `reliability.py` | 신뢰도 기반 R 팽창 + Mahalanobis 게이팅 |
 | `leader_telemetry.py` | ESP32 선두 GPS/속도 수신·파싱·ENU 변환·융합 |
 | `measurement.py` | bbox + depth → RGB-D 3D / bearing 2D 측정 |
-| `tracker.py` | IoU 단일 표적 트래커 (bbox 지수 평활) |
+| `tracker.py` | IoU 단일 표적 트래커 (bbox 지수 평활, 근접 게이트) |
 | `detector.py` | YOLO11n 래퍼 (TensorRT `.engine` 우선) |
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회) |
-| `utils_geometry.py` | 순수 기하 헬퍼 (intrinsics 누락 시 조용히 기본값 사용에 주의) |
+| `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | C1~C6 + H2 단위 회귀 테스트 (하드웨어·FC 불필요) |
-| `sitl/` | SITL 회귀 하네스 · C5 전용 프로브 · 실행 안내 |
-| `controller.py` | **죽은 코드** — 아무도 import하지 않음. 모터 직접 제어(FC 자세 안정화 우회)라 되살리지 말 것 |
+| `test_fixes.py` | 단위 회귀 35개 (하드웨어·FC 불필요) |
+| `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 
-## 알아둘 것
+## 문서
 
-### 프레임률은 병목이 아닙니다
-**카메라 FPS는 병목이 아닙니다.** setpoint는 `SETPOINT_PERIOD_SEC = 0.10` 즉 10Hz로만 나가면
-되고, 24 FPS면 루프가 42ms마다 도니 여유롭습니다(SITL 실측 setpoint 9.1~9.2Hz, 최대 갭 0.138s
-vs `GUID_TIMEOUT` 3.0s). Jetson에서 관측된 **24~26 FPS로 충분하며, 30 FPS로 올려도 제어 품질은
-개선되지 않습니다.**
-
-다만 평활 계수가 프레임당 값이라 FPS가 바뀌면 응답 시정수가 따라 변했습니다(24fps와 30fps에서
-25% 차이). `smooth_velocity_cmd`에 `dt`를 넘겨 30fps 기준으로 보정하므로, 이제 실제 FPS와
-무관하게 같은 시정수를 갖습니다.
-
-
-### 한계
-- **리더가 0.35 m/s를 넘으면 따라잡지 못합니다** (`MAX_VX`). D항이 상대속도라 정상상태
-  기여가 0이고 feed-forward가 없습니다.
-- **선두 드론이 호버링하거나 아주 천천히 움직이는 조건**에서 동작을 확인했습니다.
-  빠른 기동 추종은 feed-forward 구현 후의 과제입니다.
-- ESP-NOW 송신 펌웨어가 아직 없어 현재는 **비전 단독 경로**로 동작합니다.
-- 실제 비행 중의 검출 성능(진동·모션블러·조명), 바람/프롭워시, GPS 품질은 미검증입니다.
-
-## 라이선스 · 문서
-
-- [VERIFICATION.md](VERIFICATION.md) — 결함 감사·수정·SITL 차등 검증 이력
+- [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
