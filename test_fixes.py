@@ -259,6 +259,38 @@ check("평활: 같은 경과시간(0.1s)이면 FPS가 달라도 응답 근사 �
 check("평활: dt 미지정이면 기존 동작 유지",
       abs(float(main.smooth_velocity_cmd(zero, one, alpha=0.28)[0]) - 0.28) < 1e-9)
 
+# ------------------------------------------------- 현장 대비 (2026-09-07 감사)
+check("ESP32: 송신 펌웨어가 없으므로 기본 off (있으면 startup crash)",
+      main.USE_LEADER_ESP32 is False, f"USE_LEADER_ESP32={main.USE_LEADER_ESP32}")
+
+check("헤드리스: MARS_SHOW_WINDOW로 창을 끌 수 있음",
+      "MARS_SHOW_WINDOW" in open("main.py", encoding="utf-8").read())
+
+check("AGL 바닥 상수 존재", main.MIN_AGL_M > 0, f"MIN_AGL_M={main.MIN_AGL_M}")
+check("카메라 연속 실패 한계 존재", main.CAM_FAIL_LIMIT > 0,
+      f"CAM_FAIL_LIMIT={main.CAM_FAIL_LIMIT}")
+
+# 검출 클래스 불일치 경고
+import io as _io  # noqa: E402
+import contextlib  # noqa: E402
+from detector import YoloDetector  # noqa: E402
+
+
+class _FakeModel:
+    names = {0: "leader_drone"}
+
+
+buf = _io.StringIO()
+with contextlib.redirect_stdout(buf):
+    YoloDetector(model=_FakeModel(), target_class_name="person")
+check("검출: 모델에 없는 클래스면 시작 시 크게 경고",
+      "target_class_name='person'" in buf.getvalue() and "없습니다" in buf.getvalue())
+
+buf = _io.StringIO()
+with contextlib.redirect_stdout(buf):
+    YoloDetector(model=_FakeModel(), target_class_name="leader_drone")
+check("검출: 클래스가 맞으면 확인 메시지", "확인됨" in buf.getvalue())
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "

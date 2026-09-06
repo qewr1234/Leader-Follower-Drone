@@ -25,6 +25,8 @@ ESP32 선두 telemetry 가정:
 - 실제 명령 송신 전 반드시 프로펠러 제거 상태에서 QGC/Mission Planner로 setpoint 확인
 """
 
+import os
+
 import cv2
 import time
 import math
@@ -50,7 +52,7 @@ from mavlink_io import (
     battery_text,
 )
 
-from mission_manager import MissionManager
+from mission_manager import MissionManager, S_WAIT_LEADER
 
 from leader_telemetry import (
     LeaderTelemetryReceiver,
@@ -63,7 +65,7 @@ from leader_telemetry import (
 # 실행 설정
 # ============================================================
 
-SHOW_WINDOW = True
+SHOW_WINDOW = os.environ.get("MARS_SHOW_WINDOW", "1") != "0"
 
 # 처음에는 반드시 False.
 # True로 바꾸기 전:
@@ -76,8 +78,11 @@ SEND_MAVLINK_COMMANDS = False
 USE_MARS_IMM_DEFAULT = True
 USE_BEARING_FALLBACK = True
 
-# ESP32 leader telemetry 사용
-USE_LEADER_ESP32 = True
+# ESP32 leader telemetry 사용.
+# 송신 펌웨어(ESP-NOW)가 아직 없으므로 기본 off. True인데 장치가 없으면
+# serial.Serial()이 SerialException을 던지고, 그 호출이 try 블록 밖이라
+# 루프 진입 전에 프로그램이 죽는다.
+USE_LEADER_ESP32 = False
 
 # ESP32 수신 방식
 # "serial" 또는 "udp"
@@ -142,6 +147,10 @@ UNCERTAINTY_SLOWDOWN_TRACE = CONFIG["controller"].get(
 SETPOINT_PERIOD_SEC = 0.10
 # C2: LAND가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
 LAND_RETRY_SEC = 2.0
+# 카메라 프레임을 연속 이 횟수만큼 못 받으면 포기한다(약 CAM_FAIL_LIMIT/FPS 초).
+CAM_FAIL_LIMIT = 30
+# 이 고도(AGL) 아래에서는 하강 명령을 내지 않는다.
+MIN_AGL_M = 1.5
 
 GPS_MAX_AGE_SEC = 0.70
 LOCAL_POS_MAX_AGE_SEC = 0.40
@@ -489,7 +498,12 @@ def main():
             udp_ip=LEADER_UDP_IP,
             udp_port=LEADER_UDP_PORT,
         )
-        leader_rx.start()
+        try:
+            leader_rx.start()
+        except Exception as exc:
+            # 장치가 없거나 pyserial이 없어도 비전 단독 경로로 계속 간다.
+            print(f"[WARN] leader telemetry 비활성: {type(exc).__name__}: {exc}")
+            leader_rx = None
 
     log = ExperimentLogger(CONFIG["logger"]["log_dir"]) if CONFIG["logger"]["enabled"] else None
 
@@ -502,6 +516,9 @@ def main():
     last_bat_print = 0.0
     last_setpoint_time = 0.0
     last_land_send = 0.0  # C2: LAND 재시도 타이머
+    prev_fc_accepts = False  # GUIDED 진입 에지 검출용
+    cam_fail_streak = 0      # 연속 카메라 실패 횟수
+    show_window = SHOW_WINDOW
 
     fps_counter = 0
     fps_t0 = time.time()
@@ -537,6 +554,25 @@ def main():
             fc_mode = vehicle_state.get("mode", {}).get("name", "?")
             fc_armed = vehicle_state.get("mode", {}).get("armed", False)
             fc_accepts_setpoints = fc_mode in ("GUIDED", "OFFBOARD")
+
+            # GUIDED 진입 = 조종사가 방금 자동에게 넘긴 순간. 그 전까지 FC는 우리
+            # 명령을 전부 버렸으므로, 그동안 쌓인 상태를 그대로 들고 들어가면 안 된다.
+            #
+            #  - 미션: 수동 상승 중에는 리더가 화면 밖이라 10초 뒤 FAILSAFE_LAND로
+            #    래치된다. 리셋하지 않으면 스위치를 넘기는 첫 프레임에 LAND가 나간다.
+            #    (C1 가드는 "한 번도 못 봄"만 막고 "상승 중 놓침"은 막지 못한다)
+            #  - 평활 버퍼: FC가 무시하는 동안 목표값까지 수렴해 있으므로, 리셋하지
+            #    않으면 전환 첫 setpoint가 램프 없이 포화 상태로 나간다.
+            if fc_accepts_setpoints and not prev_fc_accepts:
+                mission.state = S_WAIT_LEADER
+                mission.last_seen_t = None
+                mission.first_seen_t = None
+                mission.start_candidate_t = None
+                mission.landing_candidate_t = None
+                prev_body_cmd = np.zeros(4, dtype=float)
+                last_land_send = 0.0
+                print(f"[SYS] {fc_mode} 진입 — 미션/명령 리셋")
+            prev_fc_accepts = fc_accepts_setpoints
 
             gps_fresh = is_fresh(vehicle_state.get("gps", {}), now, GPS_MAX_AGE_SEC)
             local_pos_fresh = is_fresh(vehicle_state.get("local_position", {}), now, LOCAL_POS_MAX_AGE_SEC)
@@ -577,7 +613,21 @@ def main():
             # ------------------------------------------------------------
             # Camera
             # ------------------------------------------------------------
-            color_image, depth_image = cam.get_frames()
+            # 카메라 예외(USB hiccup, 'Frame didn't arrive within 5000')는 흔하고,
+            # 잡지 않으면 비행 중에 제어 루프가 통째로 죽는다. 드롭 프레임으로
+            # 처리하고, 연속으로 실패하면 그때 포기한다.
+            try:
+                color_image, depth_image = cam.get_frames()
+                cam_fail_streak = 0
+            except Exception as exc:
+                cam_fail_streak += 1
+                print(f"[WARN] 카메라 프레임 실패 {cam_fail_streak}회: "
+                      f"{type(exc).__name__}: {exc}")
+                if cam_fail_streak >= CAM_FAIL_LIMIT:
+                    print(f"[ERR] 카메라 연속 실패 {CAM_FAIL_LIMIT}회 — 종료")
+                    break
+                continue
+
             if color_image is None:
                 print("[WARN] frame dropped")
                 continue
@@ -848,6 +898,13 @@ def main():
             else:
                 desired_body_cmd = np.zeros(4, dtype=float)
 
+            # 수직 축은 리더의 상대 고도를 따라간다. 리더가 아래에 있으면(혹은
+            # 트래커가 지면의 무언가를 물면) 계속 하강 명령이 나가고, 멈추는 조건은
+            # "리더 고도에 도달"뿐이다. AGL 바닥을 둔다.
+            if follower_alt is not None and follower_alt < MIN_AGL_M:
+                if desired_body_cmd[2] > 0.0:          # BODY_NED z는 down +
+                    desired_body_cmd[2] = 0.0
+
             current_body_cmd = smooth_velocity_cmd(
                 prev_cmd=prev_body_cmd,
                 new_cmd=desired_body_cmd,
@@ -895,7 +952,7 @@ def main():
                 last_h_ratio = h_ratio
                 last_ex = ex
 
-                if SHOW_WINDOW:
+                if show_window:
                     col = depth_color(ctrl_depth)
                     cv2.rectangle(color_image, (x1, y1), (x2, y2), col, 2)
                     cv2.circle(color_image, (int(cx_tgt), int(cy_tgt)), 5, (0, 0, 255), -1)
@@ -913,7 +970,7 @@ def main():
             # ------------------------------------------------------------
             # 화면 출력
             # ------------------------------------------------------------
-            if SHOW_WINDOW:
+            if show_window:
                 if not policy.get("use_full_frame", True) and policy.get("roi") is not None:
                     rx1, ry1, rx2, ry2 = policy["roi"]
                     cv2.rectangle(color_image, (rx1, ry1), (rx2, ry2), (255, 0, 255), 1)
@@ -979,8 +1036,15 @@ def main():
                 if ekf.initialized:
                     draw_model_bar(color_image, ekf.get_model_probs())
 
-                cv2.imshow("MARS-IMM Drone Follow", color_image)
-                key = cv2.waitKey(1) & 0xFF
+                try:
+                    cv2.imshow("MARS-IMM Drone Follow", color_image)
+                    key = cv2.waitKey(1) & 0xFF
+                except Exception as exc:
+                    # DISPLAY가 없거나 ssh -X 링크가 끊기면 imshow가 예외를 던진다.
+                    # 창을 포기하고 헤드리스로 계속 난다 — 여기서 죽으면 안 된다.
+                    print(f"[WARN] 화면 비활성화 ({type(exc).__name__}) — 헤드리스로 계속")
+                    show_window = False
+                    key = 255
 
                 if key in (ord("q"), 27):
                     break
@@ -994,14 +1058,18 @@ def main():
                     print(f"[SYS] SEND_MAVLINK_COMMANDS -> {SEND_MAVLINK_COMMANDS}")
 
                 elif key == ord("h"):
-                    print("[SYS] manual HOLD command")
                     if SEND_MAVLINK_COMMANDS:
                         send_hold(master)
+                        print("[SYS] manual HOLD 송신 (다음 setpoint에 덮임)")
+                    else:
+                        print("[SYS] manual HOLD 생략 — CMD=DRY")
 
                 elif key == ord("l"):
-                    print("[SYS] manual LAND command")
                     if SEND_MAVLINK_COMMANDS:
                         send_land(master)
+                        print("[SYS] manual LAND 송신")
+                    else:
+                        print("[SYS] manual LAND 생략 — CMD=DRY ('v'로 켜야 나감)")
 
             # ------------------------------------------------------------
             # Logging

@@ -52,6 +52,7 @@ python3 sitl/harness.py --all
 | `hold_heading` | **C5** | 명령 yaw_rate=0인데 기수가 25° 이상 자체 회전 |
 | `px4_setmode` | **C6** | PX4의 3-튜플 `mode_mapping`에서 `set_mode`가 예외 |
 | `depth_loss` | 거리 게이트 | 깊이만 죽었을 때(검출은 유지) 10초 뒤 착륙하지 않음 |
+| `handover` | GUIDED 인계 | 수동 상승 후 GUIDED로 넘기는 순간 LAND가 나감 |
 
 월드는 **폐루프**입니다 — 팔로워가 실제로 움직이면 리더까지의 거리가 변합니다. 팔로워 위치와
 기수는 SITL의 `LOCAL_POSITION_NED` / `ATTITUDE`로 갱신되며, 그래야 정위치 유지(H2)나 거리
@@ -85,6 +86,7 @@ git worktree remove --force /tmp/mars_before
 | `hold_heading` (C5) | 기수 편차 0.0° | 0.0° — **재현 안 됨** |
 | `px4_setmode` (C6) | PASS — 예외 없음 | **FAIL — `required argument is not an integer`** |
 | `depth_loss` (거리 게이트) | PASS — 깊이 소실 10.0초 뒤 LAND | **FAIL — 35초 내내 GUIDED, 착륙 안 함** |
+| `handover` (GUIDED 인계) | PASS — 인계 후 LAND 없음 | **FAIL — 인계 0.1초 만에 LAND** |
 
 C4 수정 후의 4.3m는 P 제어 평형거리 이론값 `TARGET + v/KP_FORWARD = 3.0 + 0.3/0.22 = 4.36m`와
 소수 둘째 자리까지 일치합니다.
@@ -102,6 +104,7 @@ LAND를 걸어버려 다른 결함의 조건에 도달조차 못 하기 때문�
 | H2 | `S_LEADER_HOVER`를 출발판단 블록으로 되돌림 |
 | C6 | `set_mode`를 `set_mode_send(mode_mapping[name])`로 되돌림 |
 | 거리 게이트 | `leader_visible_for_mission`을 `track_visible or ekf_reliable or esp_visible`로 되돌림 |
+| 인계 | GUIDED 진입 에지의 미션·명령 리셋 블록 제거 |
 
 C2 대조군 모드 이력이 결함을 그대로 보여줍니다:
 `GUIDED(2s) → LAND(15.1s) → LOITER(15.1s, 조종사) → LAND(15.2s, 컴패니언이 되뺏음)`

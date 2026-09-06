@@ -40,6 +40,54 @@ follower 컨트롤러입니다. Jetson에서 동작하며 종합설계(캡스톤
 
 ---
 
+## 운용 순서
+
+**`SEND_MAVLINK_COMMANDS`는 안전을 위해 기본값 `False`입니다** (`main.py:74`). 이 상태에서도
+카메라·YOLO·EKF·미션 상태머신·화면·로깅이 전부 정상 동작하며, 계산된 속도 명령도 화면에
+표시됩니다. **전송만 하지 않습니다.** 실비행 시 지상에서 `True`로 바꾼 뒤 진행하세요.
+
+```
+[지상]
+  1. python3 test_fixes.py                     통과 확인
+  2. 프로펠러 제거 상태로 python3 main.py       화면의 명령값이 의도대로 나오는지 확인
+  3. main.py:74 를 True 로 수정                 (또는 실행 중 v 키)
+  4. 기체 파라미터 WP_YAW_BEHAVIOR=0
+
+[비행]
+  5. 조종기로 수동 이륙 (ALT_HOLD)              원하는 고도까지
+  6. 고도 안착 후 모드 스위치를 GUIDED 로       ← 이 순간부터 추종 시작
+  7. 이상하면 스위치를 LOITER/ALT_HOLD 로       ← 즉시 조종사에게 돌아옴
+```
+
+### 왜 GUIDED여야 하는가
+
+ArduCopter는 `SET_POSITION_TARGET_LOCAL_NED`를 **GUIDED에서만** 받습니다
+(`ArduCopter/GCS_MAVLink_Copter.cpp:975`):
+
+```cpp
+// exit if vehicle is not in Guided mode or Auto-Guided mode
+if (!copter.flightmode->in_guided_mode()) {
+    return;
+}
+```
+
+디코드 직후 버려지므로, **ALT_HOLD에서는 `SEND_MAVLINK_COMMANDS=True`여도 기체가 움직이지
+않습니다.** 화면에는 `CMD:ON`이 뜨는데 반응이 없는 형태라 가장 헷갈리는 실패 방식입니다.
+ALT_HOLD로 얻으려는 고도 유지는 GUIDED에서 자동으로 됩니다(위치 제어기가 수평까지 잡아줍니다).
+
+### 조종기 스위치가 곧 자동/수동 전환입니다
+
+컴패니언은 GUIDED/OFFBOARD가 아니면 명령을 보내지 않습니다. 따라서 3단 스위치를 이렇게 두면
+SSH나 GUI를 거치지 않고 전환할 수 있습니다.
+
+| 스위치 | 모드 | 의미 |
+|---|---|---|
+| 위 | ALT_HOLD | 수동 이륙·고도 잡기 |
+| 중간 | LOITER | 비상 탈환 (위치까지 고정) |
+| 아래 | **GUIDED** | 자동 추종 |
+
+LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — C2 수정으로 SITL에서 검증했습니다(25초 유지).
+
 ## 시스템 개요
 
 단일 스레드 `while` 루프 하나가 전부입니다(`main.py:497`). ROS도 threading도 async도 없습니다.
@@ -195,6 +243,7 @@ ArduCopter 4.8.0-dev SITL(네이티브 arm64 빌드)에 **저장소의 실제 `m
 | **H2** 리더 정지 후 정위치 유지 | ✅ 후반 3.0m (목표 3.0m) | ❌ **6.0m에서 정지, 수렴 안 함** |
 | **C6** PX4 3-튜플 `mode_mapping` | ✅ 예외 없음 (PX4 SITL) | ❌ **`required argument is not an integer`** |
 | **거리 게이트** 깊이만 소실 (검출은 유지) | ✅ **10.0초 뒤 LAND** | ❌ **35초 내내 GUIDED — 착륙 안 함** |
+| **인계** 수동 상승 12초 후 GUIDED 전환 | ✅ LAND 없음 | ❌ **전환 0.1초 만에 LAND** |
 | **C5** 기수 제어권 이양 (`c5_probe.py`) | 5.0° 유지 | 1.0° 유지 — **증상 발생 불가** |
 
 C4의 4.3m는 P 제어 평형거리 이론값 `TARGET + v/KP_FORWARD = 3.0 + 0.3/0.22 = 4.36m`와
@@ -273,6 +322,24 @@ ArduCopter SITL에서 재검증해 통과를 확인했습니다.
 
 **소실 후 착륙까지 총 10초**로 맞췄습니다 — `imm.range_coast_max_sec`(2.0) +
 `MissionManager.lost_hold_sec`(8.0). SITL 실측 10.0초.
+
+### 현장 대비 수정 (2026-09-07 감사)
+
+첫 시험 비행을 상정한 다중 에이전트 감사에서 나온 것들입니다.
+
+| 문제 | 현장에서 | 수정 |
+|---|---|---|
+| `USE_LEADER_ESP32=True` + ESP32 없음 | `serial.Serial()` 예외가 `try` 블록 **밖**에서 나 프로그램이 아예 안 뜸 (100%) | 기본 `False` + `start()` 예외 가드 |
+| **GUIDED 인계 순간 즉시 LAND** | 수동 상승 중 리더가 화면 밖 → 10초 뒤 FAILSAFE_LAND 래치 → 스위치 넘기는 첫 프레임에 착륙 | **GUIDED 진입 에지에서 미션·명령 리셋** |
+| 평활 버퍼 포화 | FC가 무시하는 동안 목표값까지 수렴 → 인계 첫 setpoint가 램프 없이 최대 | 같은 리셋에서 `prev_body_cmd` 0으로 |
+| 헤드리스 `cv2.imshow` 예외 | 창이 없거나 `ssh -X`가 끊기면 루프가 통째로 사망 | `MARS_SHOW_WINDOW=0` + imshow try/except → 헤드리스로 계속 |
+| `target_class_name` 불일치 | 모델에 없는 클래스면 **검출 0건인데 경고 없음** — FPS는 정상이라 원인 찾다 하루 날림 | 시작 시 모델 클래스와 대조해 크게 경고 |
+| 카메라 hiccup | `wait_for_frames` 예외가 안 잡혀 비행 중 종료 | 드롭 프레임으로 처리, 연속 30회면 종료 |
+| 수직축 바닥 없음 | 리더(또는 지면의 오검출)를 따라 계속 하강 | `MIN_AGL_M`(1.5m) 아래에서 하강 명령 차단 |
+| `l`/`h` 키가 거짓 보고 | CMD=DRY인데 "manual LAND command"를 출력해 조작자를 속임 | 실제 송신 여부를 그대로 출력 |
+
+**GUIDED 인계 LAND는 C1 수정의 사각지대였습니다.** C1 가드는 "리더를 한 번도 못 봄"만 막고,
+"보다가 상승 중에 놓침"은 막지 못했습니다. 이 저장소의 계획된 운용 절차에서 100% 발생합니다.
 
 ## 남은 결함
 

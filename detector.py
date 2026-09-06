@@ -37,6 +37,23 @@ class YoloDetector:
         self.conf_thres = conf_thres
         self.target_class_name = target_class_name
 
+        # 모델이 이 클래스를 모르면 detect()가 영원히 빈 리스트를 반환한다.
+        # 조용히 실패하면 카메라도 YOLO도 FPS도 정상으로 보이는 채 검출만 0이라
+        # 현장에서 원인을 찾는 데 시간을 통째로 버린다.
+        names = getattr(self.model, "names", None)
+        if names:
+            available = list(names.values()) if isinstance(names, dict) else list(names)
+            if target_class_name not in available:
+                print("=" * 78)
+                print(f"[YOLO] !! target_class_name='{target_class_name}' 이(가) 모델에 없습니다.")
+                print(f"[YOLO]    모델 클래스: {available}")
+                print(f"[YOLO]    이대로 두면 검출이 영원히 0건입니다. "
+                      f"config.py의 target_class_name을 고치세요.")
+                print("=" * 78)
+            else:
+                print(f"[YOLO] target_class_name='{target_class_name}' 확인됨 "
+                      f"(모델 클래스 {len(available)}종)")
+
     def detect(self, image, roi: Optional[Tuple[int, int, int, int]] = None) -> List[Dict]:
         H, W = image.shape[:2]
         offset_x, offset_y = 0, 0

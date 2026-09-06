@@ -37,7 +37,7 @@ _P = argparse.ArgumentParser(description=__doc__,
 _P.add_argument("--scenario", default="boot_no_leader",
                 choices=["boot_no_leader", "pilot_takeover", "hold_heading",
                          "air_landing", "depth_range", "hover_hold", "px4_setmode",
-                         "depth_loss"])
+                         "depth_loss", "handover"])
 _P.add_argument("--all", action="store_true", help="모든 시나리오를 순서대로")
 _P.add_argument("--repo", default=str(__import__("pathlib").Path(__file__).resolve().parent.parent),
                 help="검사할 저장소 경로 (대조군은 수정 전 worktree를 지정)")
@@ -346,6 +346,7 @@ def run_scenario(name):
     land_seen_at = [None]
     took_over_at = [None]
     depth_lost_at = [None]
+    guided_at = [None]
 
     def watcher():
         while not World.stop:
@@ -398,6 +399,13 @@ def run_scenario(name):
                         # 리더가 FOV를 벗어난 뒤의 LAND는 정당한 소실 failsafe다
                         log(f"(리더 FOV 이탈 후 LAND — 정당한 failsafe, C3 아님)")
 
+            elif name == "handover":
+                if mode == "LAND" and land_seen_at[0] is None:
+                    land_seen_at[0] = now
+                    if guided_at[0] is not None:
+                        fail(f"인계 직후 LAND — GUIDED 전환 {now - guided_at[0]:.1f}초 만에 "
+                             f"착륙 명령이 나갔다")
+
             elif name == "depth_loss":
                 if mode == "LAND" and land_seen_at[0] is None:
                     land_seen_at[0] = now
@@ -422,6 +430,23 @@ def run_scenario(name):
             time.sleep(8)
             World.visible = False
             log("리더 소실 (lost_hold 5s 후 FAILSAFE_LAND 예상)")
+        elif name == "handover":
+            # 실제 운용 절차 재현: 조종사가 수동(LOITER = ALT_HOLD 대용)으로 상승하는
+            # 동안 리더는 화면 밖이다. 그 사이 미션은 FAILSAFE_LAND로 래치된다.
+            # 그 뒤 GUIDED로 넘길 때 LAND가 튀어나오면 안 된다.
+            log("시나리오: 리더 잠깐 보임 → 수동으로 12초 상승(리더 안 보임) → GUIDED 인계")
+            while not World.stop and not World.have_fix:
+                time.sleep(0.2)
+            time.sleep(4)                    # 리더를 잠깐 보여 last_seen_t를 세운다
+            pilot.set_mode("LOITER")         # 조종사가 수동으로
+            World.visible = False            # 상승 중 리더는 화면 밖
+            log("수동 모드 + 리더 소실 — 미션은 FAILSAFE_LAND로 래치될 것")
+            time.sleep(12)
+            World.visible = True             # 인계 시점에 리더를 다시 보여준다
+            pilot.set_mode("GUIDED")
+            guided_at[0] = time.time() - T0
+            log(f"GUIDED 인계 (t={guided_at[0]:.1f}s) — 여기서 LAND가 나오면 실패")
+
         elif name == "depth_loss":
             # 깊이만 죽이고 YOLO 검출은 유지한다. 수정 전 게이트는 bbox만 보고
             # "리더가 보인다"고 판단하므로 소실 판정이 영원히 안 난다.
@@ -500,6 +525,12 @@ def run_scenario(name):
     if os.environ.get("HARNESS_TRACE"):
         for t, r, agl in ranges[::10]:
             log(f"  t={t:5.1f}s front={r:5.2f}m agl={agl:5.1f}m fov={in_fov()}")
+
+    if name == "handover":
+        if guided_at[0] is None:
+            fail("GUIDED 인계에 도달하지 못함 (시나리오 오류)")
+        elif land_seen_at[0] is None:
+            log("인계 후 LAND 없음 — 정상")
 
     if name == "depth_loss":
         if depth_lost_at[0] is None:
