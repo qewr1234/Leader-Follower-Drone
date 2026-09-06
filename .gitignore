@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# 비행 로그 (기체별 위치·GPS 좌표 포함)
+logs/
+
+# 모델 가중치 / TensorRT 엔진 (대용량, 기체별 빌드)
+*.pt
+*.engine
+
+# 플랫폼별 wheel (감사 중 유입, Jetson에선 무용)
+*.whl
