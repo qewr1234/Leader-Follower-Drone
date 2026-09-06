@@ -32,6 +32,9 @@ CONFIG = {
     },
     "imm": {
         "max_coast_sec": 2.0,
+        # 거리 측정이 끊긴 뒤 소실로 보기까지의 유예.
+        # 미션 총 착륙 지연 = 이 값 + MissionManager.lost_hold_sec
+        "range_coast_max_sec": 2.0,
         "sigma_xy": 0.15,
         "sigma_z": 0.25,
     },

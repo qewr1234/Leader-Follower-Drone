@@ -18,6 +18,8 @@ SIGMA_W_CT = 0.3
 SIGMA_XY = CONFIG["imm"]["sigma_xy"]
 SIGMA_Z = CONFIG["imm"]["sigma_z"]
 MAX_COAST_SEC = CONFIG["imm"]["max_coast_sec"]
+# 거리 정보를 담은 측정이 끊긴 뒤 "아직 위치를 안다"고 볼 수 있는 시간.
+RANGE_COAST_MAX_SEC = CONFIG["imm"].get("range_coast_max_sec", 2.0)
 
 TRANS_PROB = np.array(
     [
@@ -270,6 +272,11 @@ class ImmEkf:
         self.mu = np.array([0.7, 0.3], dtype=float)
         self.initialized = False
         self.coast_time = 0.0
+        # coast_time과 별도로 "거리를 마지막으로 관측한 뒤 흐른 시간"을 센다.
+        # bearing-only 업데이트는 방위만 주고 거리는 관측하지 못하는데,
+        # coast_time은 거기서도 0이 되므로 깊이가 죽어도 필터가 "잘 보고 있다"고
+        # 믿게 된다. 미션의 소실 판정은 이 값을 써야 한다.
+        self.range_coast_time = 0.0
 
     def init(self, z):
         x0 = np.array([z[0], z[1], z[2], 0.0, 0.0, 0.0], dtype=float)
@@ -281,12 +288,15 @@ class ImmEkf:
         self.mu = np.array([0.7, 0.3], dtype=float)
         self.initialized = True
         self.coast_time = 0.0
+        self.range_coast_time = 0.0
 
     def predict(self, dt):
         if not self.initialized:
             return
 
         dt = max(float(dt), 1e-4)
+        # 매 프레임 누적하고, 거리 측정이 들어올 때만 0으로 되돌린다.
+        self.range_coast_time += dt
 
         Pi = TRANS_PROB
         mu_pred = Pi.T @ self.mu
@@ -326,6 +336,7 @@ class ImmEkf:
             return
 
         self.coast_time = 0.0
+        self.range_coast_time = 0.0     # 거리를 담은 유일한 측정 경로
 
         likelihoods = np.array(
             [f.update_position3d(z, R) for f in self.filters]
@@ -442,6 +453,7 @@ class ImmEkf:
             "mode_probs": self.mu.copy(),
             "initialized": self.initialized,
             "coast_time": self.coast_time,
+            "range_coast_time": self.range_coast_time,
         }
 
     def get_position(self):
@@ -460,6 +472,15 @@ class ImmEkf:
 
     def is_reliable(self):
         return self.initialized and (self.coast_time <= MAX_COAST_SEC)
+
+    def has_range_fix(self, max_age=None):
+        """거리를 아직 안다고 볼 수 있는가.
+
+        is_reliable()과 다르다: bearing-only 업데이트는 coast_time을 0으로
+        되돌리지만 거리는 관측하지 못한다. 미션의 소실 판정에는 이 쪽을 쓴다.
+        """
+        limit = RANGE_COAST_MAX_SEC if max_age is None else float(max_age)
+        return self.initialized and (self.range_coast_time <= limit)
 
 
 def get_intrinsics_from_camera(pipeline_profile):

@@ -73,8 +73,12 @@ check("C1: 부팅 직후(리더 미획득) LAND 안 함",
 
 m2 = MissionManager()
 m2.update(now=100.0, leader_visible=True, rel_vel_est=[0.0, 0.0, 0.0], **MOVING)
-state, policy = m2.update(now=106.0, leader_visible=False, **MOVING)
-check("C1: 실제로 놓친 뒤에는 FAILSAFE_LAND 유지",
+state, policy = m2.update(now=105.0, leader_visible=False, **MOVING)
+check("C1: 놓친 직후에는 LOST_HOLD (아직 착륙 아님)",
+      policy["land"] is False, f"state={state}")
+state, policy = m2.update(now=100.0 + m2.lost_hold_sec + 1.0,
+                          leader_visible=False, **MOVING)
+check("C1: lost_hold_sec 경과 후 FAILSAFE_LAND",
       policy["land"] is True and state == S_FAILSAFE_LAND, f"state={state}")
 
 # ---------------------------------------------------------------- C3
@@ -184,6 +188,37 @@ class _RaisingMaster(_CaptureMaster):
 
 check("C6: set_mode 실패해도 예외 전파 안 함(fallback 도달 가능)",
       main.set_mode(_RaisingMaster(), "LAND") is False)
+
+# ------------------------------------------------- 거리 관측 coast (소실 판정)
+from imm_ekf import ImmEkf, RANGE_COAST_MAX_SEC  # noqa: E402
+
+ek = ImmEkf()
+ek.init([0.0, 0.0, 5.0])
+check("rcoast: 초기화 직후 거리 확보", ek.has_range_fix())
+
+# bearing-only 업데이트만 반복 → 거리는 관측되지 않는다
+import numpy as np3  # noqa: E402
+Rb = np3.diag([0.03 ** 2, 0.03 ** 2])
+for _ in range(60):                     # 30fps 2초
+    ek.predict(1 / 30)
+    ek.update_bearing2d([0.0, 0.0], Rb)
+check("rcoast: bearing-only는 coast_time을 되돌린다 (기존 동작)",
+      ek.coast_time == 0.0 and ek.is_reliable())
+for _ in range(30):                     # 다시 1초 → 총 3초 > 2.0
+    ek.predict(1 / 30)
+    ek.update_bearing2d([0.0, 0.0], Rb)
+check("rcoast: bearing-only만으로는 거리 확보로 치지 않음",
+      not ek.has_range_fix(),
+      f"rcoast={ek.range_coast_time:.2f}s > {RANGE_COAST_MAX_SEC}")
+check("rcoast: 그래도 is_reliable()은 참 — 둘이 다른 질문임을 확인",
+      ek.is_reliable())
+
+ek.update_position3d([0.0, 0.0, 5.0])   # RGB-D 측정 하나로 회복
+check("rcoast: 거리 측정 들어오면 즉시 회복", ek.has_range_fix())
+
+# 총 착륙 지연 = range_coast_max_sec + lost_hold_sec = 10초
+total = CONFIG["imm"]["range_coast_max_sec"] + MissionManager().lost_hold_sec
+check("소실 후 착륙까지 총 10초", abs(total - 10.0) < 1e-9, f"{total}s")
 
 # ---------------------------------------------------------------- 트래커 신원 게이트
 from tracker import LeaderTracker  # noqa: E402

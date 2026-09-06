@@ -36,7 +36,8 @@ _P = argparse.ArgumentParser(description=__doc__,
                              formatter_class=argparse.RawDescriptionHelpFormatter)
 _P.add_argument("--scenario", default="boot_no_leader",
                 choices=["boot_no_leader", "pilot_takeover", "hold_heading",
-                         "air_landing", "depth_range", "hover_hold", "px4_setmode"])
+                         "air_landing", "depth_range", "hover_hold", "px4_setmode",
+                         "depth_loss"])
 _P.add_argument("--all", action="store_true", help="모든 시나리오를 순서대로")
 _P.add_argument("--repo", default=str(__import__("pathlib").Path(__file__).resolve().parent.parent),
                 help="검사할 저장소 경로 (대조군은 수정 전 worktree를 지정)")
@@ -87,6 +88,7 @@ class World:
     watcher가 SITL의 LOCAL_POSITION_NED / ATTITUDE로 갱신한다.
     """
     visible = True
+    depth_ok = True      # False면 검출은 계속되지만 깊이 측정만 죽는다
     frames = 0
     stop = False
 
@@ -101,6 +103,7 @@ class World:
     @classmethod
     def reset(cls):
         cls.visible = True
+        cls.depth_ok = True
         cls.frames = 0
         cls.stop = False
         cls.have_fix = False
@@ -155,7 +158,7 @@ class FakeCam:
         color = np.zeros((H, W, 3), dtype=np.uint8)
         # 배경은 15m — 어떤 depth_max보다도 멀어서 리더만 유효 픽셀이 된다.
         depth = np.full((H, W), int(15.0 / self.depth_scale), dtype=np.uint16)
-        if World.visible:
+        if World.visible and World.depth_ok:
             u, v, half, front = _bbox_px()
             if 0 <= u < W and 0 <= v < H:
                 depth[max(0, v - half):v + half, max(0, u - half):u + half] = int(
@@ -342,6 +345,7 @@ def run_scenario(name):
     seen_modes, headings, ranges = [], [], []
     land_seen_at = [None]
     took_over_at = [None]
+    depth_lost_at = [None]
 
     def watcher():
         while not World.stop:
@@ -394,6 +398,10 @@ def run_scenario(name):
                         # 리더가 FOV를 벗어난 뒤의 LAND는 정당한 소실 failsafe다
                         log(f"(리더 FOV 이탈 후 LAND — 정당한 failsafe, C3 아님)")
 
+            elif name == "depth_loss":
+                if mode == "LAND" and land_seen_at[0] is None:
+                    land_seen_at[0] = now
+
             elif name == "pilot_takeover":
                 if mode == "LAND" and land_seen_at[0] is None:
                     land_seen_at[0] = now
@@ -414,6 +422,18 @@ def run_scenario(name):
             time.sleep(8)
             World.visible = False
             log("리더 소실 (lost_hold 5s 후 FAILSAFE_LAND 예상)")
+        elif name == "depth_loss":
+            # 깊이만 죽이고 YOLO 검출은 유지한다. 수정 전 게이트는 bbox만 보고
+            # "리더가 보인다"고 판단하므로 소실 판정이 영원히 안 난다.
+            log("시나리오: 8초 뒤 깊이만 소실(검출은 유지) → 착륙하는가 (거리 게이트)")
+            while not World.stop and not World.have_fix:
+                time.sleep(0.2)
+            time.sleep(8)
+            World.depth_ok = False
+            depth_lost_at[0] = time.time() - T0
+            log(f"깊이 소실 (t={depth_lost_at[0]:.1f}s). "
+                f"기대: 약 10초 뒤 LAND")
+
         elif name == "hold_heading":
             log("시나리오: 리더 고정, 기수 드리프트 감시 (C5)")
 
@@ -480,6 +500,18 @@ def run_scenario(name):
     if os.environ.get("HARNESS_TRACE"):
         for t, r, agl in ranges[::10]:
             log(f"  t={t:5.1f}s front={r:5.2f}m agl={agl:5.1f}m fov={in_fov()}")
+
+    if name == "depth_loss":
+        if depth_lost_at[0] is None:
+            fail("깊이 소실을 발동시키지 못함 (시나리오 오류)")
+        elif land_seen_at[0] is None:
+            fail("거리 게이트: 깊이가 죽었는데 착륙하지 않음 — "
+                 "bbox만 보고 '리더가 보인다'고 판단하는 상태")
+        else:
+            delay = land_seen_at[0] - depth_lost_at[0]
+            log(f"깊이 소실 → LAND 까지 {delay:.1f}초")
+            if not (6.0 <= delay <= 16.0):
+                fail(f"거리 게이트: 착륙까지 {delay:.1f}초 — 기대 10초 부근이 아님")
 
     if name in ("depth_range", "hover_hold") and len(ranges) > 10:
         target = float(main.TARGET_DISTANCE_M)

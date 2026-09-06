@@ -32,7 +32,7 @@ class MissionManager:
         landing_vz_thresh=-0.10,
         landing_hspeed_thresh=0.25,
         landing_confirm_sec=1.8,
-        lost_hold_sec=5.0,
+        lost_hold_sec=8.0,   # + imm.range_coast_max_sec(2.0) = 소실 후 총 10초에 착륙
     ):
         self.state = S_WAIT_LEADER
 

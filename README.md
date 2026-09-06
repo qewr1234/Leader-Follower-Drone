@@ -177,6 +177,7 @@ ArduCopter 4.8.0-dev SITL(네이티브 arm64 빌드)에 **저장소의 실제 `m
 | **C4** 0.3 m/s 리더 추종 | ✅ 후반 4.3m (목표 3.0m) | ❌ **10.8m — 따라붙지 못함** |
 | **H2** 리더 정지 후 정위치 유지 | ✅ 후반 3.0m (목표 3.0m) | ❌ **6.0m에서 정지, 수렴 안 함** |
 | **C6** PX4 3-튜플 `mode_mapping` | ✅ 예외 없음 (PX4 SITL) | ❌ **`required argument is not an integer`** |
+| **거리 게이트** 깊이만 소실 (검출은 유지) | ✅ **10.0초 뒤 LAND** | ❌ **35초 내내 GUIDED — 착륙 안 함** |
 | **C5** 기수 제어권 이양 (`c5_probe.py`) | 5.0° 유지 | 1.0° 유지 — **증상 발생 불가** |
 
 C4의 4.3m는 P 제어 평형거리 이론값 `TARGET + v/KP_FORWARD = 3.0 + 0.3/0.22 = 4.36m`와
@@ -240,6 +241,22 @@ ArduCopter SITL에서 재검증해 통과를 확인했습니다.
 **수정**: 회복 시에는 겹침 대신 **근접**을 요구합니다 — 중심 이동량이 이전 bbox 대각선의
 `0.75 × (1 + lost_count)`배 이내여야 합니다. 정상 기동은 통과하고 화면 반대편 점프는 막힙니다.
 
+### 소실 판정을 거리 기준으로 (2026-09-07 추가)
+
+`leader_visible_for_mission = track_visible or ekf_reliable or esp_visible` —
+**`track_visible` 하나로 충분했습니다.** YOLO가 bbox만 내면 미션은 "리더를 보고 있다"고
+판단합니다. 깊이가 죽어 bearing-only로 강등돼도(거리 관측 불가) 소실 판정이 나지 않아
+**실패 착륙이 영원히 발동하지 않습니다.** `ekf.is_reliable()`도 마찬가지입니다 —
+`coast_time`이 bearing-only 업데이트로도 0이 되기 때문입니다.
+
+**수정**: `coast_time`과 별도로 **`range_coast_time`** 을 셉니다. 매 `predict`마다 누적하고
+**거리를 담은 측정(RGB-D / ESP32 위치)에서만** 0으로 되돌립니다. 미션 판정은
+`ekf.has_range_fix()`를 씁니다. 상태 출력에 `rcoast=`로 함께 표시되므로 운용 중 두 값이
+갈라지는 것을 볼 수 있습니다.
+
+**소실 후 착륙까지 총 10초**로 맞췄습니다 — `imm.range_coast_max_sec`(2.0) +
+`MissionManager.lost_hold_sec`(8.0). SITL 실측 10.0초.
+
 ## 남은 결함
 
 수정하지 않았습니다. 실비행 전에 판단이 필요합니다.
@@ -249,9 +266,6 @@ ArduCopter SITL에서 재검증해 통과를 확인했습니다.
   바로 구현 가능합니다.
 - **ESP32 속도 hint가 칼만 게이트를 우회** — `leader_telemetry.py:535-559`가 필터 상태에 직접
   대입하고 공분산을 무조건 축소합니다. innovation도 Mahalanobis 게이트도 likelihood도 없습니다.
-- **`is_reliable()`이 거리 관측 없이도 참** — bearing-only 업데이트나 ESP32 업데이트만으로도
-  `coast_time`이 0으로 리셋됩니다. 깊이를 잃어도 필터는 "잘 보고 있다"고 믿으므로, **"N초 안 보이면
-  착륙" 판정이 발동하지 않을 수 있습니다.**
 - **`p_ct`가 사전확률 0.333에서 벗어나지 않음** — 37개 시나리오 중 34개에서 "mode-aware"가
   사실상 무동작이었습니다.
 - **`detector_skipped` 페널티 도달 불가** — 플래그가 측정 dict에 복사되지 않아, 직전 bbox를

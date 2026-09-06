@@ -562,7 +562,7 @@ def main():
                     f"FC={fc_mode}{'*' if fc_armed else ''} "
                     f"ESP={int(leader_meas.get('available', False))}:{leader_meas.get('reason', 'none')} "
                     f"CV={p_cv:.2f} CT={p_ct:.2f} "
-                    f"coast={ekf.coast_time:.1f}s "
+                    f"coast={ekf.coast_time:.1f}s rcoast={ekf.range_coast_time:.1f}s "
                     f"mission={mission.state}"
                 )
 
@@ -795,7 +795,12 @@ def main():
             ekf_reliable = ekf.initialized and ekf.is_reliable()
             esp_visible = bool(leader_meas.get("available", False))
 
-            leader_visible_for_mission = bool(track_visible or ekf_reliable or esp_visible)
+            # 미션의 "리더가 보인다"는 판정은 bbox가 아니라 **거리를 아는가**여야 한다.
+            # track_visible은 YOLO가 상자만 그려도 참이 되고, ekf.is_reliable()은
+            # bearing-only 업데이트로도 참이 된다. 둘 다 거리 관측을 보장하지 않으므로
+            # 깊이가 죽어도 소실 판정이 나지 않아 실패 착륙이 발동하지 않는다.
+            # RGB-D와 ESP32 위치만 거리를 담으며, 그 둘만 range_coast_time을 되돌린다.
+            leader_visible_for_mission = bool(ekf.has_range_fix())
 
             # ------------------------------------------------------------
             # Mission state manager
