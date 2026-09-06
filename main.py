@@ -100,7 +100,10 @@ LEADER_MAX_AGE_SEC = 0.70
 LEADER_VELOCITY_FRAME = "ENU"
 
 # 목표 추종 거리
-TARGET_DISTANCE_M = 5.0
+TARGET_DISTANCE_M = 3.0  # C4: depth_max 10m 대비 여유 7m.
+# P제어 정상상태 평형거리 = TARGET + v_leader/KP_FORWARD 이므로
+# 이 값과 config의 depth_max_m 간격이 곧 추종 가능한 리더 속도 상한이다.
+# (5.0 + depth_max 6.0 조합에서는 리더 0.22 m/s에서 이미 깊이창 밖이었다)
 
 # BODY_NED velocity limit
 # BODY_NED:
@@ -137,6 +140,8 @@ UNCERTAINTY_SLOWDOWN_TRACE = CONFIG["controller"].get(
 )
 
 SETPOINT_PERIOD_SEC = 0.10
+# C2: LAND가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
+LAND_RETRY_SEC = 2.0
 
 GPS_MAX_AGE_SEC = 0.70
 LOCAL_POS_MAX_AGE_SEC = 0.40
@@ -282,8 +287,11 @@ def send_body_velocity(master, vx, vy, vz, yaw_rate=0.0):
         mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
     )
 
-    if abs(yaw_rate) < 1e-6:
-        type_mask |= mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+    # C5: YAW_RATE_IGNORE를 세우면 ArduCopter가 WP_YAW_BEHAVIOR(기본 2)로
+    # 기수를 스스로 돌린다. 프레임이 BODY_NED이므로 이후 모든 속도 명령이
+    # 기체가 임의로 정한 heading 기준으로 재해석된다(SITL 실측 164.6° 이탈).
+    # yaw_rate=0.0 + 비트 clear = "현재 기수 유지"이며 이것이 의도한 동작.
+    # 기체 파라미터도 WP_YAW_BEHAVIOR=0으로 설정할 것.
 
     master.mav.set_position_target_local_ned_send(
         int(time.time() * 1000) & 0xFFFFFFFF,
@@ -309,12 +317,15 @@ def set_mode(master, mode_name):
         print(f"[WARN] mode {mode_name} not available in mode_mapping")
         return False
 
-    mode_id = mode_mapping[mode_name]
-    master.mav.set_mode_send(
-        master.target_system,
-        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        mode_id,
-    )
+    # C6: PX4의 mode_mapping 값은 3-튜플(예: LAND -> (29, 4, 6))이라
+    # set_mode_send의 uint32 필드에 넣으면 struct.error가 나고, 예외 처리가
+    # 없어 비행 중 제어 루프가 죽는다. master.set_mode()가 apm/px4를 자동 분기한다.
+    try:
+        master.set_mode(mode_name)
+    except Exception as e:
+        print(f"[WARN] set_mode({mode_name}) 실패: {type(e).__name__}: {e}")
+        return False
+
     print(f"[FC] set mode: {mode_name}")
     return True
 
@@ -475,6 +486,7 @@ def main():
     prev_time = time.time()
     last_bat_print = 0.0
     last_setpoint_time = 0.0
+    last_land_send = 0.0  # C2: LAND 재시도 타이머
 
     fps_counter = 0
     fps_t0 = time.time()
@@ -504,6 +516,13 @@ def main():
             drain_messages(master)
             vehicle_state = get_vehicle_state()
 
+            # C2: FC 모드를 매 루프 읽는다. 이전에는 1Hz 출력 블록 안에서만 읽어
+            # 송신 지점에서 참조할 수 없었다. GUIDED/OFFBOARD를 벗어났다는 것은
+            # 조종사가 수동 탈환했다는 뜻이므로 모든 송신을 하드 스톱한다.
+            fc_mode = vehicle_state.get("mode", {}).get("name", "?")
+            fc_armed = vehicle_state.get("mode", {}).get("armed", False)
+            fc_accepts_setpoints = fc_mode in ("GUIDED", "OFFBOARD")
+
             gps_fresh = is_fresh(vehicle_state.get("gps", {}), now, GPS_MAX_AGE_SEC)
             local_pos_fresh = is_fresh(vehicle_state.get("local_position", {}), now, LOCAL_POS_MAX_AGE_SEC)
             attitude_fresh = is_fresh(vehicle_state.get("attitude", {}), now, ATTITUDE_MAX_AGE_SEC)
@@ -520,8 +539,6 @@ def main():
 
             if now - last_bat_print >= 1.0:
                 p_cv, p_ct = ekf.get_model_probs() if ekf.initialized else (0.0, 0.0)
-                fc_mode = vehicle_state.get("mode", {}).get("name", "?")
-                fc_armed = vehicle_state.get("mode", {}).get("armed", False)
                 print(
                     f"[STAT] {battery_text()} "
                     f"FPS={fps_display:.1f} "
@@ -535,9 +552,9 @@ def main():
                 )
 
                 # velocity setpoint는 ArduPilot GUIDED / PX4 OFFBOARD에서만 동작
-                if SEND_MAVLINK_COMMANDS and fc_mode not in ("GUIDED", "OFFBOARD"):
+                if SEND_MAVLINK_COMMANDS and not fc_accepts_setpoints:
                     print(
-                        f"[WARN] FC mode={fc_mode}: velocity setpoint가 무시될 수 있음 "
+                        f"[WARN] FC mode={fc_mode}: 송신 중단됨 "
                         f"(ArduPilot: GUIDED / PX4: OFFBOARD 필요)"
                     )
                 last_bat_print = now
@@ -787,9 +804,19 @@ def main():
             if mission_policy["land"]:
                 desired_body_cmd = np.zeros(4, dtype=float)
 
-                if SEND_MAVLINK_COMMANDS and now - last_setpoint_time >= SETPOINT_PERIOD_SEC:
-                    send_land(master)
-                    last_setpoint_time = now
+                # C2: 이전에는 100ms마다 set_mode("LAND")를 재송신해서
+                # 조종사가 LOITER로 탈환해도 100~135ms 만에 다시 끌려갔다.
+                #
+                # 모드 게이트가 곧 latch다: LAND가 실제로 먹으면 FC 모드가
+                # GUIDED/OFFBOARD를 벗어나므로 이 분기가 더 이상 실행되지 않는다.
+                # 여전히 여기 있다는 건 명령이 먹지 않았다는 뜻이라 그때만
+                # LAND_RETRY_SEC 간격으로 재시도한다 (조종사 탈환 시엔
+                # fc_accepts_setpoints=False라 아예 보내지 않는다).
+                if SEND_MAVLINK_COMMANDS and fc_accepts_setpoints:
+                    if now - last_land_send >= LAND_RETRY_SEC:
+                        send_land(master)
+                        last_land_send = now
+                        last_setpoint_time = now
 
             elif mission_policy["allow_follow"] and ekf.initialized:
                 desired_body_cmd = compute_velocity_cmd_from_estimate(
@@ -810,8 +837,9 @@ def main():
 
             # setpoint 송신
             if not mission_policy["land"]:
+                last_land_send = 0.0
                 if now - last_setpoint_time >= SETPOINT_PERIOD_SEC:
-                    if SEND_MAVLINK_COMMANDS:
+                    if SEND_MAVLINK_COMMANDS and fc_accepts_setpoints:
                         send_body_velocity(
                             master,
                             current_body_cmd[0],

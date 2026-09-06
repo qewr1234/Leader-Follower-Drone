@@ -45,6 +45,12 @@ class ReliabilityEstimator:
         if mad is None:
             return 0.0
 
+        # C4: max_depth_mad는 config에 정의만 되고 아무도 쓰지 않는 죽은 상수였다.
+        # 깊이 outlier가 과반이면 median이 outlier에 앉는데도 신뢰도가 높게 나와
+        # 제어가 포화된 전속 후진으로 갔다. 산포가 한계를 넘으면 측정을 버린다.
+        if float(mad) > float(CONFIG["measurement"]["max_depth_mad"]):
+            return 0.0
+
         r_valid = np.clip(
             valid_ratio / max(CONFIG["measurement"]["min_depth_valid_ratio"], 1e-6),
             0.0,

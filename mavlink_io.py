@@ -6,13 +6,15 @@ mavlink_io.py — Pixhawk MAVLink 통신
 - GPS/attitude/local position quality 상태 수집 추가
 """
 
+import os
 import time
 from pymavlink import mavutil
 
 last_battery_pct = None
 last_battery_voltage = None
 
-SERIAL_PORT = "/dev/ttyACM0"
+# SITL 회귀용: MARS_FC_PORT=udpin:0.0.0.0:14550 python3 main.py
+SERIAL_PORT = os.environ.get("MARS_FC_PORT", "/dev/ttyACM0")
 SERIAL_BAUD = 115200
 ALL_MOTORS = [1, 2, 3, 4]
 

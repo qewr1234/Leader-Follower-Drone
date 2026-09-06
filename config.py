@@ -21,7 +21,7 @@ CONFIG = {
         "height": 480,
         "fps": 30,
         "depth_min_m": 0.30,
-        "depth_max_m": 6.00,
+        "depth_max_m": 10.00,   # C4: TARGET_DISTANCE_M(3.0) 대비 여유 7m
         "depth_scale_fallback": 0.001,
     },
     "measurement": {

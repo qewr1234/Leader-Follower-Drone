@@ -84,6 +84,13 @@ class MissionManager:
                 self.first_seen_t = now
             self.last_seen_t = now
         else:
+            if self.last_seen_t is None:
+                # C1: 리더를 아직 한 번도 못 본 것은 "놓친" 것이 아니다.
+                # 이 가드가 없으면 _lost_time이 999.0을 반환해 부팅 첫 프레임에
+                # FAILSAFE_LAND로 직행한다 (이륙 직후 = 리더 획득 전이 정확히 이 조건).
+                self._set_state(S_WAIT_LEADER, now)
+                return self.state, self.command_policy()
+
             lost_time = self._lost_time(now)
 
             if lost_time < self.lost_hold_sec:
@@ -131,7 +138,7 @@ class MissionManager:
         # 출발 판단
         started_like = hspeed > self.start_speed_thresh
 
-        if self.state in [S_WAIT_LEADER, S_READY_HOVER, S_LEADER_HOVER]:
+        if self.state in [S_WAIT_LEADER, S_READY_HOVER]:
             if started_like:
                 if self.start_candidate_t is None:
                     self.start_candidate_t = now
@@ -146,11 +153,15 @@ class MissionManager:
 
             return self.state, self.command_policy()
 
-        # FOLLOW 중 선두가 거의 정지하면 후미도 호버링
-        if self.state == S_FOLLOW:
-            if hspeed < self.hover_speed_thresh:
+        # FOLLOW 중 선두가 거의 정지하면 정위치 유지(LEADER_HOVER)로.
+        # H2: LEADER_HOVER를 여기서 처리해야 한다. 위 출발판단 블록에 두면
+        # 진입 다음 프레임에 READY_HOVER로 덮여 정확히 1프레임만 살아남는다.
+        # 히스테리시스: 진입 0.18 m/s, 복귀 0.25 m/s. 두 상태 모두 allow_follow=True라
+        # "따라잡아서 상대속도가 준 것"과 "리더가 멈춘 것"을 혼동해도 제어는 끊기지 않는다.
+        if self.state in [S_FOLLOW, S_LEADER_HOVER]:
+            if self.state == S_FOLLOW and hspeed < self.hover_speed_thresh:
                 self._set_state(S_LEADER_HOVER, now)
-            else:
+            elif self.state == S_LEADER_HOVER and hspeed > self.start_speed_thresh:
                 self._set_state(S_FOLLOW, now)
 
             return self.state, self.command_policy()
@@ -209,19 +220,17 @@ class MissionManager:
                 hspeed = float(np.linalg.norm(rv[:2]))
                 vz = float(rv[2])
 
-        if leader_alt is not None:
-            z_for_landing = float(leader_alt)
-        elif rel_est is not None:
-            rel = np.asarray(rel_est, dtype=float)
-            z_for_landing = float(rel[2]) if rel.size >= 3 else None
-        else:
-            z_for_landing = None
+        # C3: 절대(대지) 고도가 없으면 착륙 판정을 하지 않는다.
+        # 상대 z로 대체하면 동고도 편대비행에서 값이 0 근처라 고도 조건이
+        # 항상 만족되어 공중에서 CONFIRMED_LANDING이 난다.
+        z_for_landing = float(leader_alt) if leader_alt is not None else None
 
         return hspeed, vz, z_for_landing
 
     def _lost_time(self, now):
+        # last_seen_t is None은 update()에서 이미 걸러진다 (C1 가드).
         if self.last_seen_t is None:
-            return 999.0
+            return 0.0
         return float(now - self.last_seen_t)
 
     def _set_state(self, new_state, now):
