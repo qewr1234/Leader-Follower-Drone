@@ -46,7 +46,18 @@ python3 sitl/harness.py --all
 |---|---|---|
 | `boot_no_leader` | **C1** | 리더를 한 번도 못 봤는데 LAND로 전환 |
 | `pilot_takeover` | **C2** | 조종사 LOITER 탈환이 LAND로 덮어써짐 |
+| `air_landing` | **C3** | 리더가 보이는데 공중에서 착륙 판정 → LAND |
+| `depth_range` | **C4** | 0.3 m/s 리더를 따라붙지 못함 (후반 거리 > 목표+3m) |
+| `hover_hold` | **H2** | 리더 정지 후 목표거리로 수렴 못 함 (오차 > 1.5m) |
 | `hold_heading` | **C5** | 명령 yaw_rate=0인데 기수가 25° 이상 자체 회전 |
+
+월드는 **폐루프**입니다 — 팔로워가 실제로 움직이면 리더까지의 거리가 변합니다. 팔로워 위치와
+기수는 SITL의 `LOCAL_POSITION_NED` / `ATTITUDE`로 갱신되며, 그래야 정위치 유지(H2)나 거리
+추종(C4)이 관측 가능해집니다.
+
+`air_landing`은 `LOCAL_POSITION_NED`를 `main`의 시야에서만 가려 `leader_alt_est=None`
+조건(EKF origin 설정 전에 실제로 발생)을 재현합니다. 로직을 건드리는 게 아니라 메시지가 없는
+환경을 만드는 것입니다.
 
 ## 4. 차등 검증 — 이게 핵심입니다
 
@@ -62,11 +73,29 @@ git worktree remove --force /tmp/mars_before
 
 ### 2026-09-07 실측
 
-| 시나리오 | 수정 후 | 수정 전 (대조군) |
+| 시나리오 | 수정 후 | 대조군 |
 |---|---|---|
-| `boot_no_leader` (C1) | PASS — 35초 GUIDED 유지 (947프레임) | **FAIL — t+0.9초에 LAND** |
-| `pilot_takeover` (C2) | PASS — LOITER 25초 유지 (1073프레임) | **FAIL — 0.1초 만에 LAND로 뺏김** |
+| `boot_no_leader` (C1) | PASS — 35초 GUIDED 유지 | **FAIL — t+0.9초에 LAND** |
+| `pilot_takeover` (C2) | PASS — LOITER 25초 유지 | **FAIL — 0.6초 만에 LAND로 뺏김** |
+| `air_landing` (C3) | PASS | **FAIL — t=2.6초, 고도 15m에서 착륙 판정** |
+| `depth_range` (C4) | PASS — 후반 4.3m (목표 3.0m) | **FAIL — 10.8m (목표 5.0m)** |
+| `hover_hold` (H2) | PASS — 후반 3.0m (목표 3.0m) | **FAIL — 6.0m에서 정지, 수렴 안 함** |
 | `hold_heading` (C5) | 기수 편차 0.0° | 0.0° — **재현 안 됨** |
+
+C4 수정 후의 4.3m는 P 제어 평형거리 이론값 `TARGET + v/KP_FORWARD = 3.0 + 0.3/0.22 = 4.36m`와
+소수 둘째 자리까지 일치합니다.
+
+### 대조군은 결함별로 격리해야 합니다
+
+**수정 전 전체 코드(초기 커밋)는 C3·C4·H2의 대조군으로 쓸 수 없습니다.** C1이 부팅 1~3초 만에
+LAND를 걸어버려 다른 결함의 조건에 도달조차 못 하기 때문입니다. 위 표의 C3/C4/H2 대조군은
+**수정본에서 해당 결함 하나만 되돌린** 사본입니다:
+
+| 대조군 | 되돌린 것 |
+|---|---|
+| C3 | `mission_manager._extract_motion`의 상대 z fallback 복원 |
+| C4 | `depth_max_m` 6.0, `TARGET_DISTANCE_M` 5.0 |
+| H2 | `S_LEADER_HOVER`를 출발판단 블록으로 되돌림 |
 
 C2 대조군 모드 이력이 결함을 그대로 보여줍니다:
 `GUIDED(2s) → LAND(15.1s) → LOITER(15.1s, 조종사) → LAND(15.2s, 컴패니언이 되뺏음)`
@@ -90,8 +119,8 @@ C2 대조군 모드 이력이 결함을 그대로 보여줍니다:
 
 ## 아직 커버하지 않는 것
 
-C3(공중 착륙 판정) · C4(깊이 범위) · H2(호버 정위치 유지)는 `test_fixes.py`의 단위 테스트만
-있습니다. C6(PX4 3-튜플 mode_mapping)은 PX4 SITL이 따로 필요합니다.
+C6(PX4 3-튜플 `mode_mapping`)은 PX4 SITL이 따로 필요합니다. `test_fixes.py`의 단위 테스트만
+있습니다.
 
 ## 하네스가 스텁하는 것
 
