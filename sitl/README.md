@@ -103,10 +103,7 @@ LAND를 걸어버려 다른 결함의 조건에 도달조차 못 하기 때문�
 C2 대조군 모드 이력이 결함을 그대로 보여줍니다:
 `GUIDED(2s) → LAND(15.1s) → LOITER(15.1s, 조종사) → LAND(15.2s, 컴패니언이 되뺏음)`
 
-**C5는 이 하네스로 재현되지 않았습니다.** `--force-target`으로 두 arm의 이동량을 통제하고
-`--wp-yaw-behavior 2`(공장 기본값)로 두어도 양쪽 다 0.0°였습니다. `WP_YAW_BEHAVIOR`가 GUIDED
-속도 제어에는 적용되지 않고 waypoint 항법에만 적용되는 것으로 보입니다. 마스크 수정 자체는
-`test_fixes.py`로 확인되지만, 그것이 막는다던 증상은 미검증 상태입니다.
+**C5의 증상은 재현되지 않으며, 그 이유가 소스 수준에서 확정되었습니다.** 아래 참조.
 
 ## 유용한 옵션
 
@@ -119,6 +116,44 @@ C2 대조군 모드 이력이 결함을 그대로 보여줍니다:
 --wp-yaw-behavior 2    # 기체 파라미터. C5 재현 시도 시 공장 기본값
 --fc-port / --pilot-port
 ```
+
+## C5 — 증상이 발생할 수 없는 이유 (`c5_probe.py`)
+
+`sitl/c5_probe.py`가 C5의 본질만 직접 잽니다: **type_mask가 기수 제어권을 FC에 넘기는가.**
+이륙 → 기수를 90°로 정렬 → 30초간 정지 setpoint를 지정한 마스크로 송신 → 기수 변화 측정.
+
+```bash
+python3 sitl/c5_probe.py 1479 3 30    # 수정 후 마스크
+python3 sitl/c5_probe.py 3527 3 30    # 수정 전 마스크
+```
+
+실측 (ArduCopter 4.8.0-dev, `WP_YAW_BEHAVIOR=3`):
+
+| 마스크 | 기수 최대 편차 |
+|---|---|
+| 1479 (수정 후) | 5.0° |
+| 3527 (수정 전) | 1.0° |
+
+**둘 다 기수를 유지합니다.** 이유는 세 가지이며 전부 소스로 확인됩니다:
+
+1. **`WP_YAW_BEHAVIOR=2`(공장 기본값)는 LOOK_AHEAD가 아닙니다.** `autoyaw.cpp`의
+   `default_mode()`에서 2는 `LOOK_AT_NEXT_WP_EXCEPT_RTL` → `LOOK_AT_NEXT_WP`이고,
+   GUIDED 속도 제어에는 waypoint가 없습니다. LOOK_AHEAD는 값 3입니다.
+2. **LOOK_AHEAD는 진입 시 현재 기수로 초기화됩니다** — `autoyaw.cpp:88-91`의
+   `_look_ahead_yaw_rad = copter.ahrs.get_yaw_rad()`. 그리고 `look_ahead_yaw_rad()`는
+   지면속도가 `YAW_LOOK_AHEAD_MIN_SPEED_MS`(=1 m/s)를 넘을 때만 갱신됩니다
+   (`autoyaw.cpp:22`, `config.h:476`). 정지 상태면 진입 시점의 기수를 영원히 유지합니다.
+3. **이 포크는 버그 마스크를 명령 속도가 0일 때만 내보냅니다.** `yaw_rate`는 `allow_follow`
+   경로 안에서만 계산되므로, `yaw_rate == 0`이면 병진 명령도 0입니다. 계측 결과 마스크 3527이
+   나간 620여 개 setpoint 전부에서 `|v| = 0.00`이었고, 1.0 m/s를 넘은 적은 한 번도 없습니다.
+   즉 **버그 마스크가 필요로 하는 조건과 look-ahead가 필요로 하는 조건이 상호 배타적입니다.**
+
+또한 이 기체의 후진 속도 상한은 `KP_FORWARD × (TARGET − front)`이므로 기본 게인
+0.22에서는 약 0.66 m/s이며, look-ahead 문턱 1.0 m/s에 **구조적으로 도달할 수 없습니다.**
+
+**결론**: 마스크 수정(항상 1479)은 그대로 둡니다 — 기수 유지를 FC 파라미터에 위임하는 대신
+명시하는 것이 옳고 비용이 0입니다. 다만 이전 감사가 보고한 "164.6° 이탈"은 이 구성에서
+발생할 수 없으며, C5는 **치명 등급이 아닙니다.**
 
 ## PX4 SITL (C6 전용)
 
