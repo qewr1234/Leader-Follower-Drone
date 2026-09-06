@@ -287,11 +287,13 @@ def send_body_velocity(master, vx, vy, vz, yaw_rate=0.0):
         mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
     )
 
-    # C5: YAW_RATE_IGNORE를 세우면 ArduCopter가 WP_YAW_BEHAVIOR(기본 2)로
-    # 기수를 스스로 돌린다. 프레임이 BODY_NED이므로 이후 모든 속도 명령이
-    # 기체가 임의로 정한 heading 기준으로 재해석된다(SITL 실측 164.6° 이탈).
-    # yaw_rate=0.0 + 비트 clear = "현재 기수 유지"이며 이것이 의도한 동작.
-    # 기체 파라미터도 WP_YAW_BEHAVIOR=0으로 설정할 것.
+    # C5: YAW_RATE_IGNORE를 세우면 기수 유지를 FC의 WP_YAW_BEHAVIOR에 위임하게 된다.
+    # yaw_rate=0.0 + 비트 clear = "현재 기수 유지"를 명시하는 쪽이 옳고 비용이 0이라
+    # 항상 mask 1479를 쓴다.
+    # 단, 이전 감사가 보고한 "기수 자동회전으로 164.6도 이탈"은 SITL에서 재현되지
+    # 않았고 발생할 수 없음이 확인됐다 — LOOK_AHEAD는 진입 시 현재 기수로 초기화되고
+    # 지면속도 1 m/s 초과에서만 갱신되는데, 이 포크는 버그 마스크를 명령 속도가 0일
+    # 때만 내보낸다. 자세한 근거는 sitl/README.md 참조.
 
     master.mav.set_position_target_local_ned_send(
         int(time.time() * 1000) & 0xFFFFFFFF,
@@ -413,12 +415,25 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace):
     return np.append(body_vel, cmd_yaw_rate)
 
 
-def smooth_velocity_cmd(prev_cmd, new_cmd, alpha=0.28):
-    """cmd = [body_vx, body_vy, body_vz, yaw_rate]"""
+SMOOTH_REF_DT = 1.0 / 30.0   # alpha가 튜닝된 기준 프레임 간격
+
+
+def smooth_velocity_cmd(prev_cmd, new_cmd, alpha=0.28, dt=None):
+    """cmd = [body_vx, body_vy, body_vz, yaw_rate]
+
+    alpha는 프레임당 값이라 그대로 쓰면 평활 시정수가 FPS에 딸려간다
+    (24fps와 30fps에서 응답이 25% 다르다). dt를 주면 기준 30fps 기준으로
+    보정해 실제 FPS와 무관하게 같은 시정수를 갖는다.
+    """
     prev_cmd = np.asarray(prev_cmd, dtype=float)
     new_cmd = np.asarray(new_cmd, dtype=float)
 
-    out = (1.0 - alpha) * prev_cmd + alpha * new_cmd
+    a = float(alpha)
+    if dt is not None and dt > 0:
+        a = 1.0 - (1.0 - a) ** (float(dt) / SMOOTH_REF_DT)
+        a = clamp(a, 0.0, 1.0)
+
+    out = (1.0 - a) * prev_cmd + a * new_cmd
 
     out[0] = clamp(out[0], -MAX_VX, MAX_VX)
     out[1] = clamp(out[1], -MAX_VY, MAX_VY)
@@ -832,6 +847,7 @@ def main():
                 prev_cmd=prev_body_cmd,
                 new_cmd=desired_body_cmd,
                 alpha=0.28,
+                dt=dt,
             )
             prev_body_cmd = current_body_cmd.copy()
 

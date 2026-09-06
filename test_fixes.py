@@ -185,7 +185,46 @@ class _RaisingMaster(_CaptureMaster):
 check("C6: set_mode 실패해도 예외 전파 안 함(fallback 도달 가능)",
       main.set_mode(_RaisingMaster(), "LAND") is False)
 
-# ----------------------------------------------------------------
+# ---------------------------------------------------------------- 트래커 신원 게이트
+from tracker import LeaderTracker  # noqa: E402
+
+tr = LeaderTracker()
+tr.update([{"bbox": [300.0, 220.0, 340.0, 260.0], "conf": 0.9, "cls_name": "person"}])
+tr.update([])                                   # 1프레임 미검출 -> lost_count = 1
+far = [{"bbox": [10.0, 10.0, 50.0, 50.0], "conf": 0.30, "cls_name": "person"}]
+t = tr.update(far)
+check("tracker: 1프레임 놓친 뒤 화면 반대편 검출은 거부",
+      t["lost_count"] >= 2 and t["is_lost"], f"lost={t['lost_count']}")
+
+tr2 = LeaderTracker()
+tr2.update([{"bbox": [300.0, 220.0, 340.0, 260.0], "conf": 0.9, "cls_name": "person"}])
+tr2.update([])
+near = [{"bbox": [312.0, 232.0, 352.0, 272.0], "conf": 0.5, "cls_name": "person"}]
+t = tr2.update(near)
+check("tracker: 근처 검출은 회복 허용", t["lost_count"] == 0 and not t["is_lost"])
+
+# ---------------------------------------------------------------- FPS 독립 평활
+import numpy as np2  # noqa: E402
+
+zero, one = np2.zeros(4), np2.ones(4)
+# 30fps에서 3프레임(0.1s) vs 24fps에서 2.4프레임 -> 같은 시간이면 같은 응답이어야 한다
+v = zero.copy()
+for _ in range(3):
+    v = main.smooth_velocity_cmd(v, one, alpha=0.28, dt=1 / 30)
+v30 = float(v[0])
+v = zero.copy()
+for _ in range(2):
+    v = main.smooth_velocity_cmd(v, one, alpha=0.28, dt=1 / 24)
+v24_2 = float(v[0])
+v = main.smooth_velocity_cmd(zero, one, alpha=0.28, dt=1 / 24)
+check("평활: 24fps 1스텝이 30fps 1스텝보다 빠르게 수렴 (dt 보정 동작)",
+      float(v[0]) > 0.28, f"a_eff={float(v[0]):.3f} vs 0.280")
+check("평활: 같은 경과시간(0.1s)이면 FPS가 달라도 응답 근사 일치",
+      abs(v30 - v24_2) < 0.06, f"30fps={v30:.3f} 24fps={v24_2:.3f}")
+check("평활: dt 미지정이면 기존 동작 유지",
+      abs(float(main.smooth_velocity_cmd(zero, one, alpha=0.28)[0]) - 0.28) < 1e-9)
+
+# ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "
       f"({len(failures)} 실패)")
