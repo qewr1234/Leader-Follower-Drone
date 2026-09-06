@@ -836,10 +836,16 @@ def main():
             prev_body_cmd = current_body_cmd.copy()
 
             # setpoint 송신
+            #
+            # 속도 setpoint에는 모드 게이트를 걸지 않는다. GUIDED/OFFBOARD가 아니면
+            # FC가 조용히 버리므로(조종사를 방해하지 않음), 반대로 PX4는 OFFBOARD에
+            # 진입하기 전에 이 스트림이 먼저 흐르고 있어야 한다. 게이트를 걸면
+            # PX4에서는 영원히 OFFBOARD에 못 들어가는 데드락이 된다.
+            # 조종사를 뺏는 것은 setpoint가 아니라 모드 변경(LAND)이며, 그쪽만 막는다.
             if not mission_policy["land"]:
                 last_land_send = 0.0
                 if now - last_setpoint_time >= SETPOINT_PERIOD_SEC:
-                    if SEND_MAVLINK_COMMANDS and fc_accepts_setpoints:
+                    if SEND_MAVLINK_COMMANDS:
                         send_body_velocity(
                             master,
                             current_body_cmd[0],

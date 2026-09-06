@@ -36,7 +36,7 @@ _P = argparse.ArgumentParser(description=__doc__,
                              formatter_class=argparse.RawDescriptionHelpFormatter)
 _P.add_argument("--scenario", default="boot_no_leader",
                 choices=["boot_no_leader", "pilot_takeover", "hold_heading",
-                         "air_landing", "depth_range", "hover_hold"])
+                         "air_landing", "depth_range", "hover_hold", "px4_setmode"])
 _P.add_argument("--all", action="store_true", help="모든 시나리오를 순서대로")
 _P.add_argument("--repo", default=str(__import__("pathlib").Path(__file__).resolve().parent.parent),
                 help="검사할 저장소 경로 (대조군은 수정 전 worktree를 지정)")
@@ -255,7 +255,58 @@ def preflight(m):
 
 
 # ----------------------------------------------------------------- 시나리오
+def run_px4_setmode():
+    """C6 — PX4의 mode_mapping은 3-튜플이다. set_mode가 그걸 견디는가.
+
+    이 결함은 전송 **전** 패킹에서 터진다(uint32 필드에 튜플). 따라서 비행도 EKF도
+    필요 없고, PX4로 식별되는 MAVLink 엔드포인트만 있으면 재현된다.
+    """
+    global T0
+    T0 = time.time()
+    ok = True
+
+    m = mavutil.mavlink_connection(ARGS.fc_port)
+    hb = m.wait_heartbeat(timeout=60)
+    ap = mavutil.mavlink.enums["MAV_AUTOPILOT"][hb.autopilot].name
+    log(f"연결: autopilot={ap}")
+    if "PX4" not in ap:
+        log(f"!! 이 엔드포인트는 PX4가 아니다 ({ap}). C6는 PX4에서만 발생한다.")
+        return False
+
+    mapping = m.mode_mapping() or {}
+    land_key = "AUTO.LAND" if "AUTO.LAND" in mapping else "LAND"
+    val = mapping.get(land_key)
+    log(f"mode_mapping['{land_key}'] = {val!r} (type={type(val).__name__})")
+    if not isinstance(val, tuple):
+        log("!! 3-튜플이 아니다 — 이 pymavlink/기체 조합에서는 C6 전제가 성립하지 않는다")
+        return False
+
+    for key in (land_key, "LAND"):
+        if key not in mapping:
+            continue
+        try:
+            r = main.set_mode(m, key)
+            log(f"set_mode({key}) -> {r} (예외 없음)")
+        except Exception as e:
+            log(f"!! FAIL C6: set_mode({key})가 {type(e).__name__}: {e}")
+            ok = False
+
+    try:
+        main.send_land(m)
+        log("send_land() 완료 (예외 없음)")
+    except Exception as e:
+        log(f"!! FAIL C6: send_land()가 {type(e).__name__}: {e}")
+        ok = False
+
+    m.close()
+    print(f"{'PASS' if ok else 'FAIL'} (px4_setmode)")
+    return ok
+
+
 def run_scenario(name):
+    if name == "px4_setmode":
+        return run_px4_setmode()
+
     global T0
     T0 = time.time()
     World.reset()
