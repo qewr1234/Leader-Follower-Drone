@@ -79,10 +79,9 @@ USE_MARS_IMM_DEFAULT = True
 USE_BEARING_FALLBACK = True
 
 # ESP32 leader telemetry 사용.
-# 송신 펌웨어(ESP-NOW)가 아직 없으므로 기본 off. True인데 장치가 없으면
 # serial.Serial()이 SerialException을 던지고, 그 호출이 try 블록 밖이라
 # 루프 진입 전에 프로그램이 죽는다.
-USE_LEADER_ESP32 = False
+USE_LEADER_ESP32 = True
 
 # ESP32 수신 방식
 # "serial" 또는 "udp"
