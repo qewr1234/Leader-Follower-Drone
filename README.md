@@ -9,6 +9,16 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
         (TensorRT)   (IoU)    (CV+CT 2모델)   (추종/호버/소실/착륙)      (BODY_NED)
 ```
 
+## 전체 시스템
+
+<p align="center">
+  <img src="docs/images/architecture.svg" alt="전체 시스템 아키텍처 — 리더 드론, ESP-NOW 링크, 팔로워 드론, TandemGCS" width="100%">
+</p>
+
+**이 저장소는 위 그림의 `Jetson 보드` 한 칸입니다** — 팔로워의 인지·추정·제어 코드 전부.
+리더측 자체 FC 펌웨어와 TandemGCS는 같은 캡스톤 과제의 별도 구성요소이고, ESP-NOW 선두
+텔레메트리는 **선택 사항**입니다(리더측 송신 펌웨어 미구현, 비전 단독으로 동작).
+
 ## 핵심 결과
 
 | | |
@@ -20,6 +30,48 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
 | **회귀 스위트** | 단위 검사 35개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
+
+<!--
+     ============================================================
+       실물 사진 · 화면 캡처 갤러리 (파일을 넣으면 활성화)
+
+       docs/images/ 에 아래 3개 파일을 넣고, 이 블록을 감싼
+       주석 기호만 지우면 그대로 렌더링됩니다.
+       파일 이름과 규격은 docs/images/README.md 참고.
+     ============================================================
+
+<table>
+  <tr>
+    <td width="50%" align="center"><b>Jetson 실기 검출 화면</b></td>
+    <td width="50%" align="center"><b>TandemGCS</b></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/detection-ground-test.png" alt="지상 테스트 검출 화면" width="100%"></td>
+    <td><img src="docs/images/tandemgcs.png" alt="TandemGCS 운용 화면" width="100%"></td>
+  </tr>
+  <tr>
+    <td><sub>리더 탐지(conf) · RAW depth와 IMM 추정 거리 · 중심 오차 · IMM 모델 확률</sub></td>
+    <td><sub>지도 · 센서 그래프 · 통신 상태 실시간 모니터링 · ARM / TAKEOFF / MOVE / RTL / E-STOP</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/images/follower-drone.jpg" alt="팔로워 드론 실물" width="42%"><br>
+  <sub><b>Follower 드론(실물)</b> · GPS 1차 추종 · 영상 중심 좌표 + Depth 2차 보정 · Pixhawk · Jetson · D435i</sub>
+</p>
+
+-->
+
+## 추종 동작과 Fail-safe
+
+<p align="center">
+  <img src="docs/images/tracking-failsafe.svg" alt="Depth 기반 추종 — 검출 성공 시 추종과 검출 실패 시 Fail-safe" width="100%">
+</p>
+
+검출이 살아 있으면 Depth 거리로 간격을 잡고 중심 오차로 기수를 맞춥니다. 검출이 끊기면 즉시
+제자리 호버로 물러나 재검출을 기다리고, **10초 안에 리더가 돌아오지 않으면 자동 LAND** 합니다
+(SITL 실측 10.0초). 오른쪽 그림의 3단계가 그대로 `mission_manager.py`의
+`FOLLOW → LOST_HOLD → FAILSAFE_LAND` 전이입니다.
 
 ## 시스템 개요
 
@@ -169,8 +221,10 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
 | `test_fixes.py` | 단위 회귀 35개 (하드웨어·FC 불필요) |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
+| `docs/images/` | README 다이어그램(SVG) · 사진 자리 |
 
 ## 문서
 
 - [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
+- [docs/images/README.md](docs/images/README.md) — 그림 파일 목록과 사진 추가 방법

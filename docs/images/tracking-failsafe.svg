@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 512" width="1000" height="512" role="img" aria-label="Depth 기반 추종 — 검출 성공 시 추종과 검출 실패 시 Fail-safe 동작">
+  <title>Depth 기반 추종 — 성공과 Fail-safe</title>
+  <defs>
+    <style>
+      .bg   { fill: #ffffff; }
+      .t    { font-family: "Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR","Segoe UI",sans-serif; }
+      .h1   { font-size: 25px; font-weight: 700; fill: #12222a; }
+      .hOk  { font-size: 14.5px; font-weight: 700; fill: #17909e; }
+      .hNg  { font-size: 14.5px; font-weight: 700; fill: #d0821f; }
+      .cone { fill: #e7f6f8; }
+      .coneNg { fill: #fdf2e4; }
+      .pill { fill: #2b3a42; }
+      .pillt{ font-size: 13px; font-weight: 700; fill: #ffffff; }
+      .cap  { font-size: 11.5px; fill: #87999f; }
+      .capNg{ font-size: 11.5px; fill: #d0821f; }
+      .teal { font-size: 12px; font-weight: 600; fill: #17909e; }
+      .ng   { font-size: 12.5px; font-weight: 600; fill: #d0821f; }
+      .sub  { font-size: 11.5px; fill: #5c7380; }
+      .step { font-size: 12px; fill: #3f5560; }
+      .num  { font-size: 12px; font-weight: 700; fill: #17909e; }
+      .numNg{ font-size: 12px; font-weight: 700; fill: #d0821f; }
+      .good { font-size: 12px; font-weight: 700; fill: #2f9e6f; }
+      .box  { fill: #f3fafb; stroke: #d2e8ed; stroke-width: 1.2; }
+      .boxNg{ fill: #fdf7ef; stroke: #edd6b4; stroke-width: 1.2; }
+      .dash { stroke: #17909e; stroke-width: 1.6; stroke-dasharray: 5 4; fill: none; }
+      .ghost{ fill: none; stroke: #b9c7cd; stroke-width: 1.4; stroke-dasharray: 4 4; }
+      .ghostt { font-size: 12.5px; font-weight: 600; fill: #9aabb2; }
+      .ax   { stroke: #17909e; stroke-width: 1.5; }
+      @media (prefers-color-scheme: dark) {
+        .bg   { fill: #0f1518; }
+        .h1   { fill: #e6eef1; }
+        .cone { fill: #12292e; }
+        .coneNg { fill: #2a2015; }
+        .pill { fill: #dde7eb; }
+        .pillt{ fill: #12222a; }
+        .cap  { fill: #8fa3ab; }
+        .sub  { fill: #9fb3bb; }
+        .step { fill: #b3c5cc; }
+        .hOk, .teal, .num { fill: #4fc3cf; }
+        .hNg, .ng, .capNg, .numNg { fill: #e0a45f; }
+        .good { fill: #5fc79a; }
+        .box  { fill: #142226; stroke: #2c4a52; }
+        .boxNg{ fill: #241c12; stroke: #6b5124; }
+        .dash, .ax { stroke: #4fc3cf; }
+        .ghost { stroke: #4a5c63; }
+        .ghostt{ fill: #6d8189; }
+      }
+    </style>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#17909e"/>
+    </marker>
+    <marker id="al" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M10 0 L0 5 L10 10 z" fill="#17909e"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1000" height="512"/>
+  <text class="t h1" x="16" y="34">Depth 기반 추종 — 성공과 Fail-safe</text>
+
+  <!-- ============ LEFT: SUCCESS ============ -->
+  <circle cx="24" cy="64" r="4.5" fill="#17909e"/>
+  <text class="t hOk" x="38" y="69">DETECTION 성공 — 추종</text>
+
+  <polygon class="cone" points="250,146 148,300 352,300"/>
+
+  <rect class="pill" x="198" y="82" width="104" height="28" rx="14"/>
+  <circle cx="218" cy="96" r="4" fill="#4fc3cf"/>
+  <text class="t pillt" x="256" y="101" text-anchor="middle">Follower</text>
+  <text class="t cap" x="250" y="130" text-anchor="middle">D435i Depth Camera</text>
+
+  <line class="dash" x1="250" y1="150" x2="250" y2="296"/>
+  <text class="t teal" x="262" y="216">↕ Depth 거리 d</text>
+
+  <line class="ax" x1="208" y1="280" x2="156" y2="280" marker-end="url(#al)"/>
+  <line class="ax" x1="292" y1="280" x2="344" y2="280" marker-end="url(#ar)"/>
+  <text class="t sub" x="250" y="266" text-anchor="middle">중심 오차 Δx → Yaw 제어</text>
+
+  <rect class="pill" x="206" y="302" width="88" height="28" rx="14"/>
+  <circle cx="224" cy="316" r="4" fill="#4fc3cf"/>
+  <text class="t pillt" x="258" y="321" text-anchor="middle">Leader</text>
+  <text class="t cap" x="250" y="350" text-anchor="middle">중심 좌표 검출</text>
+
+  <text class="t teal" x="16" y="386">조종사 · FS-i6 →</text>
+  <text class="t sub"  x="126" y="386">Leader 수동 조종 (RC 2.4GHz)</text>
+
+  <rect class="box" x="16" y="400" width="468" height="92" rx="10"/>
+  <text class="t num"  x="34" y="434">1</text>
+  <text class="t step" x="50" y="434">거리 멀어짐 → 접근 · 목표 거리 도달 → 정지, 고도 유지</text>
+  <text class="t num"  x="34" y="466">2</text>
+  <text class="t step" x="50" y="466">Leader가 좌우 이동 → 중심 오차 발생 → Yaw축 제어로 재정렬</text>
+
+  <!-- ============ RIGHT: FAIL-SAFE ============ -->
+  <circle cx="524" cy="64" r="4.5" fill="#d0821f"/>
+  <text class="t hNg" x="538" y="69">DETECTION 실패 — FAIL-SAFE</text>
+
+  <polygon class="coneNg" points="726,146 624,300 828,300"/>
+
+  <rect class="pill" x="674" y="82" width="104" height="28" rx="14"/>
+  <circle cx="694" cy="96" r="4" fill="#e0a45f"/>
+  <text class="t pillt" x="732" y="101" text-anchor="middle">Follower</text>
+  <text class="t capNg" x="726" y="130" text-anchor="middle">GPS 호버링 (Pixhawk)</text>
+
+  <text class="t ng" x="726" y="234" text-anchor="middle">시야 내 Leader 없음</text>
+
+  <rect class="ghost" x="876" y="302" width="88" height="28" rx="14"/>
+  <text class="t ghostt" x="920" y="321" text-anchor="middle">Leader</text>
+  <text class="t cap" x="920" y="350" text-anchor="middle">시야 이탈</text>
+
+  <text class="t ng"  x="524" y="386">Fail-safe →</text>
+  <text class="t sub" x="596" y="386">제자리 정지비행 유지 · 재검출 대기</text>
+
+  <rect class="boxNg" x="516" y="400" width="468" height="92" rx="10"/>
+  <text class="t numNg" x="534" y="426">1</text>
+  <text class="t step"  x="550" y="426">검출 실패 즉시 Fail-safe 전환 → 제자리 호버링</text>
+  <text class="t numNg" x="534" y="454">2</text>
+  <text class="t step"  x="550" y="454">Leader 재검출 → 추종 즉시 재개</text>
+  <text class="t good"  x="740" y="454">(자동 복귀)</text>
+  <text class="t numNg" x="534" y="482">3</text>
+  <text class="t step"  x="550" y="482">10초 내 재검출 실패 → 자동 LAND</text>
+</svg>
