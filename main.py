@@ -52,7 +52,7 @@ from mavlink_io import (
     battery_text,
 )
 
-from mission_manager import MissionManager, S_WAIT_LEADER
+from mission_manager import MissionManager
 
 from leader_telemetry import (
     LeaderTelemetryReceiver,
@@ -79,8 +79,9 @@ USE_MARS_IMM_DEFAULT = True
 USE_BEARING_FALLBACK = True
 
 # ESP32 leader telemetry 사용.
-# serial.Serial()이 SerialException을 던지고, 그 호출이 try 블록 밖이라
-# 루프 진입 전에 프로그램이 죽는다.
+# 장치가 없거나 pyserial이 없으면 open_leader_receiver()가 경고만 내고 None을 돌려주므로
+# 켜 둬도 비전 단독 경로로 계속 간다. 다만 LEADER_SERIAL_PORT에 다른 장치가 물려 있으면
+# 그 포트의 바이트를 같이 읽게 되니(pyserial은 배타 잠금이 없다) 포트 배정을 확인할 것.
 USE_LEADER_ESP32 = True
 
 # ESP32 수신 방식
@@ -452,6 +453,34 @@ def smooth_velocity_cmd(prev_cmd, new_cmd, alpha=0.28, dt=None):
 
 
 # ============================================================
+# ESP32 수신기
+# ============================================================
+
+def open_leader_receiver():
+    """ESP32 선두 텔레메트리 수신기를 연다.
+
+    장치가 없거나 pyserial이 없어도 예외를 밖으로 내지 않고 None을 돌려준다 —
+    ESP32는 선택 사항이고, 없으면 비전 단독으로 날아야 하기 때문이다.
+    """
+    if not USE_LEADER_ESP32:
+        return None
+
+    rx = LeaderTelemetryReceiver(
+        kind=LEADER_TELEMETRY_KIND,
+        port=LEADER_SERIAL_PORT,
+        baud=LEADER_SERIAL_BAUD,
+        udp_ip=LEADER_UDP_IP,
+        udp_port=LEADER_UDP_PORT,
+    )
+    try:
+        rx.start()
+    except Exception as exc:
+        print(f"[WARN] leader telemetry 비활성: {type(exc).__name__}: {exc}")
+        return None
+    return rx
+
+
+# ============================================================
 # 메인
 # ============================================================
 
@@ -488,21 +517,7 @@ def main():
 
     master = connect_fc()
 
-    leader_rx = None
-    if USE_LEADER_ESP32:
-        leader_rx = LeaderTelemetryReceiver(
-            kind=LEADER_TELEMETRY_KIND,
-            port=LEADER_SERIAL_PORT,
-            baud=LEADER_SERIAL_BAUD,
-            udp_ip=LEADER_UDP_IP,
-            udp_port=LEADER_UDP_PORT,
-        )
-        try:
-            leader_rx.start()
-        except Exception as exc:
-            # 장치가 없거나 pyserial이 없어도 비전 단독 경로로 계속 간다.
-            print(f"[WARN] leader telemetry 비활성: {type(exc).__name__}: {exc}")
-            leader_rx = None
+    leader_rx = open_leader_receiver()
 
     log = ExperimentLogger(CONFIG["logger"]["log_dir"]) if CONFIG["logger"]["enabled"] else None
 
@@ -563,11 +578,7 @@ def main():
             #  - 평활 버퍼: FC가 무시하는 동안 목표값까지 수렴해 있으므로, 리셋하지
             #    않으면 전환 첫 setpoint가 램프 없이 포화 상태로 나간다.
             if fc_accepts_setpoints and not prev_fc_accepts:
-                mission.state = S_WAIT_LEADER
-                mission.last_seen_t = None
-                mission.first_seen_t = None
-                mission.start_candidate_t = None
-                mission.landing_candidate_t = None
+                mission.reset()
                 prev_body_cmd = np.zeros(4, dtype=float)
                 last_land_send = 0.0
                 print(f"[SYS] {fc_mode} 진입 — 미션/명령 리셋")

@@ -41,6 +41,10 @@ class MeasurementBuilder:
             "conf": float(track.get("conf", 0.0)),
             "track_age": int(track.get("age", 0)),
             "lost_count": int(track.get("lost_count", 0)),
+            # 검출을 건너뛴 프레임의 bbox는 마지막 검출 위치다. reliability가 이 키를 보고
+            # 신뢰도를 깎으므로 반드시 넘겨야 한다 — 빠지면 오래된 bbox에 새 depth를 씌운
+            # 측정이 정상 신뢰도로 필터에 들어간다.
+            "detector_skipped": bool(track.get("detector_skipped", False)),
             **depth_stats,
         }
 
@@ -58,6 +62,7 @@ class MeasurementBuilder:
             "conf": float(track.get("conf", 0.0)),
             "track_age": int(track.get("age", 0)),
             "lost_count": int(track.get("lost_count", 0)),
+            "detector_skipped": bool(track.get("detector_skipped", False)),
         }
 
     def build_gps_relative(self, vehicle_state):
