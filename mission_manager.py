@@ -34,8 +34,6 @@ class MissionManager:
         landing_confirm_sec=1.8,
         lost_hold_sec=8.0,   # + imm.range_coast_max_sec(2.0) = 소실 후 총 10초에 착륙
     ):
-        self.state = S_WAIT_LEADER
-
         self.start_speed_thresh = float(start_speed_thresh)
         self.start_confirm_sec = float(start_confirm_sec)
         self.hover_speed_thresh = float(hover_speed_thresh)
@@ -47,12 +45,24 @@ class MissionManager:
 
         self.lost_hold_sec = float(lost_hold_sec)
 
+        self.last_state_change_t = time.time()
+        self.reset()
+
+    def reset(self):
+        """미션을 처음 상태로 되돌린다.
+
+        조종사가 GUIDED로 넘기는 순간 main이 호출한다. 수동 비행 중 쌓인 소실
+        타이머와 "추종한 적 있음" 기억을 지워, 인계 직후 LAND가 나가거나 확인 없이
+        FOLLOW로 뛰어드는 일을 막는다.
+        """
+        self.state = S_WAIT_LEADER
         self.first_seen_t = None
         self.last_seen_t = None
         self.start_candidate_t = None
         self.landing_candidate_t = None
-
-        self.last_state_change_t = time.time()
+        # 한 번이라도 FOLLOW에 들어갔는가. 참이면 잠깐 놓쳤다 다시 찾았을 때
+        # 출발 확인(0.7초 이동) 없이 바로 추종을 재개한다.
+        self.has_followed = False
 
     def update(
         self,
@@ -166,6 +176,20 @@ class MissionManager:
 
             return self.state, self.command_policy()
 
+        # 잠깐 놓쳤다가(LOST_HOLD) 또는 착륙 후보가 풀려서(LANDING_CANDIDATE) 여기 왔고,
+        # 이미 추종하던 리더라면 바로 재개한다. 이전에는 READY_HOVER로 떨어져 리더가
+        # 0.25 m/s 넘게 움직여야만 FOLLOW로 돌아왔다 — hspeed는 상대속도라 둘 다 호버
+        # 중이면 0이고, 그러면 yaw 제어도 멈춘 채 리더가 천천히 시야를 벗어나는 걸
+        # 지켜보다 소실 착륙으로 갔다. FAILSAFE_LAND / CONFIRMED_LANDING / MANUAL_OVERRIDE
+        # 에서 온 경우는 그대로 READY_HOVER — 착륙 명령이 나간 뒤나 조종사 개입 뒤에는
+        # 출발 확인을 다시 거치는 편이 안전하다.
+        if self.has_followed and self.state in (S_LOST_HOLD, S_LANDING_CANDIDATE):
+            if hspeed > self.start_speed_thresh:
+                self._set_state(S_FOLLOW, now)
+            else:
+                self._set_state(S_LEADER_HOVER, now)
+            return self.state, self.command_policy()
+
         # 나머지는 안전하게 호버링
         self._set_state(S_READY_HOVER, now)
         return self.state, self.command_policy()
@@ -237,3 +261,5 @@ class MissionManager:
         if new_state != self.state:
             self.state = new_state
             self.last_state_change_t = now
+        if new_state == S_FOLLOW:
+            self.has_followed = True

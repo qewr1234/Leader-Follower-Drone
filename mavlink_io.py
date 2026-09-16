@@ -1,9 +1,8 @@
 """
 mavlink_io.py — Pixhawk MAVLink 통신
 
-변경점:
-- 기존 battery/motor_test 유지
-- GPS/attitude/local position quality 상태 수집 추가
+- FC 모드/arm 상태, 배터리, GPS/attitude/local position 수집
+- 모터 테스트(MAV_CMD_DO_MOTOR_TEST) 계열은 velocity setpoint 제어로 넘어가면서 제거했다.
 """
 
 import os
@@ -16,7 +15,6 @@ last_battery_voltage = None
 # SITL 회귀용: MARS_FC_PORT=udpin:0.0.0.0:14550 python3 main.py
 SERIAL_PORT = os.environ.get("MARS_FC_PORT", "/dev/ttyACM0")
 SERIAL_BAUD = 115200
-ALL_MOTORS = [1, 2, 3, 4]
 
 _vehicle_state = {
     "gps": {},
@@ -66,10 +64,14 @@ def drain_messages(master):
         _vehicle_state["timestamp"] = now
 
         if mt == "HEARTBEAT":
-            # FC 본체의 heartbeat만 사용 (GCS 등 다른 시스템 무시)
+            # FC 본체(autopilot 컴포넌트)의 heartbeat만 사용한다. 시스템 ID만 맞추면
+            # 같은 기체의 다른 컴포넌트(짐벌, 카메라, mavlink-router 등)의 heartbeat가
+            # 섞여 들어와 모드 문자열이 왕복하고, main의 GUIDED 진입 에지가 매번 발동해
+            # 미션이 계속 리셋된다.
             try:
                 if (
                     msg.get_srcSystem() == master.target_system
+                    and msg.get_srcComponent() == master.target_component
                     and msg.type != mavutil.mavlink.MAV_TYPE_GCS
                 ):
                     _vehicle_state["mode"] = {
@@ -103,7 +105,8 @@ def drain_messages(master):
             except Exception:
                 pass
             try:
-                if msg.voltage_battery > 0:
+                # 규격상 65535(UINT16_MAX)는 "전압 미보고"다. > 0만 보면 65.5V로 표시된다.
+                if 0 < msg.voltage_battery < 65535:
                     last_battery_voltage = float(msg.voltage_battery) / 1000.0
             except Exception:
                 pass
@@ -114,6 +117,8 @@ def drain_messages(master):
                 "lat": getattr(msg, "lat", None),
                 "lon": getattr(msg, "lon", None),
                 "alt": getattr(msg, "alt", None),
+                # MAVLink2 확장 필드. 리더 텔레메트리가 타원체고를 보낼 때 같은 기준으로 뺀다.
+                "alt_ellipsoid": getattr(msg, "alt_ellipsoid", None),
                 "eph": getattr(msg, "eph", None),
                 "epv": getattr(msg, "epv", None),
                 "vel": getattr(msg, "vel", None),
@@ -178,31 +183,3 @@ def battery_text():
         return f"BAT={last_battery_pct}%"
     return f"BAT={last_battery_pct}%  {last_battery_voltage:.2f}V"
 
-
-def motor_test_percent(master, motor_instance, throttle_pct, duration_sec):
-    master.mav.command_long_send(
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_CMD_DO_MOTOR_TEST,
-        0,
-        float(motor_instance),
-        0.0,
-        float(throttle_pct),
-        float(duration_sec),
-        1.0,
-        0.0,
-        0.0,
-    )
-
-
-def trigger_motors(master, throttles, duration_sec=0.35):
-    for m in ALL_MOTORS:
-        motor_test_percent(master, m, throttles[m], duration_sec)
-        time.sleep(0.005)
-
-
-def stop_all_motors(master):
-    print("[MOTOR] stop all")
-    for m in ALL_MOTORS:
-        motor_test_percent(master, m, 0.0, 0.5)
-        time.sleep(0.005)

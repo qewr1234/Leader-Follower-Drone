@@ -1,10 +1,8 @@
 """
 detector.py — YOLO11n/TensorRT 탐지 모듈
 
-변경점:
 - ROI 입력 지원
 - detect()는 원본 이미지 좌표 기준 bbox 반환
-- select_target() 호환 함수 유지
 """
 
 import os
@@ -27,7 +25,10 @@ def load_model():
         print(f"[YOLO] TensorRT engine load: {TRT_MODEL}")
         return YOLO(TRT_MODEL, task="detect")
     print(f"[YOLO] PyTorch model load: {PT_MODEL}")
-    print(f"[YOLO] TensorRT 생성 예: yolo export model={PT_MODEL} format=engine imgsz=640 half=True")
+    # 고정 크기 TensorRT 엔진은 config의 imgsz와 같은 크기로 내보내야 한다. 다르면
+    # ultralytics가 엔진 크기로 덮어써서 설정한 imgsz가 조용히 무시된다.
+    print(f"[YOLO] TensorRT 생성 예: yolo export model={PT_MODEL} format=engine "
+          f"imgsz={CONFIG['detector']['imgsz']} half=True")
     return YOLO(PT_MODEL, task="detect")
 
 
@@ -99,33 +100,3 @@ class YoloDetector:
         detections.sort(key=lambda d: (d["conf"], d["area"]), reverse=True)
         return detections
 
-
-def select_target(result, model, depth_image=None, conf_thres=CONF_THRES):
-    """기존 main.py 호환용. 새 구조에서는 YoloDetector.detect()+tracker 사용 권장."""
-    if result.boxes is None:
-        return None
-    best = None
-    best_area = 0
-    for box in result.boxes:
-        cls_id = int(box.cls[0].item())
-        conf = float(box.conf[0].item())
-        if model.names[cls_id] != TARGET_CLASS_NAME or conf < conf_thres:
-            continue
-        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-        area = max(0, x2 - x1) * max(0, y2 - y1)
-        if area > best_area:
-            best_area = area
-            best = (x1, y1, x2, y2, conf)
-    if best is None:
-        return None
-    x1, y1, x2, y2, conf = best
-    H = depth_image.shape[0] if depth_image is not None else 480
-    return {
-        "bbox": (x1, y1, x2, y2),
-        "conf": conf,
-        "cx": (x1 + x2) // 2,
-        "cy": (y1 + y2) // 2,
-        "bh": y2 - y1,
-        "h_ratio": (y2 - y1) / max(H, 1),
-        "depth_m": None,
-    }

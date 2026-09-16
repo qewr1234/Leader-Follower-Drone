@@ -52,7 +52,7 @@ from mavlink_io import (
     battery_text,
 )
 
-from mission_manager import MissionManager, S_WAIT_LEADER
+from mission_manager import MissionManager
 
 from leader_telemetry import (
     LeaderTelemetryReceiver,
@@ -79,8 +79,9 @@ USE_MARS_IMM_DEFAULT = True
 USE_BEARING_FALLBACK = True
 
 # ESP32 leader telemetry 사용.
-# serial.Serial()이 SerialException을 던지고, 그 호출이 try 블록 밖이라
-# 루프 진입 전에 프로그램이 죽는다.
+# 장치가 없거나 pyserial이 없으면 open_leader_receiver()가 경고만 내고 None을 돌려주므로
+# 켜 둬도 비전 단독 경로로 계속 간다. 다만 LEADER_SERIAL_PORT에 다른 장치가 물려 있으면
+# 그 포트의 바이트를 같이 읽게 되니(pyserial은 배타 잠금이 없다) 포트 배정을 확인할 것.
 USE_LEADER_ESP32 = True
 
 # ESP32 수신 방식
@@ -103,11 +104,21 @@ LEADER_MAX_AGE_SEC = 0.70
 # ESP32가 vx=north, vy=east, vz=down 으로 보내면 "NED"
 LEADER_VELOCITY_FRAME = "ENU"
 
+# 선두 고도 기준계 — 패킷의 "alt" 필드가 해발(AMSL)인지 WGS84 타원체고(ELLIPSOID)인지.
+# 필드 이름이 alt_msl / alt_ellipsoid 처럼 명시돼 있으면 그쪽이 우선이다.
+# 국내에서 둘의 차이는 ~25m라, 틀리면 그대로 상대 고도 오차가 된다.
+LEADER_ALT_FRAME = "AMSL"
+
 # 목표 추종 거리
 TARGET_DISTANCE_M = 3.0  # C4: depth_max 10m 대비 여유 7m.
 # P제어 정상상태 평형거리 = TARGET + v_leader/KP_FORWARD 이므로
 # 이 값과 config의 depth_max_m 간격이 곧 추종 가능한 리더 속도 상한이다.
 # (5.0 + depth_max 6.0 조합에서는 리더 0.22 m/s에서 이미 깊이창 밖이었다)
+
+# 카메라 깊이 없이 ESP32 GPS 상대위치만으로 거리를 알 때의 이격 거리.
+# GPS 상대위치 오차는 m 단위라 3m 이격은 오차보다 작다. 8m면 오차 여유가 있고
+# depth_max(10m) 안이라 리더가 다시 깊이창에 들어오면 비전이 이어받는다.
+TARGET_DISTANCE_GPS_ONLY_M = 8.0
 
 # BODY_NED velocity limit
 # BODY_NED:
@@ -365,7 +376,8 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 
-def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace):
+def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace,
+                                       target_distance=None):
     """
     MARS-IMM 추정값을 BODY_NED velocity command로 변환.
 
@@ -376,10 +388,12 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace):
         [front_vel, right_vel, up_vel]
 
     목표:
-        front = TARGET_DISTANCE_M
+        front = target_distance (기본 TARGET_DISTANCE_M)
         right = 0
         up = 0
     """
+    if target_distance is None:
+        target_distance = TARGET_DISTANCE_M
     rel_fru = np.asarray(rel_fru, dtype=float)
     rel_vel_fru = np.asarray(rel_vel_fru, dtype=float)
 
@@ -391,7 +405,7 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace):
     v_right = float(rel_vel_fru[1])
     v_up = float(rel_vel_fru[2])
 
-    front_err = front - TARGET_DISTANCE_M
+    front_err = front - float(target_distance)
     right_err = right
     up_err = up
 
@@ -452,6 +466,35 @@ def smooth_velocity_cmd(prev_cmd, new_cmd, alpha=0.28, dt=None):
 
 
 # ============================================================
+# ESP32 수신기
+# ============================================================
+
+def open_leader_receiver():
+    """ESP32 선두 텔레메트리 수신기를 연다.
+
+    장치가 없거나 pyserial이 없어도 예외를 밖으로 내지 않고 None을 돌려준다 —
+    ESP32는 선택 사항이고, 없으면 비전 단독으로 날아야 하기 때문이다.
+    """
+    if not USE_LEADER_ESP32:
+        return None
+
+    rx = LeaderTelemetryReceiver(
+        kind=LEADER_TELEMETRY_KIND,
+        port=LEADER_SERIAL_PORT,
+        baud=LEADER_SERIAL_BAUD,
+        udp_ip=LEADER_UDP_IP,
+        udp_port=LEADER_UDP_PORT,
+        default_alt_frame=LEADER_ALT_FRAME,
+    )
+    try:
+        rx.start()
+    except Exception as exc:
+        print(f"[WARN] leader telemetry 비활성: {type(exc).__name__}: {exc}")
+        return None
+    return rx
+
+
+# ============================================================
 # 메인
 # ============================================================
 
@@ -488,21 +531,7 @@ def main():
 
     master = connect_fc()
 
-    leader_rx = None
-    if USE_LEADER_ESP32:
-        leader_rx = LeaderTelemetryReceiver(
-            kind=LEADER_TELEMETRY_KIND,
-            port=LEADER_SERIAL_PORT,
-            baud=LEADER_SERIAL_BAUD,
-            udp_ip=LEADER_UDP_IP,
-            udp_port=LEADER_UDP_PORT,
-        )
-        try:
-            leader_rx.start()
-        except Exception as exc:
-            # 장치가 없거나 pyserial이 없어도 비전 단독 경로로 계속 간다.
-            print(f"[WARN] leader telemetry 비활성: {type(exc).__name__}: {exc}")
-            leader_rx = None
+    leader_rx = open_leader_receiver()
 
     log = ExperimentLogger(CONFIG["logger"]["log_dir"]) if CONFIG["logger"]["enabled"] else None
 
@@ -563,11 +592,7 @@ def main():
             #  - 평활 버퍼: FC가 무시하는 동안 목표값까지 수렴해 있으므로, 리셋하지
             #    않으면 전환 첫 setpoint가 램프 없이 포화 상태로 나간다.
             if fc_accepts_setpoints and not prev_fc_accepts:
-                mission.state = S_WAIT_LEADER
-                mission.last_seen_t = None
-                mission.first_seen_t = None
-                mission.start_candidate_t = None
-                mission.landing_candidate_t = None
+                mission.reset()
                 prev_body_cmd = np.zeros(4, dtype=float)
                 last_land_send = 0.0
                 print(f"[SYS] {fc_mode} 진입 — 미션/명령 리셋")
@@ -776,7 +801,7 @@ def main():
                 R_esp = reliability.make_R_gps(r_esp_gps)
 
                 if not ekf.initialized:
-                    ekf.init(z_esp)
+                    ekf.init(z_esp, source="gps")
                     esp_update_used = "init_esp_gps"
                 else:
                     gate_ok_esp, esp_gate_d2 = reliability.gate_position3d(
@@ -786,7 +811,7 @@ def main():
                     )
 
                     if gate_ok_esp:
-                        ekf.update_position3d(z_esp, R_esp)
+                        ekf.update_position3d(z_esp, R_esp, source="gps")
                         esp_update_used = "esp_gps"
                     else:
                         esp_update_used = "gate_reject_esp_gps"
@@ -851,6 +876,11 @@ def main():
             # RGB-D와 ESP32 위치만 거리를 담으며, 그 둘만 range_coast_time을 되돌린다.
             leader_visible_for_mission = bool(ekf.has_range_fix())
 
+            # 추종 거리는 거리의 출처로 정한다. 카메라 깊이가 살아 있으면 3m,
+            # ESP32 GPS 상대위치뿐이면 GPS 오차 여유를 둔 8m.
+            vision_range_ok = bool(ekf.has_vision_range_fix())
+            target_distance_m = TARGET_DISTANCE_M if vision_range_ok else TARGET_DISTANCE_GPS_ONLY_M
+
             # ------------------------------------------------------------
             # Mission state manager
             # ------------------------------------------------------------
@@ -892,6 +922,7 @@ def main():
                     rel_fru=rel_fru,
                     rel_vel_fru=rel_vel_fru,
                     pos_cov_trace=pos_cov_trace,
+                    target_distance=target_distance_m,
                 )
 
             else:
@@ -1012,7 +1043,8 @@ def main():
                 )
                 put_text(
                     color_image,
-                    f"rel F/R/U=({rel_fru[0]:+.2f},{rel_fru[1]:+.2f},{rel_fru[2]:+.2f}) cov={pos_cov_trace:.2f}",
+                    f"rel F/R/U=({rel_fru[0]:+.2f},{rel_fru[1]:+.2f},{rel_fru[2]:+.2f}) "
+                    f"cov={pos_cov_trace:.2f} tgt={target_distance_m:.1f}m{'' if vision_range_ok else '(GPS)'}",
                     (20, 194),
                     (220, 220, 220),
                     scale=0.48,
@@ -1134,6 +1166,8 @@ def main():
                             "P_trace_pos": pos_cov_trace,
                             "mu": mu,
                             "coast_time": ekf.coast_time,
+                            "range_coast_time": ekf.range_coast_time,
+                            "vision_range_coast_time": ekf.vision_range_coast_time,
                             "initialized": ekf.initialized,
                             "reliable": ekf.is_reliable() if ekf.initialized else False,
                         },
@@ -1163,7 +1197,8 @@ def main():
                             "body_vy": current_body_cmd[1],
                             "body_vz": current_body_cmd[2],
                             "yaw_rate": current_body_cmd[3],
-                            "target_distance_m": TARGET_DISTANCE_M,
+                            "target_distance_m": target_distance_m,
+                            "vision_range_ok": vision_range_ok,
                         },
                     }
                 )

@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 580" width="1240" height="580" role="img" aria-label="전체 시스템 아키텍처: 리더 드론, ESP-NOW 링크, 팔로워 드론, TandemGCS">
+  <title>전체 시스템 아키텍처</title>
+  <defs>
+    <style>
+      .bg   { fill: #ffffff; }
+      .card { fill: #ffffff; stroke: #cfdfe6; stroke-width: 1.4; }
+      .tint { fill: #eaf7f9; stroke: #b7dfe6; stroke-width: 1.4; }
+      .t    { font-family: "Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR","Segoe UI",sans-serif; }
+      .h1   { font-size: 29px; font-weight: 700; fill: #12222a; }
+      .hd   { font-size: 16.5px; font-weight: 700; fill: #17909e; letter-spacing: .4px; }
+      .name { font-size: 14.5px; font-weight: 700; fill: #17272f; }
+      .tag  { font-size: 12.5px; fill: #7d9199; }
+      .teal { font-size: 12.5px; fill: #17909e; }
+      .sub  { font-size: 12.5px; fill: #5c7380; }
+      .flow { font-size: 11.5px; fill: #8ba3ab; letter-spacing: .6px; }
+      .lnk  { font-size: 12.5px; fill: #2f9e6f; }
+      .btn  { fill: #ffffff; stroke: #bcd3db; stroke-width: 1.2; }
+      .btnt { font-size: 11.5px; font-weight: 600; fill: #46626d; letter-spacing: .3px; }
+      .estop  { fill: #fef6ec; stroke: #e5a463; stroke-width: 1.2; }
+      .estopt { font-size: 11.5px; font-weight: 700; fill: #d0821f; letter-spacing: .3px; }
+      .pill { fill: #17909e; }
+      .pillt{ font-size: 14px; font-weight: 700; fill: #ffffff; letter-spacing: .3px; }
+      .link { stroke: #17909e; stroke-width: 2; }
+      @media (prefers-color-scheme: dark) {
+        .bg   { fill: #0f1518; }
+        .card { fill: #161f24; stroke: #2b3b43; }
+        .tint { fill: #10272c; stroke: #2a5a63; }
+        .h1   { fill: #e6eef1; }
+        .name { fill: #dde7eb; }
+        .tag  { fill: #8fa3ab; }
+        .sub  { fill: #9fb3bb; }
+        .flow { fill: #7e959d; }
+        .hd, .teal { fill: #4fc3cf; }
+        .lnk  { fill: #5fc79a; }
+        .btn  { fill: #18242a; stroke: #365058; }
+        .btnt { fill: #a8c0c8; }
+        .estop{ fill: #2a1f12; stroke: #a9741f; }
+        .link { stroke: #4fc3cf; }
+      }
+    </style>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#17909e"/>
+    </marker>
+    <marker id="b" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M10 0 L0 5 L10 10 z" fill="#17909e"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1240" height="580"/>
+  <text class="t h1" x="20" y="40">전체 시스템 아키텍처</text>
+
+  <!-- ===== LEADER ===== -->
+  <rect class="card t" x="16" y="70" width="478" height="344" rx="14"/>
+  <text class="t hd"  x="40" y="102">LEADER DRONE</text>
+  <text class="t tag" x="470" y="102" text-anchor="end">수동비행</text>
+
+  <rect class="card" x="40" y="118" width="430" height="40" rx="8"/>
+  <text class="t name" x="54" y="143">FS-i6 조종기 → 수신기</text>
+  <text class="t tag"  x="456" y="143" text-anchor="end">RC 2.4GHz</text>
+
+  <line class="link" x1="60" y1="164" x2="60" y2="186" marker-end="url(#a)"/>
+  <text class="t flow" x="74" y="182">RC INPUT</text>
+
+  <rect class="card" x="40" y="194" width="430" height="96" rx="8"/>
+  <text class="t name" x="54" y="220">STM32F405 자체 Flight Controller</text>
+  <text class="t teal" x="456" y="220" text-anchor="end">Cascade PID</text>
+  <text class="t sub"  x="54" y="245">M8N GPS · BNO080 · ICM-20602 · LPS22HH</text>
+  <text class="t sub"  x="54" y="268">출력: PWM → BLHeli ESC ×4 · 모터</text>
+
+  <line class="link" x1="60" y1="296" x2="60" y2="318" marker-end="url(#a)"/>
+  <text class="t flow" x="74" y="314">UART</text>
+
+  <rect class="tint" x="40" y="326" width="430" height="40" rx="8"/>
+  <text class="t name" x="54" y="351">ESP32 (송신)</text>
+  <text class="t teal" x="456" y="351" text-anchor="end">상태 패킷 생성</text>
+
+  <text class="t tag" x="40" y="394">자체 설계 비행제어 보드 · 펌웨어 직접 구현</text>
+
+  <!-- ===== LINK ===== -->
+  <rect class="pill" x="570" y="196" width="100" height="30" rx="15"/>
+  <text class="t pillt" x="620" y="216" text-anchor="middle">ESP-NOW</text>
+  <line class="link" x1="502" y1="252" x2="738" y2="252" marker-start="url(#b)" marker-end="url(#a)"/>
+  <text class="t sub" x="620" y="286" text-anchor="middle">드론 간 직접 무선 링크</text>
+  <text class="t lnk" x="620" y="310" text-anchor="middle">GPS · 고도 · 자세</text>
+  <text class="t lnk" x="620" y="330" text-anchor="middle">배터리 · Failsafe</text>
+
+  <!-- ===== FOLLOWER ===== -->
+  <rect class="card" x="746" y="70" width="478" height="344" rx="14"/>
+  <text class="t hd"  x="770" y="102">FOLLOWER DRONE</text>
+  <text class="t tag" x="1200" y="102" text-anchor="end">자율비행</text>
+
+  <rect class="tint" x="770" y="118" width="430" height="40" rx="8"/>
+  <text class="t name" x="784" y="143">ESP32 (수신)</text>
+  <text class="t teal" x="1186" y="143" text-anchor="end">Leader 상태 수신</text>
+
+  <line class="link" x1="790" y1="164" x2="790" y2="186" marker-end="url(#a)"/>
+  <text class="t flow" x="804" y="182">UART</text>
+
+  <rect class="card" x="770" y="194" width="430" height="68" rx="8"/>
+  <text class="t name" x="784" y="220">Jetson 보드 — 검출 · 추종 연산</text>
+  <text class="t teal" x="1186" y="220" text-anchor="end">Vision</text>
+  <text class="t sub"  x="784" y="245">RealSense D435i (USB) · 중심 좌표 + Depth 거리</text>
+
+  <line class="link" x1="790" y1="268" x2="790" y2="290" marker-end="url(#a)"/>
+  <text class="t flow" x="804" y="286">MAVLINK</text>
+
+  <rect class="card" x="770" y="298" width="430" height="68" rx="8"/>
+  <text class="t name" x="784" y="324">Pixhawk 6C</text>
+  <text class="t tag"  x="1186" y="324" text-anchor="end">PWM → ESC ×4</text>
+  <text class="t sub"  x="784" y="349">모드 전환 · ARM · 이륙 · 이동 · RTL · 비상정지</text>
+
+  <text class="t tag" x="1200" y="394" text-anchor="end">↕ Jetson ↔ TandemGCS — 상태 데이터 수신 · 제어 명령 전달</text>
+
+  <!-- ===== GCS ===== -->
+  <rect class="card" x="16" y="430" width="1208" height="92" rx="14"/>
+  <text class="t name" x="40" y="464" style="font-size:16.5px">TandemGCS</text>
+  <text class="t sub"  x="40" y="492">Follower Jetson 탑재 · WinForms C# · 지도 · 센서 그래프 · 통신 상태 실시간 모니터링</text>
+
+  <rect class="btn" x="786" y="459" width="66" height="30" rx="7"/>
+  <text class="t btnt" x="819" y="479" text-anchor="middle">ARM</text>
+  <rect class="btn" x="862" y="459" width="94" height="30" rx="7"/>
+  <text class="t btnt" x="909" y="479" text-anchor="middle">TAKEOFF</text>
+  <rect class="btn" x="966" y="459" width="72" height="30" rx="7"/>
+  <text class="t btnt" x="1002" y="479" text-anchor="middle">MOVE</text>
+  <rect class="btn" x="1048" y="459" width="58" height="30" rx="7"/>
+  <text class="t btnt" x="1077" y="479" text-anchor="middle">RTL</text>
+  <rect class="estop" x="1116" y="459" width="84" height="30" rx="7"/>
+  <text class="t estopt" x="1158" y="479" text-anchor="middle">E-STOP</text>
+</svg>

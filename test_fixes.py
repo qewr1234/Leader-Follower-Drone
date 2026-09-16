@@ -46,6 +46,8 @@ class _FakeMavlinkConsts:
     POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE = 2048
     MAV_FRAME_BODY_NED = 8
     MAV_MODE_FLAG_CUSTOM_MODE_ENABLED = 1
+    MAV_MODE_FLAG_SAFETY_ARMED = 128
+    MAV_TYPE_GCS = 6
     MAV_CMD_NAV_LAND = 21
 
 
@@ -55,6 +57,7 @@ _stub("ultralytics", YOLO=object)
 _stub("pymavlink")
 _stub("pymavlink.mavutil", mavlink=_FakeMavlinkConsts, mavutil=None)
 sys.modules["pymavlink"].mavutil = sys.modules["pymavlink.mavutil"]
+sys.modules["pymavlink.mavutil"].mode_string_v10 = lambda msg: msg.mode_name
 
 from config import CONFIG                                    # noqa: E402
 from mission_manager import (                                # noqa: E402
@@ -238,6 +241,38 @@ near = [{"bbox": [312.0, 232.0, 352.0, 272.0], "conf": 0.5, "cls_name": "person"
 t = tr2.update(near)
 check("tracker: 근처 검출은 회복 허용", t["lost_count"] == 0 and not t["is_lost"])
 
+# 리더는 사라지고 다른 대상만 계속 보이는 경우. 수정 전에는 게이트 반경이 lost_count에
+# 비례해 무한히 커져 9프레임(0.3초)째에 반대편 검출이 트랙을 가져갔고, 거부 분기에
+# max_lost가 없어 트랙이 죽지도 않았다.
+tr3 = LeaderTracker()
+tr3.update([{"bbox": [300.0, 220.0, 340.0, 260.0], "conf": 0.9, "cls_name": "person"}])
+stolen_at = None
+dropped_at = None
+for i in range(1, tr3.max_lost + 3):
+    t = tr3.update(far)
+    if tr3.track is None:
+        dropped_at = i
+        break
+    if not t["is_lost"]:
+        stolen_at = i
+        break
+check("tracker: 반대편 검출이 계속 있어도 기존 트랙을 넘겨주지 않음",
+      stolen_at is None, f"{stolen_at}프레임째 탈취")
+check("tracker: 게이트 밖 검출만 계속되면 max_lost에서 트랙 폐기",
+      dropped_at == tr3.max_lost + 1, f"dropped_at={dropped_at} (기대 {tr3.max_lost + 1})")
+t = tr3.update(far)
+check("tracker: 폐기 뒤에는 새 track_id로 명시적 재초기화",
+      t is not None and t["track_id"] == 2 and t["age"] == 1 and not t["is_lost"],
+      f"track_id={t and t.get('track_id')} age={t and t.get('age')}")
+
+# 상한이 정상 회복은 막지 않아야 한다: 3프레임 놓친 뒤 대각선 2배 거리(≈113px)는 통과
+tr4 = LeaderTracker()
+tr4.update([{"bbox": [300.0, 220.0, 340.0, 260.0], "conf": 0.9, "cls_name": "person"}])
+for _ in range(3):
+    tr4.update([])
+t = tr4.update([{"bbox": [380.0, 300.0, 420.0, 340.0], "conf": 0.6, "cls_name": "person"}])
+check("tracker: 반경 상한 아래의 정상 회복은 여전히 허용", not t["is_lost"] and t["track_id"] == 1)
+
 # ---------------------------------------------------------------- FPS 독립 평활
 import numpy as np2  # noqa: E402
 
@@ -259,9 +294,119 @@ check("평활: 같은 경과시간(0.1s)이면 FPS가 달라도 응답 근사 �
 check("평활: dt 미지정이면 기존 동작 유지",
       abs(float(main.smooth_velocity_cmd(zero, one, alpha=0.28)[0]) - 0.28) < 1e-9)
 
+# ------------------------------------------------- detector_skipped 전파
+# scheduler가 검출을 건너뛴 프레임은 마지막 bbox에 새 depth를 씌운 측정이다.
+# reliability는 track의 detector_skipped를 보고 0.55를 곱하는데, measurement dict가
+# 이 키를 복사하지 않아 main.py의 vision_reliability(rgbd_meas or ...) 경로에서는
+# 페널티가 한 번도 적용되지 않았다.
+from measurement import MeasurementBuilder  # noqa: E402
+
+_intr = {"fx": 384.0, "fy": 384.0, "ppx": 320.0, "ppy": 240.0}
+_mb = MeasurementBuilder(_intr, depth_scale=0.001)
+_depth = np2.full((480, 640), 4000, dtype=np2.uint16)     # 4m 평면
+_rel = ReliabilityEstimator()
+
+tr5 = LeaderTracker()
+for _ in range(6):
+    tr5.update([{"bbox": [300.0, 220.0, 340.0, 260.0], "conf": 0.9, "cls_name": "person"}])
+m_live = _mb.build_rgbd(tr5.update(
+    [{"bbox": [300.0, 220.0, 340.0, 260.0], "conf": 0.9, "cls_name": "person"}]), _depth)
+m_skip = _mb.build_rgbd(tr5.predict_only(), _depth)
+check("skip: 건너뛴 프레임의 rgbd 측정에 detector_skipped 키 전파",
+      m_skip.get("detector_skipped") is True and m_live.get("detector_skipped") is False)
+r_live, r_skip = _rel.vision_reliability(m_live), _rel.vision_reliability(m_skip)
+check("skip: 건너뛴 프레임 측정의 신뢰도가 0.55배로 깎임",
+      r_live > 0 and abs(r_skip / r_live - 0.55) < 1e-6, f"live={r_live:.3f} skip={r_skip:.3f}")
+b_skip = _mb.build_bearing(tr5.predict_only())
+check("skip: bearing 측정에도 전파", b_skip.get("detector_skipped") is True)
+
+# ------------------------------------------------- 재획득 시 추종 재개
+# 잠깐 놓쳤다(LOST_HOLD) 다시 찾았을 때, 리더가 호버 중이면 상대속도가 0이라
+# 출발 조건(0.25 m/s)이 영원히 안 만족돼 READY_HOVER에 갇혔다. 그 상태에선 yaw 제어도
+# 안 돌아 리더가 천천히 시야를 벗어나면 소실 착륙으로 이어진다.
+from mission_manager import S_LOST_HOLD, S_READY_HOVER  # noqa: E402
+
+_MV = dict(rel_est=[3.0, 0.0, 0.0], leader_alt=50.0, pos_cov_trace=1.0)
+
+
+def _follow_then_lose(m, t, lose_sec):
+    for _ in range(30):
+        st, _ = m.update(now=t, leader_visible=True, rel_vel_est=[0.5, 0, 0], **_MV); t += 0.1
+    assert st == S_FOLLOW
+    for _ in range(int(lose_sec * 10)):
+        st, _ = m.update(now=t, leader_visible=False, **_MV); t += 0.1
+    return st, t
+
+
+m6 = MissionManager()
+st, t = _follow_then_lose(m6, 100.0, 2.0)
+check("재개: 2초 소실은 LOST_HOLD", st == S_LOST_HOLD, f"state={st}")
+st, p = m6.update(now=t, leader_visible=True, rel_vel_est=[0.0, 0, 0], **_MV)
+check("재개: 호버 중인 리더를 재획득하면 즉시 LEADER_HOVER(allow_follow)",
+      st == S_LEADER_HOVER and p["allow_follow"] is True, f"state={st} allow={p['allow_follow']}")
+
+m7 = MissionManager()
+st, t = _follow_then_lose(m7, 100.0, 2.0)
+st, p = m7.update(now=t, leader_visible=True, rel_vel_est=[0.5, 0, 0], **_MV)
+check("재개: 이동 중인 리더를 재획득하면 출발 확인 없이 즉시 FOLLOW",
+      st == S_FOLLOW and p["allow_follow"] is True, f"state={st}")
+
+m8 = MissionManager()                      # 아직 한 번도 FOLLOW한 적 없음
+m8.update(now=100.0, leader_visible=True, rel_vel_est=[0.0, 0, 0], **_MV)
+for i in range(20):
+    m8.update(now=100.1 + i * 0.1, leader_visible=False, **_MV)
+st, p = m8.update(now=102.2, leader_visible=True, rel_vel_est=[0.0, 0, 0], **_MV)
+check("재개: 추종한 적 없으면 기존대로 READY_HOVER (출발 확인 필요)",
+      st == S_READY_HOVER and p["allow_follow"] is False, f"state={st}")
+
+m9 = MissionManager()
+st, t = _follow_then_lose(m9, 100.0, m9.lost_hold_sec + 1.0)
+check("재개: 오래 소실은 FAILSAFE_LAND", st == S_FAILSAFE_LAND, f"state={st}")
+st, p = m9.update(now=t, leader_visible=True, rel_vel_est=[0.0, 0, 0], **_MV)
+check("재개: FAILSAFE_LAND 뒤의 재획득은 자동 재개하지 않음 (READY_HOVER)",
+      st == S_READY_HOVER and p["allow_follow"] is False, f"state={st}")
+
+m10 = MissionManager()
+_follow_then_lose(m10, 100.0, 1.0)
+m10.reset()                                 # GUIDED 인계 시 main이 호출
+check("재개: reset()이 '추종한 적 있음' 기억까지 지움 (인계 후 출발 확인 재요구)",
+      m10.has_followed is False and m10.state == S_WAIT_LEADER and m10.last_seen_t is None)
+
 # ------------------------------------------------- 현장 대비 (2026-09-07 감사)
-check("ESP32: 송신 펌웨어가 없으므로 기본 off (있으면 startup crash)",
-      main.USE_LEADER_ESP32 is False, f"USE_LEADER_ESP32={main.USE_LEADER_ESP32}")
+# ESP32는 선택 사항이다. 플래그가 켜져 있어도 장치가 없으면 startup에서 죽지 않고
+# 비전 단독으로 가야 한다. (예전에는 플래그 자체를 False로 강제했지만, 사용자가 켠 뒤
+# 테스트만 깨져 있었다 — 검사할 것은 플래그 값이 아니라 "없어도 안 죽는다"다.)
+_saved = (main.USE_LEADER_ESP32, main.LEADER_TELEMETRY_KIND)
+main.USE_LEADER_ESP32 = True
+main.LEADER_TELEMETRY_KIND = "serial"
+
+
+class _NoDevice(Exception):
+    pass
+
+
+def _raise_no_device(*a, **k):
+    raise _NoDevice("could not open port /dev/ttyUSB0")
+
+
+sys.modules["serial"].Serial = _raise_no_device
+try:
+    rx = main.open_leader_receiver()
+    check("ESP32: 장치가 없어도 startup crash 없음 (None 반환)", rx is None, f"rx={rx!r}")
+except Exception as e:
+    check("ESP32: 장치가 없어도 startup crash 없음 (None 반환)", False,
+          f"{type(e).__name__}: {e}")
+
+del sys.modules["serial"].Serial          # pyserial 자체가 없는 환경(AttributeError)
+try:
+    rx = main.open_leader_receiver()
+    check("ESP32: pyserial이 없어도 startup crash 없음", rx is None, f"rx={rx!r}")
+except Exception as e:
+    check("ESP32: pyserial이 없어도 startup crash 없음", False, f"{type(e).__name__}: {e}")
+
+main.USE_LEADER_ESP32 = False
+check("ESP32: 플래그 off면 수신기를 열지 않음", main.open_leader_receiver() is None)
+main.USE_LEADER_ESP32, main.LEADER_TELEMETRY_KIND = _saved
 
 check("헤드리스: MARS_SHOW_WINDOW로 창을 끌 수 있음",
       "MARS_SHOW_WINDOW" in open("main.py", encoding="utf-8").read())
@@ -290,6 +435,142 @@ buf = _io.StringIO()
 with contextlib.redirect_stdout(buf):
     YoloDetector(model=_FakeModel(), target_class_name="leader_drone")
 check("검출: 클래스가 맞으면 확인 메시지", "확인됨" in buf.getvalue())
+
+# ------------------------------------------------- HEARTBEAT 컴포넌트 필터
+# 같은 시스템 ID의 다른 컴포넌트(짐벌·카메라·라우터)가 heartbeat를 내면 모드 문자열이
+# 왕복해 main의 GUIDED 진입 에지가 매번 발동하고 미션이 계속 리셋됐다.
+import mavlink_io  # noqa: E402
+
+
+class _HB:
+    def __init__(self, src_sys, src_comp, mode_name, mav_type=2, armed=True):
+        self._sys, self._comp = src_sys, src_comp
+        self.mode_name, self.type = mode_name, mav_type
+        self.base_mode = 128 if armed else 0
+
+    def get_type(self): return "HEARTBEAT"
+    def get_srcSystem(self): return self._sys
+    def get_srcComponent(self): return self._comp
+
+
+class _SysStatus:
+    def __init__(self, voltage): self.voltage_battery, self.battery_remaining = voltage, -1
+    def get_type(self): return "SYS_STATUS"
+
+
+class _Master:
+    target_system, target_component = 1, 1
+
+    def __init__(self, msgs): self._q = list(msgs) + [None]
+    def recv_match(self, blocking=False): return self._q.pop(0)
+
+
+mavlink_io.drain_messages(_Master([_HB(1, 1, "GUIDED")]))
+check("HB: autopilot 컴포넌트의 heartbeat로 모드 갱신",
+      mavlink_io.get_vehicle_state()["mode"]["name"] == "GUIDED")
+mavlink_io.drain_messages(_Master([_HB(1, 154, "Mode(0)", mav_type=26)]))   # 짐벌
+check("HB: 같은 시스템의 다른 컴포넌트 heartbeat는 무시",
+      mavlink_io.get_vehicle_state()["mode"]["name"] == "GUIDED",
+      f"mode={mavlink_io.get_vehicle_state()['mode']['name']}")
+mavlink_io.drain_messages(_Master([_HB(255, 190, "LOITER", mav_type=6)]))     # GCS
+check("HB: GCS heartbeat는 무시 (기존 동작 유지)",
+      mavlink_io.get_vehicle_state()["mode"]["name"] == "GUIDED")
+
+# ------------------------------------------------- 배터리 전압 sentinel
+mavlink_io.last_battery_voltage = None
+mavlink_io.drain_messages(_Master([_SysStatus(65535)]))
+check("BAT: voltage_battery=65535(미보고)는 전압으로 안 씀",
+      mavlink_io.last_battery_voltage is None, f"v={mavlink_io.last_battery_voltage}")
+mavlink_io.drain_messages(_Master([_SysStatus(12600)]))
+check("BAT: 정상 전압은 V로 환산", mavlink_io.last_battery_voltage == 12.6)
+
+# ------------------------------------------------- ESP32 serial 부분 라인
+# readline()+1ms timeout은 전송 도중 읽으면 앞토막/뒤토막이 따로 잘려 패킷을 통째로 잃었다.
+from leader_telemetry import LeaderTelemetryReceiver, parse_leader_json  # noqa: E402
+from leader_telemetry import build_leader_measurement_from_packet  # noqa: E402
+
+
+class _FakeSerial:
+    def __init__(self, chunks): self._chunks = list(chunks)
+    @property
+    def in_waiting(self): return len(self._chunks[0]) if self._chunks else 0
+    def read(self, n): return self._chunks.pop(0) if self._chunks else b""
+
+
+_pkt = b'{"lat":35.83,"lon":128.75,"alt":50.0,"vx":0.1,"vy":0.2,"vz":0.0,"seq":%d}\n'
+rx = LeaderTelemetryReceiver(kind="serial")
+rx.ser = _FakeSerial([
+    (_pkt % 1)[:30],                                  # 1번 패킷 앞토막
+    (_pkt % 1)[30:] + (_pkt % 2) + (_pkt % 3)[:12],   # 뒤토막 + 2번 전체 + 3번 앞토막
+])
+check("serial: 잘린 앞토막만 왔을 때는 패킷 없음 (버림도 없음)",
+      rx.read_latest() is None and rx._rx_buf == (_pkt % 1)[:30])
+p2 = rx.read_latest()
+check("serial: 뒤토막이 오면 1번을 복원하고, 같은 chunk의 2번까지 파싱해 최신(2)을 반환",
+      p2 is not None and p2.seq == 2, f"seq={p2 and p2.seq}")
+check("serial: 3번 앞토막은 버퍼에 남아 다음 읽기를 기다림",
+      rx._rx_buf == (_pkt % 3)[:12])
+
+# ------------------------------------------------- 리더 고도 기준계
+_ok = parse_leader_json('{"lat":1,"lon":2,"alt_ellipsoid":62.0}')
+check("alt: alt_ellipsoid 필드는 ELLIPSOID", _ok.alt_frame == "ELLIPSOID" and _ok.alt == 62.0)
+check("alt: alt_msl 필드는 AMSL", parse_leader_json('{"lat":1,"lon":2,"alt_msl":37}').alt_frame == "AMSL")
+check("alt: 그냥 alt는 수신기 기본값을 따름",
+      parse_leader_json('{"lat":1,"lon":2,"alt":37}').alt_frame == "AMSL"
+      and parse_leader_json('{"lat":1,"lon":2,"alt":62}', default_alt_frame="ellipsoid").alt_frame == "ELLIPSOID")
+
+_FOLLOWER = {
+    "global_position": {"lat": 358300000, "lon": 1287500000, "alt": 35000, "timestamp": 1.0},  # 35m AMSL
+    "gps": {"lat": 358300000, "lon": 1287500000, "alt": 35000, "alt_ellipsoid": 60000,          # 60m 타원체고
+            "timestamp": 1.0},
+    "attitude": {"yaw": 0.0, "timestamp": 1.0},
+}
+_pk = lambda js: parse_leader_json(js)  # noqa: E731
+m_amsl = build_leader_measurement_from_packet(_pk('{"lat":35.83,"lon":128.75,"alt_msl":37.0}'), _FOLLOWER, now=0.0)
+m_ell = build_leader_measurement_from_packet(_pk('{"lat":35.83,"lon":128.75,"alt_ellipsoid":62.0}'), _FOLLOWER, now=0.0)
+check("alt: AMSL 리더는 팔로워 GLOBAL_POSITION_INT.alt와 뺌 → up=+2.0",
+      m_amsl["available"] and abs(m_amsl["rel_fru"][2] - 2.0) < 1e-6, f"up={m_amsl.get('rel_fru')}")
+check("alt: 타원체고 리더는 팔로워 alt_ellipsoid와 뺌 → up=+2.0 (지오이드 25m 안 섞임)",
+      m_ell["available"] and abs(m_ell["rel_fru"][2] - 2.0) < 1e-6, f"up={m_ell.get('rel_fru')}")
+_no_ell = {k: dict(v) for k, v in _FOLLOWER.items()}
+_no_ell["gps"].pop("alt_ellipsoid")
+m_bad = build_leader_measurement_from_packet(_pk('{"lat":35.83,"lon":128.75,"alt_ellipsoid":62.0}'), _no_ell, now=0.0)
+check("alt: 타원체고 리더인데 팔로워 타원체고가 없으면 측정 불가로 거부 (섞어 쓰지 않음)",
+      m_bad["available"] is False and m_bad["reason"] == "no_follower_ellipsoid_alt", f"{m_bad}")
+
+# ------------------------------------------------- GPS 단독 거리 → 이격 확대
+# has_range_fix()는 ESP32 GPS 상대위치로도 참이 된다. 비전이 죽어도 소실 판정은 안 나는 게
+# 맞지만(링크가 살아 있으니), GPS 오차(m 단위)만으로 3m 이격 추종을 계속하면 안 된다.
+ek2 = ImmEkf()
+ek2.init([0.0, 0.0, 8.0], source="gps")
+check("gps-only: GPS로 초기화하면 거리는 알지만 비전 거리는 없음",
+      ek2.has_range_fix() and not ek2.has_vision_range_fix())
+ek2.update_position3d([0.0, 0.0, 8.0], source="rgbd")
+check("gps-only: RGB-D 측정이 들어오면 비전 거리 확보", ek2.has_vision_range_fix())
+for _ in range(90):                                   # 3초간 GPS만
+    ek2.predict(1 / 30)
+    ek2.update_position3d([0.0, 0.0, 8.0], np3.diag([4.0, 4.0, 9.0]), source="gps")
+check("gps-only: GPS만 3초면 비전 거리는 만료, 전체 거리는 유지 (소실 판정 안 남)",
+      ek2.has_range_fix() and not ek2.has_vision_range_fix(),
+      f"range={ek2.range_coast_time:.2f} vision={ek2.vision_range_coast_time:.2f}")
+check("gps-only: 이격 거리 TARGET < GPS_ONLY < depth_max (비전이 다시 이어받을 수 있는 범위)",
+      main.TARGET_DISTANCE_M < main.TARGET_DISTANCE_GPS_ONLY_M < CONFIG["camera"]["depth_max_m"],
+      f"{main.TARGET_DISTANCE_M} < {main.TARGET_DISTANCE_GPS_ONLY_M} < {CONFIG['camera']['depth_max_m']}")
+cmd = main.compute_velocity_cmd_from_estimate([8.0, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0,
+                                              target_distance=main.TARGET_DISTANCE_GPS_ONLY_M)
+check("gps-only: target_distance=8m이면 8m에서 전진 명령 0", abs(cmd[0]) < 1e-9, f"vx={cmd[0]:.3f}")
+cmd = main.compute_velocity_cmd_from_estimate([8.0, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0)
+check("gps-only: 기본 target은 여전히 3m (8m에서는 전진)", cmd[0] > 0.3, f"vx={cmd[0]:.3f}")
+
+# ------------------------------------------------- 죽은 코드 제거 / 하네스 범위
+import detector as _det  # noqa: E402
+check("정리: controller.py(모터 테스트 프로토타입) 제거", not Path("controller.py").exists())
+check("정리: mavlink_io 모터 테스트 계열 제거",
+      not any(hasattr(mavlink_io, n) for n in ("motor_test_percent", "trigger_motors", "stop_all_motors")))
+check("정리: detector.select_target 제거", not hasattr(_det, "select_target"))
+_h = open("sitl/harness.py", encoding="utf-8").read()
+check("하네스: --all이 depth_loss·handover까지 포함",
+      '"depth_loss", "handover"] if ARGS.all' in _h)
 
 # ---------------------------------------------------------------- 
 print()
