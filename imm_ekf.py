@@ -277,8 +277,12 @@ class ImmEkf:
         # coast_time은 거기서도 0이 되므로 깊이가 죽어도 필터가 "잘 보고 있다"고
         # 믿게 된다. 미션의 소실 판정은 이 값을 써야 한다.
         self.range_coast_time = 0.0
+        # 그중 카메라 깊이(RGB-D)로 거리를 본 뒤 흐른 시간. ESP32 GPS 상대위치도
+        # 거리를 담지만 오차가 m 단위라, 그것만으로 3m 추종을 계속하면 안 된다.
+        # 제어기는 이 값으로 "비전 없이 GPS만으로 가고 있는가"를 판단한다.
+        self.vision_range_coast_time = 0.0
 
-    def init(self, z):
+    def init(self, z, source="rgbd"):
         x0 = np.array([z[0], z[1], z[2], 0.0, 0.0, 0.0], dtype=float)
         P0 = _make_P0()
 
@@ -289,6 +293,8 @@ class ImmEkf:
         self.initialized = True
         self.coast_time = 0.0
         self.range_coast_time = 0.0
+        # GPS로 초기화했으면 비전 거리는 아직 본 적이 없다.
+        self.vision_range_coast_time = 0.0 if source == "rgbd" else float("inf")
 
     def predict(self, dt):
         if not self.initialized:
@@ -297,6 +303,7 @@ class ImmEkf:
         dt = max(float(dt), 1e-4)
         # 매 프레임 누적하고, 거리 측정이 들어올 때만 0으로 되돌린다.
         self.range_coast_time += dt
+        self.vision_range_coast_time += dt
 
         Pi = TRANS_PROB
         mu_pred = Pi.T @ self.mu
@@ -325,18 +332,21 @@ class ImmEkf:
 
         self.mu = mu_pred
 
-    def update(self, z, R=None):
-        return self.update_position3d(z, R)
+    def update(self, z, R=None, source="rgbd"):
+        return self.update_position3d(z, R, source=source)
 
-    def update_position3d(self, z, R=None):
+    def update_position3d(self, z, R=None, source="rgbd"):
+        """source: "rgbd"(카메라 깊이) 또는 "gps"(ESP32 상대위치)."""
         z = np.asarray(z, dtype=float)
 
         if not self.initialized:
-            self.init(z)
+            self.init(z, source=source)
             return
 
         self.coast_time = 0.0
         self.range_coast_time = 0.0     # 거리를 담은 유일한 측정 경로
+        if source == "rgbd":
+            self.vision_range_coast_time = 0.0
 
         likelihoods = np.array(
             [f.update_position3d(z, R) for f in self.filters]
@@ -454,6 +464,7 @@ class ImmEkf:
             "initialized": self.initialized,
             "coast_time": self.coast_time,
             "range_coast_time": self.range_coast_time,
+            "vision_range_coast_time": self.vision_range_coast_time,
         }
 
     def get_position(self):
@@ -481,6 +492,16 @@ class ImmEkf:
         """
         limit = RANGE_COAST_MAX_SEC if max_age is None else float(max_age)
         return self.initialized and (self.range_coast_time <= limit)
+
+    def has_vision_range_fix(self, max_age=None):
+        """카메라 깊이로 거리를 본 지 오래되지 않았는가.
+
+        has_range_fix()는 ESP32 GPS 상대위치로도 참이 된다. 미션의 소실 판정은 그쪽을
+        쓰되(GPS 링크가 살아 있으면 착륙할 이유가 없다), 추종 거리는 이 값으로 정한다 —
+        GPS만으로 3m 이격은 GPS 오차보다 작다.
+        """
+        limit = RANGE_COAST_MAX_SEC if max_age is None else float(max_age)
+        return self.initialized and (self.vision_range_coast_time <= limit)
 
 
 def get_intrinsics_from_camera(pipeline_profile):

@@ -429,7 +429,7 @@ def run_scenario(name):
             log("시나리오: 리더 소실 → FAILSAFE_LAND → 조종사 탈환 (C2)")
             time.sleep(8)
             World.visible = False
-            log("리더 소실 (lost_hold 5s 후 FAILSAFE_LAND 예상)")
+            log("리더 소실 (range_coast 2s + lost_hold 8s = 10s 후 FAILSAFE_LAND 예상)")
         elif name == "handover":
             # 실제 운용 절차 재현: 조종사가 수동(LOITER = ALT_HOLD 대용)으로 상승하는
             # 동안 리더는 화면 밖이다. 그 사이 미션은 FAILSAFE_LAND로 래치된다.
@@ -580,8 +580,10 @@ def run_scenario(name):
 
 
 if __name__ == "__main__":
+    # ArduCopter SITL로 도는 8개 전부. px4_setmode만 PX4 엔드포인트가 필요해 제외한다.
     names = ["boot_no_leader", "pilot_takeover", "air_landing",
-             "depth_range", "hover_hold", "hold_heading"] if ARGS.all \
+             "depth_range", "hover_hold", "hold_heading",
+             "depth_loss", "handover"] if ARGS.all \
         else [ARGS.scenario]
     print(f"저장소: {ARGS.repo}")
     results = {}

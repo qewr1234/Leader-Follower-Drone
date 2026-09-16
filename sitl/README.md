@@ -37,7 +37,7 @@ pip install pymavlink empy==3.3.4 pexpect future
 ## 3. 회귀 실행
 
 ```bash
-python3 sitl/harness.py --all
+python3 sitl/harness.py --all      # ArduCopter 시나리오 8개. px4_setmode는 PX4 엔드포인트 필요
 ```
 
 하네스가 GUIDED 진입 → ARM → 이륙까지 알아서 하고, 시나리오마다 다시 이륙시킵니다.
@@ -200,4 +200,4 @@ python3 sitl/harness.py --scenario px4_setmode --fc-port udpin:0.0.0.0:14540
 
 `cv2`(전부 no-op) · `pyrealsense2` · `ultralytics` · `serial`, 그리고 `camera.D435i`와
 `detector.YoloDetector`를 합성 리더를 만드는 가짜로 교체합니다. 깊이 영상은 리더 bbox 안만
-실제 거리, 나머지는 9.5m 배경입니다. **그 외에는 저장소 코드가 그대로 돕니다.**
+실제 거리, 나머지는 15m 배경(depth_max 10m 밖)입니다. **그 외에는 저장소 코드가 그대로 돕니다.**

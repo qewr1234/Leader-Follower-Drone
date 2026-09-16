@@ -18,7 +18,13 @@ leader_telemetry.py — ESP32 leader telemetry receiver + relative measurement b
    위와 동일
 
 좌표계 가정:
-- leader lat/lon/alt: WGS84, degree, meter
+- leader lat/lon: WGS84 degree
+- leader alt: meter. 기준계는 필드 이름으로 정한다 —
+    "alt_msl" / "alt_amsl"              → 해발(AMSL)
+    "alt_ellipsoid" / "alt_hae" / "alt_wgs84" → WGS84 타원체고
+    "alt" / "altitude" / "alt_m"         → 수신기의 default_alt_frame (기본 AMSL)
+  팔로워 쪽은 같은 기준으로 뺀다: AMSL이면 GLOBAL_POSITION_INT.alt, 타원체고면
+  GPS_RAW_INT.alt_ellipsoid. 기준이 다르면 국내 지오이드 차이(~25m)가 상대 고도로 들어간다.
 - leader velocity 기본값: ENU 기준 [east, north, up] m/s
 - MAVLink follower attitude yaw: rad, North 기준 clockwise
 - MARS-IMM / camera state:
@@ -55,6 +61,7 @@ class LeaderPacket:
     yaw: float
     rx_time: float
     seq: int = -1
+    alt_frame: str = "AMSL"       # "AMSL" | "ELLIPSOID"
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -81,6 +88,7 @@ class LeaderTelemetryReceiver:
         udp_ip="0.0.0.0",
         udp_port=5005,
         timeout=0.001,
+        default_alt_frame="AMSL",
     ):
         self.kind = kind
         self.port = port
@@ -88,9 +96,11 @@ class LeaderTelemetryReceiver:
         self.udp_ip = udp_ip
         self.udp_port = udp_port
         self.timeout = timeout
+        self.default_alt_frame = default_alt_frame
 
         self.ser = None
         self.sock = None
+        self._rx_buf = b""
         self.latest_packet: Optional[LeaderPacket] = None
         self.last_error = None
 
@@ -133,27 +143,42 @@ class LeaderTelemetryReceiver:
 
         return self.latest_packet
 
+    # 줄바꿈 없이 이만큼 쌓이면 쓰레기로 보고 앞부분을 버린다 (115200 baud로 수 초 분량).
+    _RX_BUF_LIMIT = 65536
+
     def _drain_serial(self):
+        """버퍼에 도착한 바이트를 전부 읽어 완성된 줄만 파싱한다.
+
+        readline()에 1ms timeout을 걸면 전송 도중(115200 baud에서 150바이트 한 줄이
+        13ms) 읽기가 시작될 때 잘린 앞토막이 돌아와 JSON 파싱에 실패하고, 뒤토막도
+        다음 호출에서 따로 잘려 그 패킷을 통째로 잃는다. 바이트를 모아 두고 '\n'이
+        보일 때만 자르면 어느 시점에 읽어도 손실이 없다.
+        """
         if self.ser is None:
             return
 
-        while True:
-            try:
-                line = self.ser.readline()
-                if not line:
-                    break
+        try:
+            n = int(getattr(self.ser, "in_waiting", 0) or 0)
+            chunk = self.ser.read(n if n > 0 else 1)
+        except Exception as exc:
+            self.last_error = str(exc)
+            return
 
-                text = line.decode("utf-8", errors="ignore").strip()
-                if not text:
-                    continue
+        if not chunk:
+            return
+        self._rx_buf += chunk
 
-                pkt = parse_leader_json(text)
-                if pkt is not None:
-                    self.latest_packet = pkt
+        while b"\n" in self._rx_buf:
+            line, self._rx_buf = self._rx_buf.split(b"\n", 1)
+            text = line.decode("utf-8", errors="ignore").strip()
+            if not text:
+                continue
+            pkt = parse_leader_json(text, default_alt_frame=self.default_alt_frame)
+            if pkt is not None:
+                self.latest_packet = pkt
 
-            except Exception as exc:
-                self.last_error = str(exc)
-                break
+        if len(self._rx_buf) > self._RX_BUF_LIMIT:
+            self._rx_buf = self._rx_buf[-4096:]
 
     def _drain_udp(self):
         if self.sock is None:
@@ -166,7 +191,7 @@ class LeaderTelemetryReceiver:
                     break
 
                 text = data.decode("utf-8", errors="ignore").strip()
-                pkt = parse_leader_json(text)
+                pkt = parse_leader_json(text, default_alt_frame=self.default_alt_frame)
                 if pkt is not None:
                     self.latest_packet = pkt
 
@@ -189,7 +214,12 @@ def _get_any(d, names, default=None):
     return default
 
 
-def parse_leader_json(text: str) -> Optional[LeaderPacket]:
+_ALT_KEYS_AMSL = ["alt_msl", "alt_amsl"]
+_ALT_KEYS_ELLIPSOID = ["alt_ellipsoid", "alt_hae", "alt_wgs84"]
+_ALT_KEYS_DEFAULT = ["alt", "altitude", "alt_m"]
+
+
+def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[LeaderPacket]:
     try:
         d = json.loads(text)
         now = time.time()
@@ -199,7 +229,22 @@ def parse_leader_json(text: str) -> Optional[LeaderPacket]:
 
         lat = float(_get_any(d, ["lat", "latitude"]))
         lon = float(_get_any(d, ["lon", "lng", "longitude"]))
-        alt = float(_get_any(d, ["alt", "altitude", "alt_m"]))
+
+        # 고도는 기준계를 함께 정한다. 이름이 명시된 필드가 우선이고,
+        # 그냥 "alt"면 수신기 설정(default_alt_frame)을 따른다.
+        alt = _get_any(d, _ALT_KEYS_AMSL)
+        if alt is not None:
+            alt_frame = "AMSL"
+        else:
+            alt = _get_any(d, _ALT_KEYS_ELLIPSOID)
+            if alt is not None:
+                alt_frame = "ELLIPSOID"
+            else:
+                alt = _get_any(d, _ALT_KEYS_DEFAULT)
+                alt_frame = str(default_alt_frame).upper()
+        alt = float(alt)
+        if alt_frame not in ("AMSL", "ELLIPSOID"):
+            raise ValueError(f"unknown alt frame {alt_frame}")
 
         vx = float(_get_any(d, ["vx", "vel_x", "v_east"], 0.0))
         vy = float(_get_any(d, ["vy", "vel_y", "v_north"], 0.0))
@@ -224,6 +269,7 @@ def parse_leader_json(text: str) -> Optional[LeaderPacket]:
             yaw=yaw,
             rx_time=now,
             seq=seq,
+            alt_frame=alt_frame,
             raw=d,
         )
 
@@ -292,6 +338,20 @@ def lla_to_enu(lat, lon, alt, lat0, lon0, alt0):
     up = alt - alt0
 
     return np.array([east, north, up], dtype=float)
+
+
+def _follower_alt_ellipsoid_m(vehicle_state: Dict[str, Any]):
+    """GPS_RAW_INT.alt_ellipsoid (mm, MAVLink2 확장) → m. 없거나 0이면 None."""
+    v = vehicle_state.get("gps", {}).get("alt_ellipsoid", None)
+    if v is None:
+        return None
+    try:
+        v = float(v)
+    except Exception:
+        return None
+    if v == 0.0:
+        return None
+    return v * 1e-3
 
 
 def get_follower_yaw(vehicle_state: Dict[str, Any]):
@@ -444,6 +504,19 @@ def build_leader_measurement_from_packet(
             "reason": "no_follower_gps",
         }
 
+    # 리더가 타원체고를 보내면 팔로워도 타원체고(GPS_RAW_INT.alt_ellipsoid)로 뺀다.
+    # 해발과 타원체고를 섞으면 지오이드 차이가 그대로 상대 고도가 된다.
+    if packet.alt_frame == "ELLIPSOID":
+        f_alt_ell = _follower_alt_ellipsoid_m(follower_vehicle_state)
+        if f_alt_ell is None:
+            return {
+                "available": False,
+                "fresh": True,
+                "age": age,
+                "reason": "no_follower_ellipsoid_alt",
+            }
+        follower_lla = (follower_lla[0], follower_lla[1], f_alt_ell)
+
     follower_yaw = get_follower_yaw(follower_vehicle_state)
     if follower_yaw is None:
         return {
@@ -515,6 +588,7 @@ def build_leader_measurement_from_packet(
         "rel_vel_cam": rel_vel_cam,
 
         "leader_alt": float(packet.alt),
+        "leader_alt_frame": packet.alt_frame,
         "leader_vz_up": leader_vz_up,
         "leader_hspeed": leader_hspeed,
 

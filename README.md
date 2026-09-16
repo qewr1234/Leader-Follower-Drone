@@ -28,7 +28,7 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 **4.3m — 이론값 4.36m와 소수 둘째 자리 일치** |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
-| **회귀 스위트** | 단위 검사 51개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
+| **회귀 스위트** | 단위 검사 75개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 추종 동작과 Fail-safe
@@ -97,6 +97,9 @@ D435i (color+depth, 640×480@30)
 - **이륙 인계가 안전합니다.** 수동 상승 후 GUIDED로 넘기는 순간 미션·명령 버퍼를 리셋해
   깨끗한 상태로 추종을 시작합니다 (SITL 검증).
 - **고도 바닥.** `MIN_AGL_M`(1.5m) 아래에서는 하강 명령을 차단합니다.
+- **GPS만으로는 붙지 않습니다.** 카메라 깊이가 끊기고 ESP32 GPS 상대위치만 남으면 이격을
+  3m에서 8m(`TARGET_DISTANCE_GPS_ONLY_M`)로 넓힙니다 — GPS 상대오차는 m 단위라 3m는
+  오차보다 작고, 8m는 깊이창(10m) 안이라 리더가 다시 보이면 비전이 이어받습니다.
 - **기본값이 dry-run.** `SEND_MAVLINK_COMMANDS = False`가 기본이라, 켜기 전까지는 인지·추정·
   화면 표시가 전부 돌면서 명령은 전송되지 않습니다.
 - **카메라 hiccup 내성.** 프레임 드롭은 드롭으로 처리하고, 헤드리스(`MARS_SHOW_WINDOW=0`)
@@ -108,7 +111,7 @@ D435i (color+depth, 640×480@30)
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 51개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 75개 — numpy만 있으면 됨
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 ```
 
@@ -127,7 +130,7 @@ SITL 시나리오 8개: 부팅 대기 · 조종사 탈환 · 공중 오판 방�
 | 기체 | Holybro X500 V2 + Pixhawk |
 | 컴패니언 | NVIDIA Jetson |
 | 카메라 | Intel RealSense D435i (640×480 @ 30fps) |
-| 선두 텔레메트리 | ESP32 (serial 115200 또는 UDP 5005) — 선택 사항, 비전 단독으로 동작 |
+| 선두 텔레메트리 | ESP32 (serial 115200 또는 UDP 5005) — 선택 사항, 비전 단독으로 동작. 고도 기준계는 `LEADER_ALT_FRAME`(AMSL/ELLIPSOID) 또는 패킷 필드명(`alt_msl` / `alt_ellipsoid`)으로 지정 |
 
 ## 실행
 
@@ -188,7 +191,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회) |
 | `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | 단위 회귀 51개 (하드웨어·FC 불필요) |
+| `test_fixes.py` | 단위 회귀 75개 (하드웨어·FC 불필요) |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 | `docs/images/` | README 다이어그램(SVG) |
 
