@@ -7,7 +7,6 @@ mission_manager.py — Leader-Follower mission state machine
 - MARS-IMM controller 위에 올라가는 안전 상태 관리자
 """
 
-import time
 import numpy as np
 
 
@@ -19,7 +18,6 @@ S_LANDING_CANDIDATE = "LANDING_CANDIDATE"
 S_CONFIRMED_LANDING = "CONFIRMED_LANDING"
 S_LOST_HOLD = "LOST_HOLD"
 S_FAILSAFE_LAND = "FAILSAFE_LAND"
-S_MANUAL_OVERRIDE = "MANUAL_OVERRIDE"
 
 
 class MissionManager:
@@ -45,7 +43,6 @@ class MissionManager:
 
         self.lost_hold_sec = float(lost_hold_sec)
 
-        self.last_state_change_t = time.time()
         self.reset()
 
     def reset(self):
@@ -56,7 +53,6 @@ class MissionManager:
         FOLLOW로 뛰어드는 일을 막는다.
         """
         self.state = S_WAIT_LEADER
-        self.first_seen_t = None
         self.last_seen_t = None
         self.start_candidate_t = None
         self.landing_candidate_t = None
@@ -73,27 +69,24 @@ class MissionManager:
         leader_alt=None,
         leader_vel_world=None,
         pos_cov_trace=999.0,
-        manual_override=False,
     ):
         """
         입력:
         - leader_visible: vision/gps/esp/MARS-IMM 기준 선두 추적 가능 여부
         - rel_est: 후미 기준 선두 상대 위치 [front, right, up]
         - rel_vel_est: 상대 속도
-        - leader_alt: 선두 절대/상대 고도. 없으면 rel_est[2]를 보조로 사용
+        - leader_alt: 선두 절대(대지) 고도. None이면 착륙 판정을 하지 않는다 (C3)
         - leader_vel_world: ESP32/GPS에서 받은 선두 속도
         - pos_cov_trace: IMM 위치 공분산 trace
         """
 
-        if manual_override:
-            self._set_state(S_MANUAL_OVERRIDE, now)
-            return self.state, self.command_policy()
-
         if leader_visible:
-            if self.first_seen_t is None:
-                self.first_seen_t = now
             self.last_seen_t = now
         else:
+            # 가림 중에는 확인 타이머를 끊는다. 남겨 두면 가려진 시간이 타이머에
+            # 합산돼 재획득 첫 프레임에 CONFIRMED_LANDING / FOLLOW가 날 수 있다.
+            self.landing_candidate_t = None
+            self.start_candidate_t = None
             if self.last_seen_t is None:
                 # C1: 리더를 아직 한 번도 못 본 것은 "놓친" 것이 아니다.
                 # 이 가드가 없으면 _lost_time이 999.0을 반환해 부팅 첫 프레임에
@@ -112,7 +105,6 @@ class MissionManager:
 
         # 여기부터는 leader_visible=True
         hspeed, vz, z_for_landing = self._extract_motion(
-            rel_est=rel_est,
             rel_vel_est=rel_vel_est,
             leader_alt=leader_alt,
             leader_vel_world=leader_vel_world,
@@ -120,6 +112,8 @@ class MissionManager:
 
         # 추정 불확실성이 너무 크면 FOLLOW 금지
         if pos_cov_trace > 8.0:
+            self.landing_candidate_t = None
+            self.start_candidate_t = None
             self._set_state(S_LOST_HOLD, now)
             return self.state, self.command_policy()
 
@@ -180,9 +174,8 @@ class MissionManager:
         # 이미 추종하던 리더라면 바로 재개한다. 이전에는 READY_HOVER로 떨어져 리더가
         # 0.25 m/s 넘게 움직여야만 FOLLOW로 돌아왔다 — hspeed는 상대속도라 둘 다 호버
         # 중이면 0이고, 그러면 yaw 제어도 멈춘 채 리더가 천천히 시야를 벗어나는 걸
-        # 지켜보다 소실 착륙으로 갔다. FAILSAFE_LAND / CONFIRMED_LANDING / MANUAL_OVERRIDE
-        # 에서 온 경우는 그대로 READY_HOVER — 착륙 명령이 나간 뒤나 조종사 개입 뒤에는
-        # 출발 확인을 다시 거치는 편이 안전하다.
+        # 지켜보다 소실 착륙으로 갔다. FAILSAFE_LAND / CONFIRMED_LANDING 에서 온 경우는
+        # 그대로 READY_HOVER — 착륙 명령이 나간 뒤에는 출발 확인을 다시 거치는 편이 안전하다.
         if self.has_followed and self.state in (S_LOST_HOLD, S_LANDING_CANDIDATE):
             if hspeed > self.start_speed_thresh:
                 self._set_state(S_FOLLOW, now)
@@ -224,12 +217,9 @@ class MissionManager:
         if self.state == S_FAILSAFE_LAND:
             return {"mode": "FAILSAFE_LAND", "allow_follow": False, "land": True}
 
-        if self.state == S_MANUAL_OVERRIDE:
-            return {"mode": "MANUAL", "allow_follow": False, "land": False}
-
         return {"mode": "HOLD", "allow_follow": False, "land": False}
 
-    def _extract_motion(self, rel_est, rel_vel_est, leader_alt, leader_vel_world):
+    def _extract_motion(self, rel_vel_est, leader_alt, leader_vel_world):
         hspeed = 0.0
         vz = 0.0
 
@@ -258,8 +248,6 @@ class MissionManager:
         return float(now - self.last_seen_t)
 
     def _set_state(self, new_state, now):
-        if new_state != self.state:
-            self.state = new_state
-            self.last_state_change_t = now
+        self.state = new_state
         if new_state == S_FOLLOW:
             self.has_followed = True

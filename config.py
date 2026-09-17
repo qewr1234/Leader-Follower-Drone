@@ -6,23 +6,22 @@ Mode-Aware Reliability-Scheduled IMM Tracking
 """
 
 CONFIG = {
-		"detector": {
-		    "pt_model": "/home/dsl/DRONE/leader_drone_yolo11n.pt",
-		    "trt_model": "/home/dsl/DRONE/leader_drone_yolo11n.engine",
-		    # 현재는 사람으로 실험 중. 드론 전환 시 "leader_drone"으로 변경.
-		    # (커스텀 모델(.pt/.engine)에 해당 클래스가 있어야 함)
-		    "target_class_name": "person",
-		    "conf_thres": 0.25,
-		    "iou_thres": 0.45,
-		    "imgsz": 416,
-		},
-	    "camera": {
+    "detector": {
+        "pt_model": "/home/dsl/DRONE/leader_drone_yolo11n.pt",
+        "trt_model": "/home/dsl/DRONE/leader_drone_yolo11n.engine",
+        # 현재는 사람으로 실험 중. 드론 전환 시 "leader_drone"으로 변경.
+        # (커스텀 모델(.pt/.engine)에 해당 클래스가 있어야 함)
+        "target_class_name": "person",
+        "conf_thres": 0.25,
+        "iou_thres": 0.45,
+        "imgsz": 416,
+    },
+    "camera": {
         "width": 640,
         "height": 480,
         "fps": 30,
         "depth_min_m": 0.30,
         "depth_max_m": 10.00,   # C4: TARGET_DISTANCE_M(3.0) 대비 여유 7m
-        "depth_scale_fallback": 0.001,
     },
     "measurement": {
         "bbox_inner_ratio": 0.55,
@@ -56,14 +55,8 @@ CONFIG = {
         "hover_detect_every": 3,
         "normal_detect_every": 2,
         "maneuver_detect_every": 1,
-        "uncertainty_gain": 0.8,
-        "maneuver_gain": 1.2,
-        "lost_gain": 0.35,
     },
     "controller": {
-        "hold_after_lost": 5.0,
-        "test_interval": 0.10,
-        "test_duration": 0.35,
         "uncertainty_slowdown_trace": 4.0,
     },
     "logger": {

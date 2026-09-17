@@ -1,11 +1,10 @@
 """
 logger.py — 실험 로깅 (JSONL 스트리밍 + 종료 시 CSV 변환)
 
-변경점:
-- 기존 csv.DictWriter는 첫 row에서 헤더가 고정되어, 이후 새 키가 생기면
-  (예: 첫 탐지 시점에 track.* 필드 등장) ValueError로 메인 루프 전체가 죽었다.
-- 실행 중에는 row마다 flush되는 JSONL로 기록하고(크래시에도 데이터 보존),
-  close() 시 전체 키의 합집합으로 CSV를 생성한다.
+실행 중에는 row마다 flush되는 JSONL로 기록하고(크래시에도 데이터 보존),
+close() 시 전체 키의 합집합으로 CSV를 생성한다. csv.DictWriter를 바로 쓰면
+첫 row에서 헤더가 고정되어 뒤늦게 등장하는 키(예: 첫 탐지 시 track.*)가
+ValueError로 메인 루프를 죽이기 때문이다.
 """
 
 import csv
@@ -34,7 +33,6 @@ class ExperimentLogger:
         ts = time.strftime("%Y%m%d_%H%M%S")
         self.jsonl_path = os.path.join(log_dir, f"{prefix}_{ts}.jsonl")
         self.csv_path = os.path.join(log_dir, f"{prefix}_{ts}.csv")
-        self.path = self.csv_path
         self.file = open(self.jsonl_path, "w")
         print(f"[LOG] writing: {self.jsonl_path} (CSV는 종료 시 생성)")
 

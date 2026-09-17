@@ -29,7 +29,12 @@ _vehicle_state = {
 def connect_fc():
     print("[FC] connecting...")
     master = mavutil.mavlink_connection(SERIAL_PORT, baud=SERIAL_BAUD)
-    master.wait_heartbeat()
+    # wait_heartbeat() 는 timeout 없이 영원히 막힌다. 포기하진 않되 10초마다 알려서
+    # 포트/전원 문제를 침묵 속에 묻지 않는다. timeout 시 pymavlink 는 None 을 돌려준다.
+    waited = 0
+    while master.wait_heartbeat(timeout=10) is None:
+        waited += 10
+        print(f"[FC] heartbeat 대기 중 ({waited}s) — 포트/전원 확인")
     print(f"[FC] connected  sys={master.target_system}  comp={master.target_component}")
     request_data_streams(master)
     return master
@@ -54,7 +59,7 @@ def request_data_streams(master, rate_hz=10):
 
 
 def drain_messages(master):
-    global last_battery_pct, last_battery_voltage, _vehicle_state
+    global last_battery_pct, last_battery_voltage
     while True:
         msg = master.recv_match(blocking=False)
         if msg is None:

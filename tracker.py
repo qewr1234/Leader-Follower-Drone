@@ -21,9 +21,6 @@ class LeaderTracker:
         self.track = None
         self.next_id = 1
 
-    def reset(self):
-        self.track = None
-
     def predict_only(self):
         """
         detector를 일부러 실행하지 않은 프레임.
@@ -54,30 +51,32 @@ class LeaderTracker:
                 return old
             return self.track.copy()
 
+        # 게이트를 먼저 걸고, 통과한 후보 중에서만 점수 최대를 고른다.
+        # 점수 최대를 먼저 고르고 그 하나에만 게이트를 걸면, lost_count>0 에서 리더의
+        # IoU≈0 이라 화면 어디에 있든 conf 가 더 높은 다른 대상이 뽑혀 게이트에서 거부되고,
+        # 게이트 안의 진짜 리더는 후보로도 검토되지 않아 매 프레임 거부 → max_lost 뒤 폐기된다.
+        #
+        # 회복 중에는 겹침을 요구할 수 없다 — 블랙아웃 동안 타겟이 움직이기 때문이다.
+        # 다만 "아무 검출이나 수용"은 안 된다: 검출률이 낮으면 lost_count>0이 정상
+        # 상태가 되어 IoU 게이트가 사실상 무력화되고, 화면 반대편의 다른 대상이
+        # 트랙을 가져간다. 순간이동만 막는 근접 게이트를 둔다.
         best_det = None
         best_score = -1.0
         prev_bbox = self.track["bbox"]
+        lost_count = self.track["lost_count"]
         for det in detections:
             iou = iou_xyxy(prev_bbox, det["bbox"])
+            passes_gate = iou >= self.iou_threshold or (
+                lost_count > 0 and self._near_enough(prev_bbox, det["bbox"], lost_count)
+            )
+            if not passes_gate:
+                continue
             score = 0.75 * iou + 0.25 * det["conf"]
             if score > best_score:
                 best_score = score
                 best_det = det
 
-        if best_det is None:
-            return self.update([])
-
-        best_iou = iou_xyxy(prev_bbox, best_det["bbox"])
-        # 회복 중에는 겹침을 요구할 수 없다 — 블랙아웃 동안 타겟이 움직이기 때문이다.
-        # 다만 "아무 검출이나 수용"은 안 된다: 검출률이 낮으면 lost_count>0이 정상
-        # 상태가 되어 IoU 게이트가 사실상 무력화되고, 화면 반대편의 다른 대상이
-        # 트랙을 가져간다. 순간이동만 막는 근접 게이트를 둔다.
-        accept = best_iou >= self.iou_threshold or (
-            self.track["lost_count"] > 0
-            and self._near_enough(prev_bbox, best_det["bbox"], self.track["lost_count"])
-        )
-
-        if accept:
+        if best_det is not None:
             alpha = 0.65 if self.track["lost_count"] == 0 else 0.85
             self.track["bbox"] = self._smooth_bbox(self.track["bbox"], best_det["bbox"], alpha)
             self.track["conf"] = float(best_det["conf"])

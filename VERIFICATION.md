@@ -19,7 +19,7 @@
 소스에서 이유를 찾습니다. C5가 그 사례입니다(아래).
 
 ```bash
-python3 test_fixes.py                        # 단위 37개, 하드웨어 불필요
+python3 test_fixes.py                        # 단위 84개, 하드웨어 불필요
 python3 sitl/harness.py --all                # SITL 8개 시나리오
 python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 ```
@@ -45,7 +45,7 @@ python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 
 ## 수정 완료 (2026-09-07)
 
-`python3 test_fixes.py` — 18개 검사 전부 통과. 하드웨어 없이 순수 로직만 검증합니다.
+`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 84개). 하드웨어 없이 순수 로직만 검증합니다.
 
 ### C1 — 부팅 즉시 FAILSAFE_LAND
 
@@ -214,7 +214,7 @@ ArduCopter SITL에서 재검증해 통과를 확인했습니다.
 
 | 문제 | 현장에서 | 수정 |
 |---|---|---|
-| `USE_LEADER_ESP32=True` + ESP32 없음 | `serial.Serial()` 예외가 `try` 블록 **밖**에서 나 프로그램이 아예 안 뜸 (100%) | 기본 `False` + `start()` 예외 가드 |
+| `USE_LEADER_ESP32=True` + ESP32 없음 | `serial.Serial()` 예외가 `try` 블록 **밖**에서 나 프로그램이 아예 안 뜸 (100%) | `open_leader_receiver()`가 `start()`를 `try`로 감싸 실패 시 경고 후 `None` → 비전 단독. 기본값은 `True` 유지 |
 | **GUIDED 인계 순간 즉시 LAND** | 수동 상승 중 리더가 화면 밖 → 10초 뒤 FAILSAFE_LAND 래치 → 스위치 넘기는 첫 프레임에 착륙 | **GUIDED 진입 에지에서 미션·명령 리셋** |
 | 평활 버퍼 포화 | FC가 무시하는 동안 목표값까지 수렴 → 인계 첫 setpoint가 램프 없이 최대 | 같은 리셋에서 `prev_body_cmd` 0으로 |
 | 헤드리스 `cv2.imshow` 예외 | 창이 없거나 `ssh -X`가 끊기면 루프가 통째로 사망 | `MARS_SHOW_WINDOW=0` + imshow try/except → 헤드리스로 계속 |
@@ -234,23 +234,26 @@ ArduCopter SITL에서 재검증해 통과를 확인했습니다.
 - **정상상태 뒤처짐** — 순수 P제어에 D항이 상대속도라 정상상태 기여가 0입니다. 리더 1m/s당 약 4.55m
   뒤처집니다(이론값과 소수 2자리 일치). 리더 속도 feed-forward가 필요하며, ESP32 속도가 들어오면
   바로 구현 가능합니다.
-- **ESP32 속도 hint가 칼만 게이트를 우회** — `leader_telemetry.py:535-559`가 필터 상태에 직접
+- **ESP32 속도 hint가 칼만 게이트를 우회** — `leader_telemetry.py:584-608`
+  (`apply_leader_velocity_hint_to_imm`)가 필터 상태에 직접
   대입하고 공분산을 무조건 축소합니다. innovation도 Mahalanobis 게이트도 likelihood도 없습니다.
 - **`p_ct`가 사전확률 0.333에서 벗어나지 않음** — 37개 시나리오 중 34개에서 "mode-aware"가
   사실상 무동작이었습니다.
-- **`detector_skipped` 페널티 도달 불가** — 플래그가 측정 dict에 복사되지 않아, 직전 bbox를
-  재사용한 프레임도 신뢰도 1.0으로 EKF에 들어갑니다.
 - **조작자 키가 전부 `if SHOW_WINDOW:` 안** — 헤드리스 환경에서 탈출구가 없습니다.
-- **시작 실패 지점이 잘못됨** — `leader_rx.start()`가 `try` 블록 밖에서 호출되어, ESP32가 안 꽂혀
-  있으면 루프 진입 전에 `SerialException`으로 죽습니다.
 - **종료 시 GUIDED armed 유지**, 최소 이격 개념 없음(선회 시 최근접 1.59m 관측).
+
+해소된 항목: `detector_skipped` 페널티 도달 불가 — `measurement.py`가 track의 플래그를 측정 dict에
+복사해 `reliability.py`의 0.55 페널티가 실제로 적용됩니다(`test_fixes.py`의 `skip:` 검사).
+`leader_rx.start()` 크래시 — `open_leader_receiver()`가 `start()`를 `try`로 감싸 ESP32가 없으면
+경고 후 비전 단독으로 뜹니다.
 
 ## 검증 방법
 
 드론 없이 4층으로 검증 가능합니다: 순수함수/프레임 단위 → `main.main()` 폐루프 시뮬
 (`cv2`/`ultralytics`/`pyrealsense2`만 스텁) → MAVLink 와이어 → ArduCopter SITL 실비행.
 
-둘 다 저장소에 있습니다 — `test_fixes.py`(1층)와 [`sitl/`](sitl/)(4층). SITL 하네스는 드론도
+셋 다 저장소에 있습니다 — `test_fixes.py`(1층), `test_closed_loop.py`(2층, 가짜 FC·가짜 시계로
+실제 `main.main()`을 결정론 실행, `--dump`/`--compare`), [`sitl/`](sitl/)(4층). SITL 하네스는 드론도
 카메라도 없이 `numpy`와 `pymavlink`만으로 돌고, ArduCopter 빌드부터 차등 검증까지
 [`sitl/README.md`](sitl/README.md)에 적어뒀습니다.
 

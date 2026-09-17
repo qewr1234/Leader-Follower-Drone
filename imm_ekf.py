@@ -8,12 +8,10 @@ imm_ekf.py — IMM-EKF 상태 추정기, adaptive R / bearing update 지원
 import numpy as np
 
 from config import CONFIG
-from utils_geometry import pixel_to_camera as pixel_to_3d
 
 
 SIGMA_A_CV = 0.8
 SIGMA_A_CT = 1.2
-SIGMA_W_CT = 0.3
 
 SIGMA_XY = CONFIG["imm"]["sigma_xy"]
 SIGMA_Z = CONFIG["imm"]["sigma_z"]
@@ -176,34 +174,6 @@ class _SingleEKF:
 
         return self._nonlinear_update(z, h, H, R, likelihood_dim=2)
 
-    def innovation_position3d(self, z, R=None):
-        H = self.H_POS
-        R = self.R_DEFAULT if R is None else R
-
-        y = z - H @ self.x
-        S = H @ self.P @ H.T + R
-
-        return y, S
-
-    def innovation_bearing2d(self, z, R):
-        px, py, pz = self.x[0], self.x[1], self.x[2]
-
-        if pz <= 1e-4:
-            return np.array([999.0, 999.0]), np.eye(2) * 999.0
-
-        h = np.array([px / pz, py / pz], dtype=float)
-
-        H = np.zeros((2, 6), dtype=float)
-        H[0, 0] = 1.0 / pz
-        H[0, 2] = -px / (pz * pz)
-        H[1, 1] = 1.0 / pz
-        H[1, 2] = -py / (pz * pz)
-
-        y = z - h
-        S = H @ self.P @ H.T + R
-
-        return y, S
-
     def _linear_update(self, z, H, R, likelihood_dim):
         h = H @ self.x
         return self._nonlinear_update(z, h, H, R, likelihood_dim)
@@ -331,9 +301,6 @@ class ImmEkf:
             f.predict(dt)
 
         self.mu = mu_pred
-
-    def update(self, z, R=None, source="rgbd"):
-        return self.update_position3d(z, R, source=source)
 
     def update_position3d(self, z, R=None, source="rgbd"):
         """source: "rgbd"(카메라 깊이) 또는 "gps"(ESP32 상대위치)."""
@@ -467,19 +434,8 @@ class ImmEkf:
             "vision_range_coast_time": self.vision_range_coast_time,
         }
 
-    def get_position(self):
-        x, _ = self.get_state()
-        return x[:3]
-
-    def get_velocity(self):
-        x, _ = self.get_state()
-        return x[3:]
-
     def get_model_probs(self):
         return self.mu.copy()
-
-    def is_coasting(self):
-        return self.coast_time > 0.0
 
     def is_reliable(self):
         return self.initialized and (self.coast_time <= MAX_COAST_SEC)
@@ -502,15 +458,3 @@ class ImmEkf:
         """
         limit = RANGE_COAST_MAX_SEC if max_age is None else float(max_age)
         return self.initialized and (self.vision_range_coast_time <= limit)
-
-
-def get_intrinsics_from_camera(pipeline_profile):
-    stream = pipeline_profile.get_stream(__import__("pyrealsense2").stream.color)
-    intr = stream.as_video_stream_profile().get_intrinsics()
-
-    return {
-        "fx": intr.fx,
-        "fy": intr.fy,
-        "ppx": intr.ppx,
-        "ppy": intr.ppy,
-    }

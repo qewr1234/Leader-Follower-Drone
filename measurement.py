@@ -65,11 +65,6 @@ class MeasurementBuilder:
             "detector_skipped": bool(track.get("detector_skipped", False)),
         }
 
-    def build_gps_relative(self, vehicle_state):
-        # 현재 업로드 코드에는 leader GPS가 없으므로, GPS는 quality/gating 확장용 placeholder.
-        # leader/follower GPS가 모두 있으면 ENU/NED 상대좌표 변환을 여기에 구현한다.
-        return None
-
     def _depth_stats(self, depth_image, bbox):
         x1, y1, x2, y2 = map(int, bbox)
         H, W = depth_image.shape[:2]
@@ -97,19 +92,15 @@ class MeasurementBuilder:
                 "depth_m": None,
                 "depth_valid_ratio": valid_ratio,
                 "depth_mad": None,
-                "depth_iqr": None,
                 "depth_valid_count": int(valid.size),
             }
 
         med = float(np.median(valid))
         mad = float(np.median(np.abs(valid - med)))
-        q25, q75 = np.percentile(valid, [25, 75])
-        iqr = float(q75 - q25)
         return {
             "depth_m": med,
             "depth_valid_ratio": valid_ratio,
             "depth_mad": mad,
-            "depth_iqr": iqr,
             "depth_valid_count": int(valid.size),
         }
 
@@ -119,6 +110,5 @@ class MeasurementBuilder:
             "depth_m": None,
             "depth_valid_ratio": 0.0,
             "depth_mad": None,
-            "depth_iqr": None,
             "depth_valid_count": 0,
         }

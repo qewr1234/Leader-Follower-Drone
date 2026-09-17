@@ -42,7 +42,7 @@ from measurement import MeasurementBuilder
 from reliability import ReliabilityEstimator
 from scheduler import PerceptionScheduler
 from imm_ekf import ImmEkf
-from utils_geometry import bbox_center
+from utils_geometry import bbox_center, clamp
 from logger import ExperimentLogger
 
 from mavlink_io import (
@@ -159,6 +159,8 @@ SETPOINT_PERIOD_SEC = 0.10
 LAND_RETRY_SEC = 2.0
 # 카메라 프레임을 연속 이 횟수만큼 못 받으면 포기한다(약 CAM_FAIL_LIMIT/FPS 초).
 CAM_FAIL_LIMIT = 30
+# FC 링크(drain/send)가 연속 이 횟수만큼 예외를 내면 포기한다.
+FC_FAIL_LIMIT = 30
 # 이 고도(AGL) 아래에서는 하강 명령을 내지 않는다.
 MIN_AGL_M = 1.5
 
@@ -372,10 +374,6 @@ def send_land(master):
 # 제어기
 # ============================================================
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
 def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace,
                                        target_distance=None):
     """
@@ -505,6 +503,9 @@ def main():
 
     use_mars_imm = USE_MARS_IMM_DEFAULT
 
+    # FC 먼저 — 없으면 YOLO를 올리고 카메라를 켠 채 기다리지 않게.
+    master = connect_fc()
+
     detector = YoloDetector()
 
     cam = D435i(
@@ -529,16 +530,11 @@ def main():
     ekf = ImmEkf()
     mission = MissionManager()
 
-    master = connect_fc()
-
     leader_rx = open_leader_receiver()
 
     log = ExperimentLogger(CONFIG["logger"]["log_dir"]) if CONFIG["logger"]["enabled"] else None
 
     last_track = None
-    last_depth_m = None
-    last_h_ratio = None
-    last_ex = 0.0
 
     prev_time = time.time()
     last_bat_print = 0.0
@@ -546,6 +542,8 @@ def main():
     last_land_send = 0.0  # C2: LAND 재시도 타이머
     prev_fc_accepts = False  # GUIDED 진입 에지 검출용
     cam_fail_streak = 0      # 연속 카메라 실패 횟수
+    fc_fail_streak = 0       # 연속 FC 링크 실패 횟수
+    last_fused_rx_time = None  # 마지막으로 EKF에 융합한 ESP32 패킷의 rx_time
     show_window = SHOW_WINDOW
 
     fps_counter = 0
@@ -567,13 +565,24 @@ def main():
     try:
         while True:
             now = time.time()
+            # prev_time 은 프레임 획득에 성공한 뒤에 갱신한다. 여기서 갱신하면
+            # 카메라 실패로 continue 한 반복의 시간이 predict / range_coast 에서 사라진다.
             dt = max(now - prev_time, 1e-4)
-            prev_time = now
 
             # ------------------------------------------------------------
             # Pixhawk / ESP32 수신
             # ------------------------------------------------------------
-            drain_messages(master)
+            try:
+                drain_messages(master)
+                fc_fail_streak = 0
+            except Exception as exc:
+                fc_fail_streak += 1
+                print(f"[WARN] FC link: drain 실패 {fc_fail_streak}회: "
+                      f"{type(exc).__name__}: {exc}")
+                if fc_fail_streak >= FC_FAIL_LIMIT:
+                    print(f"[ERR] FC 링크 연속 실패 {FC_FAIL_LIMIT}회 — 종료")
+                    break
+                continue
             vehicle_state = get_vehicle_state()
 
             # C2: FC 모드를 매 루프 읽는다. 이전에는 1Hz 출력 블록 안에서만 읽어
@@ -656,6 +665,8 @@ def main():
                 print("[WARN] frame dropped")
                 continue
 
+            prev_time = now
+
             H, W = color_image.shape[:2]
             cx_img = W // 2
 
@@ -716,7 +727,6 @@ def main():
                 )
                 track = tracker.update(detections)
             else:
-                detections = []
                 track = tracker.predict_only()
 
             last_track = track
@@ -746,7 +756,7 @@ def main():
                     gate_ok, gate_d2 = reliability.gate_position3d(
                         ekf,
                         rgbd_meas["z"],
-                        R if R is not None else None,
+                        R,
                     )
 
                     if gate_ok or not use_mars_imm:
@@ -789,7 +799,18 @@ def main():
             r_esp_gps = 0.0
             r_esp_time = 0.0
 
-            if USE_LEADER_ESP32 and leader_meas.get("available", False):
+            # read_latest() 는 새 패킷이 없으면 같은 패킷을 다시 돌려준다. 같은 관측을
+            # 매 프레임 독립 측정처럼 융합하면 안 되므로 새 패킷(rx_time 변경)일 때만 융합한다.
+            # leader_meas 자체(표시·hspeed)는 매 프레임 그대로 만든다.
+            esp_rx_time = leader_meas.get("rx_time", None)
+            esp_new_packet = (
+                leader_meas.get("available", False)
+                and esp_rx_time is not None
+                and esp_rx_time != last_fused_rx_time
+            )
+
+            if USE_LEADER_ESP32 and esp_new_packet:
+                last_fused_rx_time = esp_rx_time
                 z_esp = np.asarray(leader_meas["rel_cam"], dtype=float)
 
                 age = float(leader_meas.get("age", 999.0))
@@ -861,18 +882,11 @@ def main():
                 leader_hspeed = None
                 leader_vz_up = None
 
-            # mission에서 선두가 보인다고 볼 조건:
-            # - tracker가 직접 보임
-            # - EKF가 신뢰 가능
-            # - ESP32 leader telemetry가 정상
-            track_visible = track is not None and not track.get("is_lost", False)
-            ekf_reliable = ekf.initialized and ekf.is_reliable()
-            esp_visible = bool(leader_meas.get("available", False))
+            esp_visible = bool(leader_meas.get("available", False))  # 화면 출력용
 
             # 미션의 "리더가 보인다"는 판정은 bbox가 아니라 **거리를 아는가**여야 한다.
-            # track_visible은 YOLO가 상자만 그려도 참이 되고, ekf.is_reliable()은
-            # bearing-only 업데이트로도 참이 된다. 둘 다 거리 관측을 보장하지 않으므로
-            # 깊이가 죽어도 소실 판정이 나지 않아 실패 착륙이 발동하지 않는다.
+            # bbox 유무나 ekf.is_reliable()(bearing-only 업데이트로도 참)은 거리 관측을
+            # 보장하지 않으므로, 깊이가 죽어도 소실 판정이 나지 않아 실패 착륙이 발동하지 않는다.
             # RGB-D와 ESP32 위치만 거리를 담으며, 그 둘만 range_coast_time을 되돌린다.
             leader_visible_for_mission = bool(ekf.has_range_fix())
 
@@ -892,14 +906,11 @@ def main():
                 leader_alt=leader_alt_est,
                 leader_vel_world=leader_vel_world,
                 pos_cov_trace=pos_cov_trace,
-                manual_override=False,
             )
 
             # ------------------------------------------------------------
             # Command decision
             # ------------------------------------------------------------
-            desired_body_cmd = np.zeros(4, dtype=float)
-
             if mission_policy["land"]:
                 desired_body_cmd = np.zeros(4, dtype=float)
 
@@ -913,7 +924,11 @@ def main():
                 # fc_accepts_setpoints=False라 아예 보내지 않는다).
                 if SEND_MAVLINK_COMMANDS and fc_accepts_setpoints:
                     if now - last_land_send >= LAND_RETRY_SEC:
-                        send_land(master)
+                        try:
+                            send_land(master)
+                        except Exception as exc:
+                            print(f"[WARN] FC link: LAND 송신 실패: "
+                                  f"{type(exc).__name__}: {exc}")
                         last_land_send = now
                         last_setpoint_time = now
 
@@ -954,13 +969,17 @@ def main():
                 last_land_send = 0.0
                 if now - last_setpoint_time >= SETPOINT_PERIOD_SEC:
                     if SEND_MAVLINK_COMMANDS:
-                        send_body_velocity(
-                            master,
-                            current_body_cmd[0],
-                            current_body_cmd[1],
-                            current_body_cmd[2],
-                            yaw_rate=current_body_cmd[3],
-                        )
+                        try:
+                            send_body_velocity(
+                                master,
+                                current_body_cmd[0],
+                                current_body_cmd[1],
+                                current_body_cmd[2],
+                                yaw_rate=current_body_cmd[3],
+                            )
+                        except Exception as exc:
+                            print(f"[WARN] FC link: setpoint 송신 실패: "
+                                  f"{type(exc).__name__}: {exc}")
                     last_setpoint_time = now
 
             # ------------------------------------------------------------
@@ -972,15 +991,7 @@ def main():
             if track is not None and not track.get("is_lost", False):
                 x1, y1, x2, y2 = track["bbox"]
                 cx_tgt, cy_tgt = bbox_center(track["bbox"])
-                ex = (cx_tgt - cx_img) / max(cx_img, 1)
-
-                bh = y2 - y1
-                h_ratio = bh / max(H, 1)
-
                 ctrl_depth = ekf_depth_m if ekf_depth_m is not None else raw_depth_m
-                last_depth_m = ctrl_depth
-                last_h_ratio = h_ratio
-                last_ex = ex
 
                 if show_window:
                     col = depth_color(ctrl_depth)

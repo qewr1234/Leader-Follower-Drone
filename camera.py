@@ -1,7 +1,13 @@
 """
-camera.py — Intel RealSense D435i RGB-D + IMU 래퍼
+camera.py — Intel RealSense D435i RGB-D 래퍼 (pyrealsense2)
 
-기존 업로드에는 D435i 클래스 구현이 없어서, pyrealsense2 기반으로 새로 구성.
+컬러(BGR8)·깊이(Z16) 스트림을 켜고, 깊이를 컬러 시점에 정렬한 프레임 쌍을
+get_frames() 로 돌려준다. main.py 는 .intrinsics / .depth_scale 을 읽어
+MeasurementBuilder 에 넘긴다.
+
+IMU(accel/gyro) 스트림은 켜지 않는다 — 읽는 곳이 없고, 켜 두면 IMU 전용
+frameset 이 wait_for_frames() 에 섞여 들어와 컬러/깊이 없는 프레임이 생기고
+메인 루프가 dt 를 잃는다.
 """
 
 import numpy as np
@@ -26,18 +32,11 @@ class D435i:
         self.align = None
         self.profile = None
         self.depth_scale = 0.001
-        self.accel = (0.0, 0.0, 0.0)
-        self.gyro = (0.0, 0.0, 0.0)
         self.intrinsics = None
 
     def start(self):
         self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
         self.config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
-        try:
-            self.config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f)
-            self.config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f)
-        except Exception:
-            pass
 
         self.profile = self.pipeline.start(self.config)
         self.align = rs.align(rs.stream.color)
@@ -55,22 +54,6 @@ class D435i:
 
     def get_frames(self):
         frames = self.pipeline.wait_for_frames()
-
-        # IMU stream이 섞여 들어올 수 있으므로 motion frame 먼저 처리
-        for f in frames:
-            try:
-                if f.is_motion_frame():
-                    motion = f.as_motion_frame()
-                    data = motion.get_motion_data()
-                    profile = f.get_profile()
-                    stream_type = profile.stream_type()
-                    if stream_type == rs.stream.accel:
-                        self.accel = (data.x, data.y, data.z)
-                    elif stream_type == rs.stream.gyro:
-                        self.gyro = (data.x, data.y, data.z)
-            except Exception:
-                pass
-
         aligned = self.align.process(frames)
         color_frame = aligned.get_color_frame()
         depth_frame = aligned.get_depth_frame()
@@ -80,18 +63,3 @@ class D435i:
         color_image = np.asanyarray(color_frame.get_data())
         depth_image = np.asanyarray(depth_frame.get_data())
         return color_image, depth_image
-
-    def get_depth_m(self, depth_image, x1, y1, x2, y2):
-        # 호환성용. 실제로는 measurement.py에서 depth quality까지 계산 권장.
-        if depth_image is None:
-            return None
-        H, W = depth_image.shape
-        x1 = max(0, int(x1)); y1 = max(0, int(y1))
-        x2 = min(W, int(x2)); y2 = min(H, int(y2))
-        if x2 <= x1 or y2 <= y1:
-            return None
-        roi = depth_image[y1:y2, x1:x2]
-        valid = roi[(roi > 0)]
-        if valid.size < 10:
-            return None
-        return float(np.median(valid)) * self.depth_scale

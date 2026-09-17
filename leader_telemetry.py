@@ -101,8 +101,8 @@ class LeaderTelemetryReceiver:
         self.ser = None
         self.sock = None
         self._rx_buf = b""
+        self._last_err = None     # 같은 오류가 매 프레임 반복될 때 1회만 출력하기 위해
         self.latest_packet: Optional[LeaderPacket] = None
-        self.last_error = None
 
     def start(self):
         if self.kind == "serial":
@@ -131,6 +131,12 @@ class LeaderTelemetryReceiver:
                 self.sock.close()
         except Exception:
             pass
+
+    def _warn_once(self, msg):
+        """read_latest() 는 매 프레임 불리므로, 같은 오류(예: USB 빠짐)는 처음 한 번만 찍는다."""
+        if msg != self._last_err:
+            print(f"[LEADER] {msg}")
+            self._last_err = msg
 
     def read_latest(self) -> Optional[LeaderPacket]:
         """
@@ -161,7 +167,7 @@ class LeaderTelemetryReceiver:
             n = int(getattr(self.ser, "in_waiting", 0) or 0)
             chunk = self.ser.read(n if n > 0 else 1)
         except Exception as exc:
-            self.last_error = str(exc)
+            self._warn_once(f"serial read error: {exc}")
             return
 
         if not chunk:
@@ -199,7 +205,7 @@ class LeaderTelemetryReceiver:
                 break
 
             except Exception as exc:
-                self.last_error = str(exc)
+                self._warn_once(f"UDP recv error: {exc}")
                 break
 
 
@@ -283,15 +289,11 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
 
 def normalize_lat_lon_alt_from_mavlink(gps_or_global: Dict[str, Any]):
     """
-    MAVLink GPS_RAW_INT / GLOBAL_POSITION_INT 값을 degree/meter로 변환.
+    MAVLink GPS_RAW_INT / GLOBAL_POSITION_INT dict를 degree/meter로 변환.
 
-    GPS_RAW_INT:
-        lat, lon: deg * 1e7
-        alt: mm
-
-    GLOBAL_POSITION_INT:
-        lat, lon: deg * 1e7
-        alt: mm
+    두 메시지 모두 lat, lon은 deg * 1e7, alt는 mm 이므로 항상 그 배율로 나눈다.
+    (크기로 단위를 추측하지 않는다 — 해발 1m 미만 이륙지에서 alt=800mm 가
+    800m 로 남는 문제가 있었다.)
     """
     if not gps_or_global:
         return None
@@ -303,19 +305,7 @@ def normalize_lat_lon_alt_from_mavlink(gps_or_global: Dict[str, Any]):
     if lat is None or lon is None or alt is None:
         return None
 
-    lat = float(lat)
-    lon = float(lon)
-    alt = float(alt)
-
-    # MAVLink integer scale
-    if abs(lat) > 1000:
-        lat *= 1e-7
-    if abs(lon) > 1000:
-        lon *= 1e-7
-    if abs(alt) > 1000:
-        alt *= 1e-3
-
-    return lat, lon, alt
+    return float(lat) * 1e-7, float(lon) * 1e-7, float(alt) * 1e-3
 
 
 def lla_to_enu(lat, lon, alt, lat0, lon0, alt0):
@@ -406,14 +396,6 @@ def fru_to_camera_xyz(vec_fru):
     """
     front, right, up = map(float, vec_fru[:3])
     return np.array([right, -up, front], dtype=float)
-
-
-def camera_xyz_to_fru(vec_cam):
-    """
-    camera XYZ [right, down, forward] → FRU [front, right, up]
-    """
-    right, down, front = map(float, vec_cam[:3])
-    return np.array([front, right, -down], dtype=float)
 
 
 # ============================================================
