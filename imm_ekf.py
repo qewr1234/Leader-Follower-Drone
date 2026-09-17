@@ -407,6 +407,12 @@ class ImmEkf:
         for f in self.filters:
             f.x = G @ f.x
             f.P = G @ f.P @ G.T
+            # CT 필터의 회전율은 진행 방향각의 변화로 추정한다. 속도를 dpsi 만큼 돌렸으니
+            # 직전 방향각도 같이 돌려야 한다 — 안 돌리면 팔로워 자신의 yaw rate 가
+            # 그대로 타겟 선회율 omega 로 들어간다.
+            if f._prev_heading is not None:
+                h = f._prev_heading + dpsi
+                f._prev_heading = float(np.arctan2(np.sin(h), np.cos(h)))
 
     def get_state(self):
         if not self.initialized:

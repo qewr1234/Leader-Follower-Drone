@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C1~C6 + H2 회귀 테스트 — 단위 검사 84개.
+"""C1~C6 + H2 회귀 테스트 — 단위 검사 86개.
 
 하드웨어도 FC도 없이 순수 로직만 검증한다. cv2 / pymavlink / pyrealsense2 등은
 sys.modules에 최소 스텁을 넣어 main.py를 import 가능하게 만든다.
@@ -695,6 +695,31 @@ check("타이머: 공분산 폭주 중 LOST_HOLD", st == S_LOST_HOLD, f"state={s
 st, p = m12.update(now=t, leader_visible=True, pos_cov_trace=1.0, **_LANDING)
 check("타이머: 공분산 회복 첫 프레임에 착륙 명령 없음 (타이머 새로 시작)",
       p["land"] is False and m12.landing_candidate_t == t, f"land={p['land']} cand_t={m12.landing_candidate_t} t={t}")
+
+# ------------------------------------------------- ego-yaw 보정이 CT omega 로 새지 않음
+# 타겟이 월드에서 직진(참 선회율 0)하고 팔로워가 일정 yaw rate 로 회전하면, compensate_ego_yaw 가
+# 속도 벡터를 dpsi 만큼 돌린다. 직전 방향각(_prev_heading)을 같이 돌리지 않으면 d_heading 에
+# dpsi 가 통째로 섞여 omega 가 팔로워 yaw rate 로 수렴했다(수정 전 0.2 rad/s → omega +0.202).
+import math as _math  # noqa: E402
+
+
+def _omega_with_ego_yaw(yaw_rate, v_w=1.0):
+    ek = ImmEkf(); ek.init([0.0, 0.0, 5.0])
+    dt = 1 / 30; Rm = np3.diag([0.15 ** 2, 0.15 ** 2, 0.25 ** 2]); psi = 0.0
+    for k in range(1, 301):
+        t = k * dt
+        ek.predict(dt)
+        psi += yaw_rate * dt
+        ek.compensate_ego_yaw(yaw_rate * dt)
+        r = _math.hypot(v_w * t, 5.0); phi_c = _math.atan2(5.0, v_w * t) + psi   # 카메라 각 = 월드 각 + ψ
+        ek.update_position3d(np3.array([r * _math.cos(phi_c), 0.0, r * _math.sin(phi_c)]), Rm)
+    return ek.filters[1]._omega
+
+
+check("ego-yaw: 팔로워 yaw 0.2 rad/s 가 CT omega 로 새지 않음 (|omega| < 0.02)",
+      abs(_omega_with_ego_yaw(0.2)) < 0.02, f"omega={_omega_with_ego_yaw(0.2):+.3f}")
+check("ego-yaw: 반대 방향(-0.3 rad/s)도 동일", abs(_omega_with_ego_yaw(-0.3)) < 0.02,
+      f"omega={_omega_with_ego_yaw(-0.3):+.3f}")
 
 # ---------------------------------------------------------------- 
 print()
