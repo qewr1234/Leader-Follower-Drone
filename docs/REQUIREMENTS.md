@@ -29,14 +29,14 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | FCR-05 | 기수는 리더 방위각을 0 으로 유지하고, 명령 yaw_rate 0 에서 기체가 스스로 회전하지 않는다 | VERIFICATION C5 | T, A | UT[C5:]; SITL[hold_heading]; AN[yaw.nominal.pm_deg] | 검증됨 |
 | FCR-06 | 명령 평활은 프레임률과 무관하게 같은 시정수를 갖는다 | main.py `smooth_velocity_cmd` | T | UT[평활:] | 검증됨 |
 | FCR-07 | 위치 공분산 trace 가 2 / 4 를 넘으면 명령을 0.75 / 0.55 배로 줄인다 | config `controller.uncertainty_slowdown_trace` | A | AN[kff_sweep.scale0.55.gm_db] | 부분 (여유 분석만, 배율 단위 검사 없음) |
-| FCR-08 | 리더 절대 속도(0.3 s 정합 저역통과한 자기 속도 + EKF 상대 속도)를 KFF 0.8 로 피드포워드하되 0.05 m/s 소프트 데드존(기울기 1)과 2.0 s 저역통과를 거치고, 인자가 없으면 기존 명령과 같다 | README 제어 법칙, STABILITY_MARGINS 7절 | T | UT[FF:]; CL[FOLLOW 중(리더]; SITL[depth_range] | 검증됨 (SITL 은 수정 전 값으로 실측, 재실행 필요) |
+| FCR-08 | 리더 절대 속도(0.3 s 정합 저역통과한 자기 속도 + EKF 상대 속도)를 KFF 0.8 로 피드포워드하되 0.05 m/s 소프트 데드존(기울기 1)과 2.0 s 저역통과를 거치고, 인자가 없으면 기존 명령과 같다 | README 제어 법칙, STABILITY_MARGINS 7절 | T | UT[FF:]; CL[FOLLOW 중(리더]; SITL[depth_range]; SITL[leader_sine] | 검증됨 (SITL 재실행: depth_range 후반 4.1 m, leader_sine 0.72) |
 | FCR-09 | 바깥 루프는 전 축에서 위상여유 ≥ 45°, 이득여유 ≥ 6 dB, 감도 피크 Ms ≤ 2 를 만족한다 | STABILITY_MARGINS 1·4절 | A | AN[axes.forward.pm_deg]; AN[axes.forward.gm_db]; AN[axes.right.gm_db]; UT[분석: 현재 설계]; UT[분석 골든:] | 검증됨 (분석: GM 14.4 / 13.3 / 14.9 dB, Ms ≤ 1.35. 수정 전은 4.9 / 4.4 / 5.3 dB 로 미충족이었음 — 골든 검사가 그 값을 기록) |
 | FCR-10 | 리더→팔로워 속도 전달 \|Γ(jω)\| 이 모든 주파수에서 1 이하다 (스트링 안정, 다중 기체 체인 전제) | STABILITY_MARGINS 6절 | A | AN[axes.forward.peak]; AN[validation]; UT[분석: 현재 설계] | 부분 (피크 1.13 @0.27 rad/s — 피드포워드+P 겹침. 수정 전 1.80 @1.15. KFF 0.6 이면 1.02, 체인 운용 전 결정) |
 | FCR-11 | FC ATTITUDE 의 roll/pitch/yaw 변화량으로 매 프레임 EKF 상대 상태를 역회전해 기체 기울어짐이 리더 이동으로 보이지 않게 하고, 그 보정이 CT 각속도로 새지 않는다 | README 안전 설계 | T | UT[자세보정:]; UT[ego-yaw:] | 검증됨 (실기 미검증) |
 | FCR-12 | 비전 거리가 없고 GPS 상대위치만 있으면 이격을 8 m 로 넓힌다 | README 안전 설계 | T | UT[gps-only:] | 검증됨 |
 | FCR-13 | 출발·정지·착륙 판단은 리더 절대 속도(ESP32 > 자기+상대 > 상대 폴백) 로 한다 | README 안전 설계 | T | UT[미션:]; CL[리더 출발 후]; CL[추종 중(t=8s)]; SITL[depth_range] | 검증됨 |
 | FCR-14 | 피드포워드를 뺀 P+D 기준선은 PM ≥ 45°, GM ≥ 6 dB, Ms ≤ 1.5, 스트링 안정을 만족한다 | STABILITY_MARGINS 1절 | A | AN[kff_sweep.kff0.gm_db]; UT[분석: P+D] | 검증됨 (분석) |
-| FCR-15 | 리더 속도가 0.25 ± 0.05 m/s, 1.15 rad/s 정현파일 때 팔로워 속도 진폭비가 1 이하다 (실제 FC 에서의 스트링 안정성) | STABILITY_MARGINS 6절, sitl/README | T | SITL[leader_sine]; AN[sitl_like.current] | 미검증 (시나리오 작성됨, ArduCopter SITL 실행 대기. 선형 예측 0.70, 수정 전 코드 대조군 2.3) |
+| FCR-15 | 리더 속도가 0.25 ± 0.05 m/s, 1.15 rad/s 정현파일 때 팔로워 속도 진폭비가 1 이하다 (실제 FC 에서의 스트링 안정성) | STABILITY_MARGINS 6절, sitl/README | T | SITL[leader_sine]; AN[sitl_like.current] | 검증됨 (SITL 실측 0.43 / 0.72, 예측 0.70. 수정 전 코드 대조군 1.95 FAIL — 차등 검증) |
 
 ### EST — 인지 / 추정
 
@@ -119,7 +119,6 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 
 | ID | 상태 | 필요한 것 |
 |---|---|---|
-| FCR-15 | 미검증 | `python3 sitl/harness.py --scenario leader_sine` 을 현재 코드와 수정 전 코드(`--repo`, 커밋 e4b4cd7)로 각각 실행해 진폭비를 대조 |
 | FCR-10 | 부분 | 남은 피크 1.13 은 피드포워드+P 겹침. 3대 이상 체인이면 KFF 0.6(1.02) 또는 ESP32 선두 절대 속도 방송으로 자기 속도 경로 제거 |
 | EST-12 | 미충족 | 리더 드론 데이터셋 확장, 재학습 |
 | FCR-07 | 부분 | 감속 배율 0.75 / 0.55 의 단위 검사 추가 |

@@ -127,11 +127,12 @@ pymavlink 2.4.49, `arducopter` stable 배포 바이너리(빌드 없음), 시나
 | `boot_no_leader` | PASS | 35초 GUIDED 유지, LAND 없음 |
 | `pilot_takeover` | PASS | 18.0s LAND → 조종사 LOITER, 재 LAND 없음 |
 | `air_landing` | PASS | 공중 착륙 판정 없음. 체인 실행에서 리더가 수직 FOV 를 벗어나 소실 failsafe 가 난 것은 preflight 상승 정착 대기로 해결 |
-| `depth_range` | PASS | 후반 3.9m (피드포워드 전 4.4m). `vL=0.28 ff=+0.28 fresh=LP1/ATT1`, FOLLOW 유지. 3.3m 까지 못 간 것은 MAX_VX 0.35 − 리더 0.3 = 0.05 m/s 의 추격 여유 때문 (아래) |
+| `depth_range` | PASS | 후반 3.9m (피드포워드 전 4.4m). `vL=0.28 ff=+0.28 fresh=LP1/ATT1`, FOLLOW 유지. 3.3m 까지 못 간 것은 MAX_VX 0.35 − 리더 0.3 = 0.05 m/s 의 추격 여유 때문 (아래). 피드포워드 안정성 수정(82b4f74) 뒤 재실행에서는 4.1m — 소프트 데드존이 빼는 0.05 m/s 만큼(+0.18 m 예측) |
 | `hover_hold` | PASS | 후반 3.0m |
 | `hold_heading` | PASS | 기수 편차 0.0° |
 | `depth_loss` | PASS | 깊이 소실 → LAND 10.0초 |
 | `handover` | PASS | GUIDED 인계 후 LAND 없음 |
+| `leader_sine` | PASS | 진폭비 0.72 (수정 전 대조군 1.95 FAIL). 아래 절 |
 
 이 실행이 잡아낸 저장소 결함 2건과 하네스 결함 4건은 커밋 이력(cc427b5, e217a1f, 90fb807, e22ebee)에 있습니다.
 가장 큰 것은 pymavlink 2.4.4x 가 `target_component` 를 0 으로 두는데 HEARTBEAT 필터가 컴포넌트 일치를
@@ -254,7 +255,7 @@ python3 sitl/harness.py --scenario px4_setmode --fc-port udpin:0.0.0.0:14540
 `detector.YoloDetector`를 합성 리더를 만드는 가짜로 교체합니다. 깊이 영상은 리더 bbox 안만
 실제 거리, 나머지는 15m 배경(depth_max 10m 밖)입니다. **그 외에는 저장소 코드가 그대로 돕니다.**
 
-## leader_sine — 스트링 안정성 (2026-09-18 추가, 미실행)
+## leader_sine — 스트링 안정성 (2026-09-18 추가·실측)
 
 [docs/STABILITY_MARGINS.md](../docs/STABILITY_MARGINS.md) 의 선형 모델이 처음의 피드포워드 구현에서 1.15 rad/s 공진
 (리더 속도 변동 1.8배 증폭)을 예측했는데, 등속·계단 시나리오는 그 주파수를 자극하지 않아 8개가 전부 통과했습니다.
@@ -269,10 +270,14 @@ python3 sitl/harness.py --scenario leader_sine --repo /tmp/mars_before   # 대�
 git worktree remove --force /tmp/mars_before
 ```
 
-로그의 `진폭비 x.xx (선형 예측: 수정 전 1.8, 현재 0.67)` 줄이 결과입니다. 실제 FC 속도루프가 모델(0.3 s)보다 느리면
-두 값 다 조금 내려갑니다(강건성 표). 결과가 나오면 아래 표에 채웁니다.
+로그의 `진폭비 x.xx (선형 예측: 수정 전 1.8, 현재 0.67)` 줄이 결과입니다.
 
-| 저장소 | 진폭비 | 판정 |
-|---|---|---|
-| 현재 | (미실행) | |
-| 수정 전 e4b4cd7 | (미실행) | |
+| 저장소 | 진폭비 | 판정 | 관측 |
+|---|---|---|---|
+| 현재 (82b4f74) | **0.43** (단독 실행) / **0.72** (`--all` 안에서) | PASS | 팔로워 평균 0.27 m/s, 거리 평균 4.28 / 3.37 m, 거리 진폭 0.03 / 0.06 m. 미션 FOLLOW 유지 |
+| 수정 전 e4b4cd7 | **1.95** | **FAIL** | 속도 진폭 0.097 m/s, 거리 진폭 0.11 m. 추정 리더 속도가 0.15~0.42 로 흔들려 미션이 FOLLOW↔LEADER_HOVER 를 5.5 s 주기로 오갔음 |
+
+2026-09-18 WSL1 실측(ArduCopter 4.5 SITL). 선형 모델 예측(현재 0.67, 수정 전 1.8)과 비선형 체인 시뮬 예측(0.70, 2.3) 사이에
+들어옵니다. 현재 코드의 두 값 차이(0.43 / 0.72)는 단독 실행 중 콘솔 정지(FPS=0.1 한 번)가 정착 구간에 걸린 영향으로 보이며
+둘 다 기준(1.0) 아래입니다. 수정 전 대조군에서는 증폭 자체보다 **미션 상태가 진동한 것**이 더 위험한 관측입니다 —
+LEADER_HOVER 도 allow_follow 라 제어는 끊기지 않았지만, 실기에서는 착륙 후보 판정까지 흔들 수 있습니다.
