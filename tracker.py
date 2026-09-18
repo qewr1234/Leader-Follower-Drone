@@ -37,66 +37,56 @@ class LeaderTracker:
         if self.track is None:
             if not detections:
                 return None
-            det = self._choose_initial(detections)
-            self.track = self._new_track(det)
+            self.track = self._new_track(self._choose_initial(detections))
             return self.track.copy()
 
-        if not detections:
-            self.track["lost_count"] += 1
-            self.track["is_lost"] = self.track["lost_count"] > 0
-            self.track["conf"] *= 0.90
-            if self.track["lost_count"] > self.max_lost:
-                old = self.track.copy()
-                self.track = None
-                return old
-            return self.track.copy()
+        best_det = self._match(detections)
+        if best_det is None:
+            # 미검출이든 전부 게이트 밖이든 같은 미스다. 게이트 밖 검출을 미스로 세지 않으면
+            # lost_count가 쌓이며 반경이 커져 결국 다른 대상이 트랙을 가져간다.
+            return self._miss()
 
-        # 게이트를 먼저 걸고, 통과한 후보 중에서만 점수 최대를 고른다.
-        # 점수 최대를 먼저 고르고 그 하나에만 게이트를 걸면, lost_count>0 에서 리더의
-        # IoU≈0 이라 화면 어디에 있든 conf 가 더 높은 다른 대상이 뽑혀 게이트에서 거부되고,
-        # 게이트 안의 진짜 리더는 후보로도 검토되지 않아 매 프레임 거부 → max_lost 뒤 폐기된다.
-        #
-        # 회복 중에는 겹침을 요구할 수 없다 — 블랙아웃 동안 타겟이 움직이기 때문이다.
-        # 다만 "아무 검출이나 수용"은 안 된다: 검출률이 낮으면 lost_count>0이 정상
-        # 상태가 되어 IoU 게이트가 사실상 무력화되고, 화면 반대편의 다른 대상이
-        # 트랙을 가져간다. 순간이동만 막는 근접 게이트를 둔다.
-        best_det = None
-        best_score = -1.0
+        alpha = 0.65 if self.track["lost_count"] == 0 else 0.85
+        self.track["bbox"] = self._smooth_bbox(self.track["bbox"], best_det["bbox"], alpha)
+        self.track["conf"] = float(best_det["conf"])
+        self.track["area"] = bbox_area(self.track["bbox"])
+        self.track["age"] += 1
+        self.track["lost_count"] = 0
+        self.track["is_lost"] = False
+        return self.track.copy()
+
+    def _miss(self) -> Dict:
+        """놓친 프레임 하나 반영. max_lost를 넘기면 트랙을 버리고 마지막 상태를 돌려준다."""
+        self.track["lost_count"] += 1
+        self.track["is_lost"] = True
+        self.track["conf"] *= 0.90
+        old = self.track.copy()
+        if self.track["lost_count"] > self.max_lost:
+            self.track = None
+        return old
+
+    def _match(self, detections):
+        """게이트를 통과한 검출 중 점수 최대. 없으면 None.
+
+        게이트를 먼저 걸어야 한다: 점수 최대 하나에만 게이트를 걸면 lost_count>0에서
+        리더의 IoU≈0이라 conf가 높은 다른 대상이 뽑혀 거부되고, 게이트 안의 진짜 리더는
+        검토조차 되지 않아 max_lost 뒤 폐기된다.
+        회복 중(lost_count>0)에는 겹침을 요구할 수 없지만 "아무 검출이나 수용"도 안 된다 —
+        순간이동만 막는 근접 게이트를 둔다.
+        """
         prev_bbox = self.track["bbox"]
         lost_count = self.track["lost_count"]
+        best_det, best_score = None, -1.0
         for det in detections:
             iou = iou_xyxy(prev_bbox, det["bbox"])
-            passes_gate = iou >= self.iou_threshold or (
+            if iou < self.iou_threshold and not (
                 lost_count > 0 and self._near_enough(prev_bbox, det["bbox"], lost_count)
-            )
-            if not passes_gate:
+            ):
                 continue
             score = 0.75 * iou + 0.25 * det["conf"]
             if score > best_score:
-                best_score = score
-                best_det = det
-
-        if best_det is not None:
-            alpha = 0.65 if self.track["lost_count"] == 0 else 0.85
-            self.track["bbox"] = self._smooth_bbox(self.track["bbox"], best_det["bbox"], alpha)
-            self.track["conf"] = float(best_det["conf"])
-            self.track["area"] = bbox_area(self.track["bbox"])
-            self.track["age"] += 1
-            self.track["lost_count"] = 0
-            self.track["is_lost"] = False
-        else:
-            # 검출은 있지만 전부 게이트 밖 — 리더는 안 보이고 다른 대상만 보이는 상황이다.
-            # 미검출 분기와 똑같이 max_lost에서 트랙을 버려야 한다. 안 버리면 lost_count만
-            # 무한히 쌓이면서 게이트 반경이 계속 커지고, 결국 그 다른 대상이 트랙을 가져간다.
-            self.track["lost_count"] += 1
-            self.track["is_lost"] = True
-            self.track["conf"] *= 0.90
-            if self.track["lost_count"] > self.max_lost:
-                old = self.track.copy()
-                self.track = None
-                return old
-
-        return self.track.copy()
+                best_score, best_det = score, det
+        return best_det
 
     def _near_enough(self, prev_bbox, det_bbox, lost_count):
         """중심 이동량이 놓친 프레임 수에 비례한 한계 안인가.
