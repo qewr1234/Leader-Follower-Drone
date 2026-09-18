@@ -91,6 +91,7 @@ class World:
     depth_ok = True      # False면 검출은 계속되지만 깊이 측정만 죽는다
     frames = 0
     stop = False
+    generation = 0       # 시나리오마다 +1. 늦게 끝나는 이전 시나리오의 스레드가 새 시나리오를 건드리지 못하게.
 
     # 팔로워 (local NED, m / rad)
     f_n = f_e = f_d = 0.0
@@ -106,6 +107,7 @@ class World:
         cls.depth_ok = True
         cls.frames = 0
         cls.stop = False
+        cls.generation += 1
         cls.have_fix = False
         cls.f_n = cls.f_e = cls.f_d = 0.0
         cls.f_yaw = 0.0
@@ -143,6 +145,7 @@ class FakeCam:
     def __init__(self, *a, **k):
         self.depth_scale = 0.001
         self.intrinsics = {"fx": FX, "fy": FY, "ppx": CX, "ppy": CY}
+        self.generation = World.generation      # 이 main 이 속한 시나리오
 
     def start(self):
         print("[CAM] fake D435i (SITL harness)")
@@ -151,9 +154,9 @@ class FakeCam:
         pass
 
     def get_frames(self):
-        World.frames += 1
-        if World.stop:
+        if World.stop or World.generation != self.generation:
             raise KeyboardInterrupt("scenario finished")
+        World.frames += 1
         time.sleep(1.0 / 30.0)
         color = np.zeros((H, W, 3), dtype=np.uint8)
         # 배경은 15m — 어떤 depth_max보다도 멀어서 리더만 유효 픽셀이 된다.
@@ -226,6 +229,22 @@ def preflight(m):
     m.mav.param_set_send(m.target_system, m.target_component, b"WP_YAW_BEHAVIOR",
                          ARGS.wp_yaw_behavior, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
     time.sleep(0.5)
+
+    # 직전 시나리오가 LAND 로 끝났으면 기체가 아직 하강 중일 수 있다. ArduCopter 는 착지 상태에서만 GUIDED
+    # 이륙을 받으므로 공중에서 보낸 이륙 명령은 거부된다("이륙 실패 (고도 미도달)"). 착지·시동 해제까지 기다린다.
+    armed_bit = mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+    hb = m.recv_match(type="HEARTBEAT", blocking=True, timeout=5)
+    if hb is not None and (hb.base_mode & armed_bit) and mavutil.mode_string_v10(hb) == "LAND":
+        log("직전 LAND 진행 중 — 착지·시동 해제 대기")
+        t0 = time.time()
+        while time.time() - t0 < 120:
+            hb = m.recv_match(type="HEARTBEAT", blocking=True, timeout=5)
+            if hb is not None and not (hb.base_mode & armed_bit):
+                log(f"착지 확인 ({time.time() - t0:.0f}s)")
+                break
+        else:
+            raise RuntimeError("LAND 착지 대기 시간 초과")
+        time.sleep(2)
 
     m.set_mode("GUIDED")
     time.sleep(2)
@@ -313,6 +332,7 @@ def run_scenario(name):
     global T0
     T0 = time.time()
     World.reset()
+    gen = World.generation
     verdict = {"pass": True, "why": []}
 
     def fail(why):
@@ -349,7 +369,7 @@ def run_scenario(name):
     guided_at = [None]
 
     def watcher():
-        while not World.stop:
+        while (not World.stop and World.generation == gen):
             msg = pilot.recv_match(blocking=True, timeout=1.0)
             now = time.time() - T0
             if now > ARGS.duration:
@@ -435,7 +455,7 @@ def run_scenario(name):
             # 동안 리더는 화면 밖이다. 그 사이 미션은 FAILSAFE_LAND로 래치된다.
             # 그 뒤 GUIDED로 넘길 때 LAND가 튀어나오면 안 된다.
             log("시나리오: 리더 잠깐 보임 → 수동으로 12초 상승(리더 안 보임) → GUIDED 인계")
-            while not World.stop and not World.have_fix:
+            while (not World.stop and World.generation == gen) and not World.have_fix:
                 time.sleep(0.2)
             time.sleep(4)                    # 리더를 잠깐 보여 last_seen_t를 세운다
             pilot.set_mode("LOITER")         # 조종사가 수동으로
@@ -451,7 +471,7 @@ def run_scenario(name):
             # 깊이만 죽이고 YOLO 검출은 유지한다. 수정 전 게이트는 bbox만 보고
             # "리더가 보인다"고 판단하므로 소실 판정이 영원히 안 난다.
             log("시나리오: 8초 뒤 깊이만 소실(검출은 유지) → 착륙하는가 (거리 게이트)")
-            while not World.stop and not World.have_fix:
+            while (not World.stop and World.generation == gen) and not World.have_fix:
                 time.sleep(0.2)
             time.sleep(8)
             World.depth_ok = False
@@ -466,13 +486,13 @@ def run_scenario(name):
             # LOCAL_POSITION_NED가 없으면 leader_alt_est=None이 되고,
             # 수정 전 코드는 상대 z로 대체해 공중에서 착륙 판정을 통과시킨다.
             log("시나리오: 절대고도 없음 + 리더 하강 → 공중 착륙 판정 여부 (C3)")
-            while not World.stop and not World.have_fix:
+            while (not World.stop and World.generation == gen) and not World.have_fix:
                 time.sleep(0.2)
             # 6초만 하강한다. landing_confirm_sec(1.8s)를 넘기기엔 충분하고,
             # 계속 내리면 리더가 FOV를 벗어나 "정당한" 리더 소실 failsafe가 걸려
             # 착륙 판정과 구분할 수 없게 된다.
             t0 = time.time()
-            while not World.stop and time.time() - t0 < 6.0:
+            while (not World.stop and World.generation == gen) and time.time() - t0 < 6.0:
                 World.l_d += 0.3 * 0.1     # 0.3 m/s 하강 (팔로워 MAX_VZ 0.12보다 빠름)
                 time.sleep(0.1)
             log("하강 종료, 리더 고도 유지")
@@ -483,19 +503,19 @@ def run_scenario(name):
             # P 제어라 평형 거리 = TARGET + v/KP_FORWARD 이므로, 그 값이 depth_max를
             # 넘으면 거리 관측을 잃고 무한히 뒤처진다 — 이것이 C4다.
             log("시나리오: 리더 0.3 m/s 전진 — 평형거리가 깊이창 안에 드는가 (C4)")
-            while not World.stop and not World.have_fix:
+            while (not World.stop and World.generation == gen) and not World.have_fix:
                 time.sleep(0.2)
-            while not World.stop:
+            while (not World.stop and World.generation == gen):
                 World.l_n += 0.3 * 0.1
                 time.sleep(0.1)
 
         elif name == "hover_hold":
             log("시나리오: 리더 전진 후 정지 → 팔로워가 정위치를 유지하는가 (H2)")
-            while not World.stop and not World.have_fix:
+            while (not World.stop and World.generation == gen) and not World.have_fix:
                 time.sleep(0.2)
             t0 = time.time()
             # 1단계: 0.3 m/s로 8초 전진 → FOLLOW 진입 + 팔로워가 뒤처진 상태를 만든다
-            while not World.stop and time.time() - t0 < 8:
+            while (not World.stop and World.generation == gen) and time.time() - t0 < 8:
                 World.l_n += 0.3 * 0.1
                 time.sleep(0.1)
             log(f"리더 정지. 이후 팔로워가 목표거리로 수렴하는지 관측")
@@ -509,17 +529,21 @@ def run_scenario(name):
             fail(f"main.main() 예외: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
-        World.stop = True
+        if World.generation == gen:          # 늦게 끝난 이전 main 이 다음 시나리오를 멈추지 않게
+            World.stop = True
 
     threads = [threading.Thread(target=f, daemon=True) for f in (runner, watcher, driver)]
     for t in threads:
         t.start()
 
     deadline = time.time() + ARGS.duration + 10
-    while time.time() < deadline and not World.stop:
+    while time.time() < deadline and (not World.stop and World.generation == gen):
         time.sleep(0.5)
     World.stop = True
-    time.sleep(1.5)
+    threads[0].join(timeout=15)
+    if threads[0].is_alive():
+        log("!! main 이 15초 안에 종료되지 않음 — 콘솔 QuickEdit(클릭/드래그)로 멈췄거나 루프가 막힌 상태. 결과 신뢰 불가")
+    time.sleep(0.5)
 
     log(f"mode 이력: {[f'{t:.0f}s:{s}' for t, s in seen_modes]}")
     if os.environ.get("HARNESS_TRACE"):

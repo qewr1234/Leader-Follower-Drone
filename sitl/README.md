@@ -34,13 +34,39 @@ pip install pymavlink empy==3.3.4 pexpect future
 첫 하트비트까지 30초 남짓 걸립니다. 로그에 `Waiting for internal clock bits`가 떠 있어도
 정상이며, 곧 하트비트가 나옵니다.
 
+## 2-b. Windows (WSL1, 빌드 없이)
+
+가상화를 못 켜는 PC 는 WSL1 로도 됩니다. ArduPilot 을 빌드하지 않고 배포된 리눅스 SITL 바이너리를 씁니다
+(WSL1 에서 빌드는 30~60분, wxpython 컴파일이 특히 오래 걸리며 하네스에는 필요 없습니다).
+
+```bash
+# Ubuntu (WSL1) 안에서
+mkdir -p ~/sitl && cd ~/sitl
+wget https://firmware.ardupilot.org/Copter/stable/SITL_x86_64_linux_gnu/arducopter
+wget https://raw.githubusercontent.com/ArduPilot/ardupilot/master/Tools/autotest/default_params/copter.parm
+chmod +x arducopter
+./arducopter -I0 --model + --speedup 1 --defaults copter.parm --home 35.83,128.75,50,0 \
+    --serial0 udpclient:127.0.0.1:14551 --serial1 udpclient:127.0.0.1:14552
+```
+
+저장소는 `/mnt/c/...` 보다 WSL 홈(`~`)에 clone 하는 편이 빠릅니다. 하네스는 `numpy`, `pymavlink` 만 있으면 됩니다.
+
+**콘솔 주의.** 기본 Ubuntu 콘솔은 QuickEdit 모드라 창을 클릭하거나 텍스트를 드래그하면 출력이 막히고
+`print` 에서 프로세스 전체가 멈춥니다. 하네스 로그에 `FPS=0.2` 가 찍히거나 `main 이 15초 안에 종료되지 않음`
+경고가 나오면 그것입니다. **Windows Terminal** 에서 Ubuntu 탭을 열어 돌리고, 실행 중에는 창을 건드리지 마세요.
+
 ## 3. 회귀 실행
 
 ```bash
 python3 sitl/harness.py --all      # ArduCopter 시나리오 8개. px4_setmode는 PX4 엔드포인트 필요
 ```
 
-하네스가 GUIDED 진입 → ARM → 이륙까지 알아서 하고, 시나리오마다 다시 이륙시킵니다.
+하네스가 GUIDED 진입 → ARM → 이륙까지 알아서 하고, 시나리오마다 다시 이륙시킵니다. 직전 시나리오가
+LAND 로 끝났으면(`depth_loss` 등) 착지·시동 해제를 기다린 뒤 이륙합니다 — ArduCopter 는 공중에서 보낸
+GUIDED 이륙 명령을 거부합니다.
+
+각 시나리오는 `프레임 N개 · PASS/FAIL` 로 끝납니다. **프레임 수가 1000개 안팎이 아니면 그 PASS/FAIL 은
+믿지 마세요** — main 이 돌지 않은 채 시나리오만 흘러간 것입니다.
 
 | 시나리오 | 검증 대상 | 실패 조건 |
 |---|---|---|

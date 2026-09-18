@@ -1013,6 +1013,15 @@ for _ in range(25):                              # 후미가 하강 중이면 �
                        leader_vel_body=[0.0, 0, -0.5], leader_alt=0.3, pos_cov_trace=1.0); t += 0.1
 check("미션: 착륙 판정도 절대 vz 로 (상대 vz 가 + 여도 리더가 하강하면 CONFIRMED_LANDING)", p["land"] is True, f"state={st}")
 
+# ------------------------------------------------- mavlink_io: 수신율 진단
+mavlink_io._rate_t0 = None; mavlink_io._rate_counts.clear()
+_t = 1000.0
+check("rx: 첫 호출은 기준 시각만 잡음", mavlink_io.stream_rates_text(_t) == "rx[Hz] -")
+mavlink_io.drain_messages(_Master([_HB(1, 1, "GUIDED") for _ in range(2)] + [_SysStatus(12000)]))
+_rx = mavlink_io.stream_rates_text(_t + 2.0)
+check("rx: 2초에 HB 2개 → HB=1, 나머지 0, 호출 뒤 카운터 리셋",
+      _rx == "rx[Hz] HB=1 LP=0 ATT=0 GP=0" and mavlink_io.stream_rates_text(_t + 3.0) == "rx[Hz] HB=0 LP=0 ATT=0 GP=0", _rx)
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "

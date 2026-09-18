@@ -25,7 +25,7 @@ from imm_ekf import ImmEkf
 from leader_telemetry import (LeaderTelemetryReceiver, apply_leader_velocity_hint_to_imm,
                               build_leader_measurement_from_packet)
 from logger import ExperimentLogger
-from mavlink_io import battery_text, connect_fc, drain_messages, get_vehicle_state
+from mavlink_io import battery_text, connect_fc, drain_messages, get_vehicle_state, stream_rates_text
 from measurement import MeasurementBuilder
 from mission_manager import MissionManager
 from reliability import ReliabilityEstimator
@@ -470,6 +470,7 @@ def main():
     current_body_cmd = np.zeros(4)
     prev_rpy_for_comp = None      # 직전 프레임 팔로워 (roll, pitch, yaw)
     ff_fru = np.zeros(3)          # 리더 속도 피드포워드 (FRU, 저역통과 상태)
+    v_leader_fru = None           # 리더 절대 속도 추정 (FRU). STAT 진단용으로 루프 밖에서도 참조
 
     print("=" * 90)
     print("[INFO] q/ESC 종료 | m: MARS-IMM on/off | v: MAVLink velocity 송신 on/off | l: LAND | h: HOLD")
@@ -528,7 +529,9 @@ def main():
                       f"CMD={'ON' if SEND_MAVLINK_COMMANDS else 'DRY'} FC={fc_mode}{'*' if fc_armed else ''} "
                       f"ESP={int(leader_meas.get('available', False))}:{leader_meas.get('reason', 'none')} "
                       f"CV={p_cv:.2f} CT={p_ct:.2f} coast={ekf.coast_time:.1f}s rcoast={ekf.range_coast_time:.1f}s "
-                      f"mission={mission.state}")
+                      f"mission={mission.state} "
+                      f"vL={(float(np.linalg.norm(v_leader_fru)) if v_leader_fru is not None else float('nan')):.2f} "
+                      f"ff={ff_fru[0]:+.2f} fresh=LP{int(local_pos_fresh)}/ATT{int(attitude_fresh)} {stream_rates_text(now)}")
                 if SEND_MAVLINK_COMMANDS and not fc_accepts_setpoints:
                     print(f"[WARN] FC mode={fc_mode}: 송신 중단됨 (ArduPilot: GUIDED / PX4: OFFBOARD 필요)")
                 last_stat_print = now

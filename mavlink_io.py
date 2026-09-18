@@ -53,6 +53,26 @@ def is_fc_heartbeat(master, msg):
     return True
 
 
+# 메시지 수신율 (STAT 진단용). 스트림 요청이 안 먹으면 fresh 게이트가 닫혀 피드포워드·자세보정이 조용히 꺼진다.
+_RATE_TYPES = {"HEARTBEAT": "HB", "LOCAL_POSITION_NED": "LP", "ATTITUDE": "ATT", "GLOBAL_POSITION_INT": "GP"}
+_rate_counts = {}
+_rate_t0 = None
+
+
+def stream_rates_text(now=None):
+    """마지막 호출 이후의 타입별 수신율 문자열. 1초마다 STAT 에서 부른다."""
+    global _rate_t0
+    now = time.time() if now is None else float(now)
+    if _rate_t0 is None:
+        _rate_t0 = now
+        return "rx[Hz] -"
+    dt = max(now - _rate_t0, 1e-6)
+    text = " ".join(f"{short}={_rate_counts.get(mt, 0) / dt:.0f}" for mt, short in _RATE_TYPES.items())
+    _rate_counts.clear()
+    _rate_t0 = now
+    return f"rx[Hz] {text}"
+
+
 _vehicle_state = {
     "gps": {},
     "global_position": {},
@@ -103,6 +123,8 @@ def drain_messages(master):
         mt = msg.get_type()
         now = time.time()
         _vehicle_state["timestamp"] = now
+        if mt in _RATE_TYPES:
+            _rate_counts[mt] = _rate_counts.get(mt, 0) + 1
 
         if mt == "HEARTBEAT":
             # FC 본체(autopilot 컴포넌트)의 heartbeat 만 쓴다. 시스템 ID 만 맞추면 같은 기체의 다른

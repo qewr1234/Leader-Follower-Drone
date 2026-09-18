@@ -28,7 +28,7 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 **4.3m — 이론값 4.36m와 소수 둘째 자리 일치** |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
-| **회귀 스위트** | 단위 검사 121개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
+| **회귀 스위트** | 단위 검사 123개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 추종 동작과 Fail-safe
@@ -127,7 +127,7 @@ D435i (color+depth, 640×480@30)
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 121개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 123개 — numpy만 있으면 됨
 python3 test_closed_loop.py    # 폐루프 특성화 — 가짜 FC·가짜 시계로 실제 main.main() 결정론 실행 (--dump/--compare)
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 ```
@@ -232,7 +232,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회, 실외 노출 옵션·AE 측광 ROI) |
 | `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | 단위 회귀 121개 (하드웨어·FC 불필요) |
+| `test_fixes.py` | 단위 회귀 123개 (하드웨어·FC 불필요) |
 | `test_closed_loop.py` | 폐루프 특성화 테스트 — 가짜 FC·가짜 시계로 실제 `main.main()` 결정론 실행, `--dump`/`--compare`로 리팩토링 전후 스트림 비교 |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 | `docs/images/` | README 다이어그램(SVG) |
