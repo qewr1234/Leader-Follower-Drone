@@ -351,9 +351,8 @@ def run_scenario(name):
     # C3: 절대(대지) 고도를 못 얻는 상황을 재현한다. LOCAL_POSITION_NED는 EKF origin
     # 설정 전에는 실제로 오지 않으며, 그때 leader_alt_est가 None이 된다.
     # 로직을 건드리는 게 아니라 "메시지가 없는 환경"을 만드는 것이다.
+    _real_state = main.get_vehicle_state       # 시나리오 끝에 반드시 원복 (아래 pilot.close() 앞)
     if name == "air_landing":
-        _real_state = main.get_vehicle_state
-
         def _no_local_position():
             st = dict(_real_state())
             st["local_position"] = {}
@@ -596,6 +595,9 @@ def run_scenario(name):
         else:
             log("기수 샘플 부족 — 판정 불가")
 
+    # air_landing 의 LOCAL_POSITION_NED 차단을 원복한다. 안 하면 이후 시나리오가 전부 자기 속도·고도 없이
+    # 돌아 피드포워드가 꺼지고(vL=nan, fresh=LP0) 미션이 상대 속도 폴백으로 간다 — 2026-09-18 WSL1 실측.
+    main.get_vehicle_state = _real_state
     pilot.close()
     print(f"프레임 {World.frames}개 · {'PASS' if verdict['pass'] else 'FAIL'} ({name})")
     if verdict["why"]:
