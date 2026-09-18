@@ -57,7 +57,7 @@ def fig_string_stability():
     ax.axhline(1.0, color=C["ink2"], lw=1.0, ls=(0, (4, 3)))
     ax.text(0.0115, 1.03, "string-stability limit |Γ| = 1", color=C["ink2"], fontsize=9, va="bottom")
     ax.axvline(SITL["omega"], color=C["grid"], lw=1.2)
-    ax.text(SITL["omega"] * 1.06, 0.04, "SITL test\nω = 1.15 rad/s (T = 5.5 s)", color=C["ink2"], fontsize=8.5, va="bottom")
+    ax.text(SITL["omega"] * 1.06, 2.33, "SITL test: ω = 1.15 rad/s (T = 5.5 s)", color=C["ink2"], fontsize=8.5, va="top")
     # SITL 실측점 (흰 테두리 2px)
     for key, col in (("before", C["orange"]), ("current", C["blue"])):
         for v in SITL[key]:
@@ -74,7 +74,7 @@ def fig_string_stability():
     ax.annotate(f"current: peak {gc:.2f} at {wc:.2f} rad/s\n(gain margin 14.4 dB)", (wc, gc), xytext=(0.028, 1.32), fontsize=9,
                 color=C["ink"], arrowprops=dict(arrowstyle="-", color=C["ink2"], lw=0.8))
     ax.text(0.0115, 0.86, "P+D only: no amplification,\nbut 1.36 m lag at 0.3 m/s", color=C["ink2"], fontsize=8.5, va="top")
-    ax.set_xscale("log"); ax.set_xlim(0.01, 20); ax.set_ylim(0, 2.2)
+    ax.set_xscale("log"); ax.set_xlim(0.01, 20); ax.set_ylim(0, 2.36)
     ax.set_xlabel("ω [rad/s]"); ax.set_ylabel("|Γ(jω)| = |v_follower / v_leader|")
     ax.set_title("Leader→follower velocity gain: linear model vs ArduCopter SITL (2026-09-18)", loc="left", fontsize=11)
     ax.legend(loc="upper left", fontsize=8.5, bbox_to_anchor=(0.0, -0.13), ncol=1)
