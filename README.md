@@ -28,7 +28,7 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 **4.3m — 이론값 4.36m와 소수 둘째 자리 일치** |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
-| **회귀 스위트** | 단위 검사 123개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
+| **회귀 스위트** | 단위 검사 129개 + SITL 시나리오 9개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 추종 동작과 Fail-safe
@@ -71,7 +71,8 @@ D435i (color+depth, 640×480@30)
 ## 제어 법칙
 
 네 축 모두 P+D 에 리더 속도 피드포워드를 더해 제어합니다. 상대 위치·속도는 IMM-EKF 추정값
-(FRU: front/right/up)이고, 리더 속도 `v_L` 은 FC 가 주는 자기 속도(LOCAL_POSITION_NED)와 EKF 상대 속도의 합입니다.
+(FRU: front/right/up)이고, 리더 속도 `v_L` 은 FC 가 주는 자기 속도(LOCAL_POSITION_NED, 0.3 s 정합 저역통과)와
+EKF 상대 속도의 합입니다.
 
 | 축 | 명령 | 식 |
 |---|---|---|
@@ -85,12 +86,15 @@ D435i (color+depth, 640×480@30)
 **피드포워드가 없으면 정상상태 거리 오차가 `v/KP_FORWARD` 로 남습니다** — 리더 0.3 m/s 에 1.4 m,
 1 m/s 에 4.5 m 로 깊이창(10 m) 밖으로 밀려 소실됩니다. 초기 SITL 실측 평형 거리 4.3 m 가 이론값
 `3.0 + 0.3/0.22 = 4.36 m` 와 일치한 것이 이 오차입니다. 피드포워드(`KFF = 0.8`)를 넣으면 오차는
-`(1 − KFF) × v/KP` 로 줄어 0.3 m/s 에 0.27 m 입니다. `KFF < 1` 로 두는 이유는 안정성 여유입니다:
-`v_L` 안의 자기 속도는 EKF 상대 속도의 지연 δ 만큼 상쇄가 늦어 `s·δ/(1+s·δ)` 이득으로 명령에
-양성 되먹임되는데, FC 속도루프 0.3 s·δ 1 s 가정 시 최대 루프 이득 0.77 을 KFF 와 0.7 s 저역통과로
-0.4 아래로 누릅니다. 1 축 폐루프 시뮬레이션(FC 지연 0.3 s, EKF 지연 1 s)에서 정상상태 오차가 이론값과
-일치하고 발산·진동이 없음을 단위 검사로 고정했고, 폐루프 시나리오에서 추종 중 거리 오차는
-1.15 m → 0.53 m 입니다. 호버 중 추정 잡음으로 기어가지 않도록 0.1 m/s 데드밴드가 있습니다.
+`(v − KFF × (v − 0.05))/KP` 로 줄어 0.3 m/s 에 0.45 m 입니다(0.05 는 소프트 데드존).
+
+**피드포워드의 안정성 여유는 선형 모델로 확인했습니다** ([docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md)).
+`v_L` 안의 자기 속도는 EKF 상대 속도가 상쇄해 주기까지의 지연 차이만큼 명령에 양성 되먹임되는데, IMM-EKF 의
+속도 추정 지연을 실측(63 % 응답 0.30 s)해 계산해 보니 처음 값(저역통과 0.7 s, 정합 없음)은 이득여유 4.9 dB,
+1.15 rad/s 에서 리더 속도 변동을 1.8배 증폭하는 스트링 불안정 설계였습니다. 지금은 자기 속도를 EKF 와 같은
+0.3 s 로 늦추고 피드포워드 저역통과를 2.0 s 로 늘려 이득여유 14.4 dB, 최대 증폭 1.13 입니다. 데드밴드는 국소
+기울기가 3 이던 램프 대신 기울기 1 인 소프트 데드존(0.05 m/s)입니다. 실제 코드로 돌린 4단 체인 시뮬레이션이
+선형 예측과 4 % 안에서 맞고, SITL `leader_sine` 시나리오(ArduCopter 실측 0.72배, 수정 전 코드 1.95배)가 이를 확인했습니다.
 
 ## 안전 설계
 
@@ -127,17 +131,29 @@ D435i (color+depth, 640×480@30)
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 123개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 129개 — numpy만 있으면 됨
 python3 test_closed_loop.py    # 폐루프 특성화 — 가짜 FC·가짜 시계로 실제 main.main() 결정론 실행 (--dump/--compare)
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
+python3 analysis/stability_margins.py --plots   # 분석 층: 바깥 루프 선형 모델의 여유·스트링 안정성 (matplotlib)
+python3 analysis/trace_check.py                 # 요구도 ↔ 검사 추적성
 ```
+
+시험 위에 **분석 층**이 있습니다. IMM-EKF 의 주파수응답을 실측해 바깥 루프의 개루프 전달함수를 세우고 위상·이득
+여유, 감도 피크, 리더→팔로워 속도 전달(스트링 안정성)을 계산한 뒤 실제 코드로 돌린 비선형 체인 시뮬레이션과
+4 % 안에서 맞췄습니다. **이 분석이 시험이 놓친 결함을 찾았습니다**: 처음의 피드포워드 구현은 이득여유 4.9 dB,
+1.15 rad/s 에서 리더 속도 변동을 1.8배 증폭했습니다(P+D 단독은 18.6 dB, 증폭 없음). 등속 리더·계단 시나리오는 그
+주파수를 자극하지 않아 SITL 8개가 전부 통과했던 것입니다. 원인(자기 속도와 EKF 상대속도의 지연 불일치)과 수정
+(피드포워드 저역통과 2 s + 자기 속도 정합 필터 0.3 s + 소프트 데드존 → 14.4 dB, 1.13배)은
+[docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) 에 있고, 정현파 리더 SITL 시나리오 `leader_sine` 이 이를
+ArduCopter 에서 검사합니다(실측: 현재 코드 0.72배, 수정 전 코드 1.95배로 FAIL). 요구도 57개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
+[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 의 추적성 표에 있습니다.
 
 그리고 모든 시나리오는 **차등 검증**입니다 — 수정 전 코드에도 같은 시나리오를 돌려 대조군에서
 문제가 실제로 재현되는지 확인합니다. 대조군이 통과하는 테스트는 아무것도 증명하지 못하기
 때문입니다.
 
-SITL 시나리오 8개: 부팅 대기 · 조종사 탈환 · 공중 오판 방지 · 이동 리더 추종 · 정지 리더
-정위치 유지 · 기수 유지 · 소실 시 자동 착륙 · GUIDED 인계. 상세 이력과 실측값은
+SITL 시나리오 9개: 부팅 대기 · 조종사 탈환 · 공중 오판 방지 · 이동 리더 추종 · 정지 리더
+정위치 유지 · 기수 유지 · 소실 시 자동 착륙 · GUIDED 인계 · 정현파 리더(스트링 안정성). 상세 이력과 실측값은
 **[VERIFICATION.md](VERIFICATION.md)**, 하네스 실행법은 [sitl/README.md](sitl/README.md).
 
 ## 하드웨어
@@ -232,7 +248,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회, 실외 노출 옵션·AE 측광 ROI) |
 | `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | 단위 회귀 123개 (하드웨어·FC 불필요) |
+| `test_fixes.py` | 단위 회귀 129개 (하드웨어·FC 불필요) |
 | `test_closed_loop.py` | 폐루프 특성화 테스트 — 가짜 FC·가짜 시계로 실제 `main.main()` 결정론 실행, `--dump`/`--compare`로 리팩토링 전후 스트림 비교 |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 | `docs/images/` | README 다이어그램(SVG) |
@@ -240,5 +256,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 ## 문서
 
 - [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
+- [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) — 바깥 루프 선형 모델, 위상·이득 여유, 스트링 안정성, 체인 시뮬레이션, 개선안
+- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 57개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
 - [docs/images/README.md](docs/images/README.md) — README 그림 파일과 수정 방법

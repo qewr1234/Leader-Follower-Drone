@@ -697,8 +697,8 @@ check("정리: mavlink_io 모터 테스트 계열 제거",
       not any(hasattr(mavlink_io, n) for n in ("motor_test_percent", "trigger_motors", "stop_all_motors")))
 check("정리: detector.select_target 제거", not hasattr(_det, "select_target"))
 _h = open("sitl/harness.py", encoding="utf-8").read()
-check("하네스: --all이 depth_loss·handover까지 포함",
-      '"depth_loss", "handover"] if ARGS.all' in _h)
+check("하네스: --all이 depth_loss·handover·leader_sine까지 포함",
+      '"depth_loss", "handover", "leader_sine"] if ARGS.all' in _h)
 
 # ------------------------------------------------- 불확실성 분기의 타이머 초기화
 # pos_cov_trace > 8.0 이면 리더가 보여도 LOST_HOLD 로 간다. 이때도 착륙 후보 타이머를 끊어야
@@ -960,22 +960,30 @@ check("FF: 자기 속도 NED→FRU (동쪽을 보며 북진 = 좌측 이동, vz 
 _db = main.FF_DEADBAND_MPS
 _f_small = main.leader_velocity_ff([0, 0, 0], [0.5 * _db, 0, 0], 100.0)
 _f_half = main.leader_velocity_ff([0, 0, 0], [1.5 * _db, 0, 0], 100.0)
+_f_3db = main.leader_velocity_ff([0, 0, 0], [3.0 * _db, 0, 0], 100.0)
 _f_tau = main.leader_velocity_ff([0, 0, 0], [0.3, 0, 0], main.FF_TAU_SEC)
 _f_none = main.leader_velocity_ff([0.3, 0, 0], None, 100.0)
-check("FF: 데드밴드(0.5·db→0, 1.5·db→절반 램프), 시정수 τ 에서 63%, None 이면 0 으로 감쇠",
-      _f_small[0] == 0.0 and abs(_f_half[0] - 0.75 * _db) < 1e-9 and abs(_f_tau[0] - 0.3 * (1 - _math.exp(-1))) < 1e-9
-      and abs(_f_none[0]) < 1e-9, f"{_f_small[0]:.3f} {_f_half[0]:.3f} {_f_tau[0]:.3f} {_f_none[0]:.3f}")
+check("FF: 소프트 데드존(0.5·db→0, 1.5·db→0.5·db, 3·db→2·db: 기울기 1), 시정수 τ 에서 63% (τ=2.0s), None 이면 0 으로 감쇠",
+      _f_small[0] == 0.0 and abs(_f_half[0] - 0.5 * _db) < 1e-9 and abs(_f_3db[0] - 2.0 * _db) < 1e-9
+      and abs(_f_tau[0] - (0.3 - _db) * (1 - _math.exp(-1))) < 1e-9 and abs(main.FF_TAU_SEC - 2.0) < 1e-9
+      and abs(_f_none[0]) < 1e-9, f"{_f_small[0]:.3f} {_f_half[0]:.3f} {_f_3db[0]:.3f} {_f_tau[0]:.3f} {_f_none[0]:.3f}")
+_sl0 = main.self_velocity_lpf(None, [0.3, 0, 0], 0.1)
+_sl1 = main.self_velocity_lpf([0, 0, 0], [0.3, 0, 0], main.FF_SELF_TAU_SEC)
+check("FF: 자기 속도 정합 저역통과 — 첫 샘플은 그대로, 시정수(0.3s = EKF 속도 지연 실측)에서 63%",
+      np3.allclose(_sl0, [0.3, 0, 0]) and abs(_sl1[0] - 0.3 * (1 - _math.exp(-1))) < 1e-9 and abs(main.FF_SELF_TAU_SEC - 0.3) < 1e-9,
+      f"{_sl0[0]:.3f} {_sl1[0]:.3f}")
 
 
 def _sim_1d(kff, v_l=0.3, tau_fc=0.3, delta_ekf=1.0, T=40.0):
     """1축 폐루프: FC 속도루프 1차 지연 τ, EKF 상대속도 1차 지연 δ(최악 1s), 리더 v_l 등속. (정상상태 오차, 최대 |오차|) 반환."""
     saved = main.KFF_LEADER_VEL; main.KFF_LEADER_VEL = kff
-    dt = 1 / 30; front, v_f, v_rel_est = 3.0, 0.0, 0.0; ff = np3.zeros(3); cmd = np3.zeros(4); e_max = 0.0
+    dt = 1 / 30; front, v_f, v_rel_est = 3.0, 0.0, 0.0; ff = np3.zeros(3); cmd = np3.zeros(4); e_max = 0.0; v_self = None
     try:
         for _ in range(int(T / dt)):
             v_rel = v_l - v_f
             v_rel_est += (v_rel - v_rel_est) * (dt / delta_ekf)
-            ff = main.leader_velocity_ff(ff, [v_f + v_rel_est, 0.0, 0.0], dt)
+            v_self = main.self_velocity_lpf(v_self, [v_f, 0.0, 0.0], dt)
+            ff = main.leader_velocity_ff(ff, [v_self[0] + v_rel_est, 0.0, 0.0], dt)
             u = main.compute_velocity_cmd_from_estimate([front, 0, 0], [v_rel_est, 0, 0], 1.0, None, ff)
             cmd = main.smooth_velocity_cmd(cmd, u, alpha=0.28, dt=dt)
             v_f += (cmd[0] - v_f) * (dt / tau_fc)
@@ -988,8 +996,8 @@ def _sim_1d(kff, v_l=0.3, tau_fc=0.3, delta_ekf=1.0, T=40.0):
 
 _e_ff, _emax_ff = _sim_1d(_kff)
 _e_p, _ = _sim_1d(0.0)
-_e_theory_ff, _e_theory_p = (1 - _kff) * 0.3 / main.KP_FORWARD, 0.3 / main.KP_FORWARD
-check("FF: 1축 폐루프(FC τ=0.3s, EKF 지연 1s) 정상상태 오차 = (1-KFF)·v/Kp, P 만이면 v/Kp — 발산·진동 없음",
+_e_theory_ff, _e_theory_p = (0.3 - _kff * (0.3 - _db)) / main.KP_FORWARD, 0.3 / main.KP_FORWARD
+check("FF: 1축 폐루프(FC τ=0.3s, EKF 지연 1s) 정상상태 오차 = (v − KFF·(v−DB))/Kp (소프트 데드존), P 만이면 v/Kp — 발산·진동 없음",
       abs(_e_ff - _e_theory_ff) < 0.05 and abs(_e_p - _e_theory_p) < 0.05 and _emax_ff < 1.0,
       f"ff={_e_ff:.2f}m(이론 {_e_theory_ff:.2f}) p={_e_p:.2f}m(이론 {_e_theory_p:.2f}) max|e|={_emax_ff:.2f}")
 
@@ -1021,6 +1029,45 @@ mavlink_io.drain_messages(_Master([_HB(1, 1, "GUIDED") for _ in range(2)] + [_Sy
 _rx = mavlink_io.stream_rates_text(_t + 2.0)
 check("rx: 2초에 HB 2개 → HB=1, 나머지 0, 호출 뒤 카운터 리셋",
       _rx == "rx[Hz] HB=1 LP=0 ATT=0 GP=0" and mavlink_io.stream_rates_text(_t + 3.0) == "rx[Hz] HB=0 LP=0 ATT=0 GP=0", _rx)
+
+# ------------------------------------------------- 분석: 바깥 루프 안정성 여유 (docs/STABILITY_MARGINS.md)
+from analysis import stability_margins as _sm  # noqa: E402
+_frf = _sm.EkfFrf(_sm.load_frf())               # docs/stability_margins.json 의 IMM-EKF 실측 주파수응답 (없으면 재실측 ~40s)
+_lag = _sm.ekf_velocity_step_lag()
+check("분석: IMM-EKF 속도 추정 63% 응답 ≤ 0.5s, 램프에 위치 지연 없음",
+      _lag["t63_velocity_s"] is not None and _lag["t63_velocity_s"] <= 0.5 and abs(_lag["pos_lag_m_at_end"]) < 0.01,
+      f"t63={_lag['t63_velocity_s']}s lag={_lag['pos_lag_m_at_end']:.4f}m")
+
+
+def _margins_of(**kw):
+    p = _sm.Params(**kw)
+    r = _sm.margins(_sm.open_loop(p, _sm.W, _frf), _sm.W)
+    r.update(_sm.string_stability(p, _sm.W, _frf))
+    r["self_fb_peak"] = float(np3.max(np3.abs(_sm.self_feedback_path(p, _sm.W, _frf))))
+    return r
+
+
+_r0 = _margins_of(kff=0.0)
+check("분석: P+D 기준선(KFF=0) 전후축 PM ≥ 45°, GM ≥ 6dB, Ms ≤ 1.5, |Γ| ≤ 1 (스트링 안정)",
+      _r0["pm_deg"] >= 45 and _r0["gm_db"] >= 6 and _r0["Ms"] <= 1.5 and _r0["peak"] <= 1.0 + 1e-3,
+      f"PM={_r0['pm_deg']:.1f} GM={_r0['gm_db']:.1f} Ms={_r0['Ms']:.2f} Γ={_r0['peak']:.3f}")
+_rb = _margins_of(tau_ff=0.7, tau_m=0.0)
+check("분석 골든: 수정 전 설계(FF τ 0.7s, 자기 속도 정합 없음) 전후축 GM 4.9dB·Ms 2.3·|Γ| 피크 1.80 @1.15rad/s — 결함의 기록 (회귀 방지용 대조)",
+      abs(_rb["gm_db"] - 4.9) < 0.3 and abs(_rb["Ms"] - 2.31) < 0.1 and abs(_rb["peak"] - 1.80) < 0.05 and abs(_rb["w_peak"] - 1.15) < 0.1,
+      f"GM={_rb['gm_db']:.2f} Ms={_rb['Ms']:.2f} Γ={_rb['peak']:.3f}@{_rb['w_peak']:.2f}")
+_rr = _margins_of()                      # 코드 값 (τ_ff 2.0, τ_m 0.3)
+check("분석: 현재 설계(코드 값: FF τ 2.0s + 자기 속도 정합 LPF 0.3s) 전 축 PM ≥ 45°, GM ≥ 12dB, Ms ≤ 1.35, |Γ| 피크 ≤ 1.15, 양성 되먹임 경로 피크 ≤ 0.15",
+      all(_margins_of(kp=kp, kd=kd)["gm_db"] >= 12 and _margins_of(kp=kp, kd=kd)["pm_deg"] >= 45
+          for kp, kd in ((main.KP_RIGHT, main.KD_RIGHT), (main.KP_UP, main.KD_UP)))
+      and _rr["gm_db"] >= 12 and _rr["Ms"] <= 1.35 and _rr["peak"] <= 1.15 and _rr["self_fb_peak"] <= 0.15 and abs(_rr["dc_gain"] - 1.0) < 0.01,
+      f"GM={_rr['gm_db']:.1f} Ms={_rr['Ms']:.2f} Γ={_rr['peak']:.3f} fb={_rr['self_fb_peak']:.2f}")
+
+# ------------------------------------------------- 추적성: docs/REQUIREMENTS.md 의 참조가 코드와 맞는가
+from analysis import trace_check as _tc  # noqa: E402
+_ts = _tc.run(verbose=False)
+check("추적성: REQUIREMENTS.md 의 검증 근거(UT/CL/SITL/AN/INSPECT)가 전부 실제로 존재, 요구도 ≥ 50개, 폐루프 검사 전부 요구도에 연결",
+      not _ts["errors"] and _ts["requirements"] >= 50 and not _ts["cl_orphans"],
+      "; ".join(_ts["errors"][:3]) or f"{_ts['requirements']}개, UT {_ts['ut_traced']}/{_ts['ut_total']}, CL {_ts['cl_traced']}/{_ts['cl_total']}")
 
 # ---------------------------------------------------------------- 
 print()

@@ -85,8 +85,9 @@ MAX_YAW_RATE = 0.35
 UNCERTAINTY_SLOWDOWN_TRACE = CONFIG["controller"].get("uncertainty_slowdown_trace", 4.0)
 # 리더 속도 피드포워드 (config controller.leader_vel_ff_*)
 KFF_LEADER_VEL = float(CONFIG["controller"].get("leader_vel_ff_gain", 0.8))
-FF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_tau_sec", 0.7))
-FF_DEADBAND_MPS = float(CONFIG["controller"].get("leader_vel_ff_deadband_mps", 0.10))
+FF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_tau_sec", 2.0))
+FF_SELF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_self_tau_sec", 0.3))
+FF_DEADBAND_MPS = float(CONFIG["controller"].get("leader_vel_ff_deadband_mps", 0.05))
 
 SETPOINT_PERIOD_SEC = 0.10
 # C2: LAND 가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
@@ -227,19 +228,36 @@ def follower_velocity_fru(vehicle_state):
     return np.array([vx * c + vy * s, -vx * s + vy * c, -vz])
 
 
-def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
-    """피드포워드 항 갱신: 데드밴드(호버 잡음 억제) → 1차 저역통과(FF_TAU_SEC). leader_vel_fru 가 None 이면 0 으로 감쇠.
+def self_velocity_lpf(prev, v_self_fru, dt):
+    """자기 속도(FC) 를 EKF 상대속도와 같은 지연(FF_SELF_TAU_SEC) 으로 늦춘다. prev 가 None 이면 현재 값으로 시작.
 
-    리더 속도 = 자기 속도(FC 측정) + 상대 속도(EKF 추정). EKF 속도는 지연 δ 가 있어 자기 속도의 고주파 성분이
-    s·δ/(1+s·δ) 이득으로 명령에 양성 되먹임된다. FC 속도루프 τ≈0.3s, δ≈1s 면 이 루프 이득 최대치가 약 0.77 이라
-    KFF=1 이면 여유가 얇다. KFF 0.8 과 0.7s 저역통과를 곱하면 0.4 아래 — 대신 정상상태 오차 (1-KFF)·v/Kp 가 남는다.
+    리더 속도 = 자기 속도 + 상대 속도 인데 두 항의 지연이 다르면 그 차이만큼 자기 속도가 피드포워드로 되먹임된다
+    (docs/STABILITY_MARGINS.md 2절의 H_m − E_v/s 항). EKF 속도 추정의 63% 응답이 0.30s 로 실측되어 그 값에 맞춘다.
+    """
+    v = np.asarray(v_self_fru, dtype=float)
+    if prev is None or FF_SELF_TAU_SEC <= 0.0:
+        return v
+    a = 1.0 - math.exp(-max(float(dt), 0.0) / FF_SELF_TAU_SEC)
+    return np.asarray(prev, dtype=float) + a * (v - np.asarray(prev, dtype=float))
+
+
+def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
+    """피드포워드 항 갱신: 소프트 데드존(호버 잡음 억제) → 1차 저역통과(FF_TAU_SEC). leader_vel_fru 가 None 이면 0 으로 감쇠.
+
+    소프트 데드존은 속도 크기에서 FF_DEADBAND_MPS 를 빼는 형태라 기울기가 1 이다. 예전의 "0.10 위로 2배까지 선형 램프" 는
+    DB~2DB 구간에서 국소 기울기가 3 이라 실효 이득이 3·KFF 가 됐고, 리더 0.15 m/s 정현파에서 3.5배 증폭이 관측됐다.
+    빼는 만큼 정상상태 오차가 KFF·DB/Kp 만큼 늘어(0.05 → 0.18m) 폭을 0.10 에서 0.05 로 줄였다.
+
+    저역통과 2.0s 와 자기 속도 정합 필터(self_velocity_lpf) 의 근거는 docs/STABILITY_MARGINS.md: FC 속도루프 0.3s,
+    EKF 속도 지연 0.30s(실측) 에서 예전 값(0.7s, 정합 없음) 은 GM 4.9dB·|Γ| 피크 1.80 (1.15 rad/s) 이었고,
+    지금 값은 GM 14.4dB·|Γ| 1.13 이다. 정상상태 오차 (1-KFF)·v/Kp 는 그대로다.
     """
     target = np.zeros(3)
     if leader_vel_fru is not None:
         v = np.asarray(leader_vel_fru, dtype=float)
         speed = float(np.linalg.norm(v))
         if speed > FF_DEADBAND_MPS:
-            target = v * clamp((speed - FF_DEADBAND_MPS) / FF_DEADBAND_MPS, 0.0, 1.0)
+            target = v * (1.0 - FF_DEADBAND_MPS / speed)
     prev = np.asarray(prev_ff, dtype=float)
     a = 1.0 - math.exp(-max(float(dt), 0.0) / max(FF_TAU_SEC, 1e-3))
     return prev + a * (target - prev)
@@ -470,6 +488,7 @@ def main():
     current_body_cmd = np.zeros(4)
     prev_rpy_for_comp = None      # 직전 프레임 팔로워 (roll, pitch, yaw)
     ff_fru = np.zeros(3)          # 리더 속도 피드포워드 (FRU, 저역통과 상태)
+    v_self_lpf = None             # 자기 속도 정합 저역통과 상태 (FRU)
     v_leader_fru = None           # 리더 절대 속도 추정 (FRU). STAT 진단용으로 루프 밖에서도 참조
 
     print("=" * 90)
@@ -509,6 +528,7 @@ def main():
                 mission.reset()
                 prev_body_cmd = np.zeros(4)
                 ff_fru = np.zeros(3)
+                v_self_lpf = None
                 last_land_send = 0.0
                 print(f"[SYS] {fc_mode} 진입 — 미션/명령 리셋")
             prev_fc_accepts = fc_accepts_setpoints
@@ -627,11 +647,13 @@ def main():
             # 리더 절대 속도(FRU) = FC 자기 속도 + EKF 상대 속도. 미션(출발/정지/착륙 판단)과 피드포워드가 같이 쓴다.
             # 상대 속도만 보면 후미가 선두 속도를 맞추는 순간 0 이 되어 '선두 정지' 로 오판한다. 자기 속도·자세가
             # 신선하고 EKF 가 신뢰할 수 있을 때만 만들고, 없으면 미션은 상대 속도로 폴백한다.
+            # 자기 속도는 EKF 상대속도와 같은 지연으로 늦춘다(self_velocity_lpf) — 아니면 그 차이가 피드포워드로 되먹임된다.
             v_leader_fru = None
             if ekf.initialized and ekf.is_reliable() and local_pos_fresh and attitude_fresh:
                 v_f = follower_velocity_fru(vehicle_state)
                 if v_f is not None:
-                    v_leader_fru = v_f + rel_vel_fru
+                    v_self_lpf = self_velocity_lpf(v_self_lpf, v_f, dt)
+                    v_leader_fru = v_self_lpf + rel_vel_fru
 
             mission_state, mission_policy = mission.update(
                 now=now, leader_visible=leader_visible_for_mission,
