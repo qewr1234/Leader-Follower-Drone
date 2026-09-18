@@ -83,6 +83,10 @@ KP_YAW = 0.8
 MAX_YAW_RATE = 0.35
 
 UNCERTAINTY_SLOWDOWN_TRACE = CONFIG["controller"].get("uncertainty_slowdown_trace", 4.0)
+# 리더 속도 피드포워드 (config controller.leader_vel_ff_*)
+KFF_LEADER_VEL = float(CONFIG["controller"].get("leader_vel_ff_gain", 0.8))
+FF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_tau_sec", 0.7))
+FF_DEADBAND_MPS = float(CONFIG["controller"].get("leader_vel_ff_deadband_mps", 0.10))
 
 SETPOINT_PERIOD_SEC = 0.10
 # C2: LAND 가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
@@ -211,8 +215,38 @@ def send_land(master):
 # 제어기
 # ============================================================
 
-def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance=None):
-    """IMM 추정(FRU 상대 위치·속도) → BODY_NED [vx, vy, vz, yaw_rate]. 네 축 모두 P+D, 불확실하면 감속."""
+def follower_velocity_fru(vehicle_state):
+    """FC 의 LOCAL_POSITION_NED 속도(NED) 를 기체 yaw 로 돌린 (front, right, up). 값이 없으면 None."""
+    lp = vehicle_state.get("local_position", {})
+    yaw = vehicle_state.get("attitude", {}).get("yaw")
+    vx, vy, vz = lp.get("vx"), lp.get("vy"), lp.get("vz")
+    if None in (vx, vy, vz, yaw):
+        return None
+    c, s = math.cos(float(yaw)), math.sin(float(yaw))
+    vx, vy, vz = float(vx), float(vy), float(vz)
+    return np.array([vx * c + vy * s, -vx * s + vy * c, -vz])
+
+
+def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
+    """피드포워드 항 갱신: 데드밴드(호버 잡음 억제) → 1차 저역통과(FF_TAU_SEC). leader_vel_fru 가 None 이면 0 으로 감쇠.
+
+    리더 속도 = 자기 속도(FC 측정) + 상대 속도(EKF 추정). EKF 속도는 지연 δ 가 있어 자기 속도의 고주파 성분이
+    s·δ/(1+s·δ) 이득으로 명령에 양성 되먹임된다. FC 속도루프 τ≈0.3s, δ≈1s 면 이 루프 이득 최대치가 약 0.77 이라
+    KFF=1 이면 여유가 얇다. KFF 0.8 과 0.7s 저역통과를 곱하면 0.4 아래 — 대신 정상상태 오차 (1-KFF)·v/Kp 가 남는다.
+    """
+    target = np.zeros(3)
+    if leader_vel_fru is not None:
+        v = np.asarray(leader_vel_fru, dtype=float)
+        speed = float(np.linalg.norm(v))
+        if speed > FF_DEADBAND_MPS:
+            target = v * clamp((speed - FF_DEADBAND_MPS) / FF_DEADBAND_MPS, 0.0, 1.0)
+    prev = np.asarray(prev_ff, dtype=float)
+    a = 1.0 - math.exp(-max(float(dt), 0.0) / max(FF_TAU_SEC, 1e-3))
+    return prev + a * (target - prev)
+
+
+def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance=None, leader_vel_ff=None):
+    """IMM 추정(FRU 상대 위치·속도) → BODY_NED [vx, vy, vz, yaw_rate]. 네 축 모두 P+D + 리더 속도 피드포워드, 불확실하면 감속."""
     if target_distance is None:
         target_distance = TARGET_DISTANCE_M
     front, right, up = (float(v) for v in np.asarray(rel_fru, dtype=float)[:3])
@@ -225,9 +259,10 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, targ
     else:
         scale = 1.0
 
-    cmd_forward = clamp((KP_FORWARD * (front - float(target_distance)) + KD_FORWARD * v_front) * scale, -MAX_VX, MAX_VX)
-    cmd_right = clamp((KP_RIGHT * right + KD_RIGHT * v_right) * scale, -MAX_VY, MAX_VY)
-    cmd_up = clamp((KP_UP * up + KD_UP * v_up) * scale, -MAX_VZ, MAX_VZ)
+    ff_f, ff_r, ff_u = (0.0, 0.0, 0.0) if leader_vel_ff is None else (float(v) for v in np.asarray(leader_vel_ff, dtype=float)[:3])
+    cmd_forward = clamp((KFF_LEADER_VEL * ff_f + KP_FORWARD * (front - float(target_distance)) + KD_FORWARD * v_front) * scale, -MAX_VX, MAX_VX)
+    cmd_right = clamp((KFF_LEADER_VEL * ff_r + KP_RIGHT * right + KD_RIGHT * v_right) * scale, -MAX_VY, MAX_VY)
+    cmd_up = clamp((KFF_LEADER_VEL * ff_u + KP_UP * up + KD_UP * v_up) * scale, -MAX_VZ, MAX_VZ)
     # yaw: 선두 방위각을 0 으로 (시야 이탈 방지). BODY_NED yaw_rate 우회전 +, 타겟이 오른쪽이면 bearing + → 부호 일치.
     cmd_yaw_rate = clamp(KP_YAW * math.atan2(right, max(front, 0.5)) * scale, -MAX_YAW_RATE, MAX_YAW_RATE)
 
@@ -383,7 +418,8 @@ def build_log_row(s):
         "vehicle_state": {**{k: s["vehicle_state"].get(k, {}) for k in ("gps", "global_position", "local_position", "attitude")},
                           "gps_fresh": s["gps_fresh"], "local_position_fresh": s["local_pos_fresh"], "attitude_fresh": s["attitude_fresh"]},
         "control": {"send_enabled": SEND_MAVLINK_COMMANDS, "body_vx": cmd[0], "body_vy": cmd[1], "body_vz": cmd[2],
-                    "yaw_rate": cmd[3], "target_distance_m": s["target_distance_m"], "vision_range_ok": s["vision_range_ok"]},
+                    "yaw_rate": cmd[3], "target_distance_m": s["target_distance_m"], "vision_range_ok": s["vision_range_ok"],
+                    "ff_front": s["ff_fru"][0], "ff_right": s["ff_fru"][1], "ff_up": s["ff_fru"][2]},
     }
 
 
@@ -433,6 +469,7 @@ def main():
     prev_body_cmd = np.zeros(4)
     current_body_cmd = np.zeros(4)
     prev_rpy_for_comp = None      # 직전 프레임 팔로워 (roll, pitch, yaw)
+    ff_fru = np.zeros(3)          # 리더 속도 피드포워드 (FRU, 저역통과 상태)
 
     print("=" * 90)
     print("[INFO] q/ESC 종료 | m: MARS-IMM on/off | v: MAVLink velocity 송신 on/off | l: LAND | h: HOLD")
@@ -470,6 +507,7 @@ def main():
             if fc_accepts_setpoints and not prev_fc_accepts:
                 mission.reset()
                 prev_body_cmd = np.zeros(4)
+                ff_fru = np.zeros(3)
                 last_land_send = 0.0
                 print(f"[SYS] {fc_mode} 진입 — 미션/명령 리셋")
             prev_fc_accepts = fc_accepts_setpoints
@@ -589,6 +627,15 @@ def main():
                 leader_alt=leader_alt_est, leader_vel_world=leader_vel_world, pos_cov_trace=pos_cov_trace)
 
             # ---------------- 명령 ----------------
+            # 리더 속도 피드포워드: 자기 속도(FC)·자세가 신선하고 EKF 가 거리를 아는 추종 상태에서만. 아니면 0 으로 감쇠.
+            v_leader_fru = None
+            if mission_policy["allow_follow"] and ekf.initialized and ekf.is_reliable() and ekf.has_range_fix() \
+                    and local_pos_fresh and attitude_fresh:
+                v_f = follower_velocity_fru(vehicle_state)
+                if v_f is not None:
+                    v_leader_fru = v_f + rel_vel_fru
+            ff_fru = leader_velocity_ff(ff_fru, v_leader_fru, dt)
+
             desired_body_cmd = np.zeros(4)
             if mission_policy["land"]:
                 # C2: 모드 게이트가 곧 latch 다 — LAND 가 먹으면 FC 가 GUIDED 를 벗어나 이 분기가 더 실행되지
@@ -602,7 +649,7 @@ def main():
                     last_land_send = now
                     last_setpoint_time = now
             elif mission_policy["allow_follow"] and ekf.initialized:
-                desired_body_cmd = compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance_m)
+                desired_body_cmd = compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance_m, ff_fru)
 
             # 수직 축은 리더 상대 고도를 따라간다 — 트래커가 지면의 무언가를 물면 계속 하강한다. AGL 바닥.
             if follower_alt is not None and follower_alt < MIN_AGL_M and desired_body_cmd[2] > 0.0:
@@ -653,7 +700,7 @@ def main():
                     (f"rel F/R/U=({rel_fru[0]:+.2f},{rel_fru[1]:+.2f},{rel_fru[2]:+.2f}) cov={pos_cov_trace:.2f} "
                      f"tgt={target_distance_m:.1f}m{'' if vision_range_ok else '(GPS)'}", (220, 220, 220), 0.48),
                     (f"cmd BODY_NED vx={current_body_cmd[0]:+.2f} vy={current_body_cmd[1]:+.2f} "
-                     f"vz={current_body_cmd[2]:+.2f} yr={current_body_cmd[3]:+.2f}", (100, 255, 100), 0.48),
+                     f"vz={current_body_cmd[2]:+.2f} yr={current_body_cmd[3]:+.2f} ffF={ff_fru[0]:+.2f}", (100, 255, 100), 0.48),
                     (f"fresh GPS/LP/ATT={int(gps_fresh)}/{int(local_pos_fresh)}/{int(attitude_fresh)}", (180, 180, 255), 0.48),
                 ])
                 if ekf.initialized:
@@ -689,7 +736,7 @@ def main():
 
             # ---------------- 로그 ----------------
             if log is not None:
-                log.log(build_log_row(dict(
+                log.log(build_log_row(dict(ff_fru=ff_fru, 
                     now=now, dt=dt, fps_display=fps_display, use_mars_imm=use_mars_imm, policy=policy,
                     mission_state=mission_state, mission_policy=mission_policy, track=track, rgbd_meas=rgbd_meas,
                     r_vis=r_vis, r_depth=r_depth, gate_d2=gate_d2, update_used=update_used, leader_meas=leader_meas,

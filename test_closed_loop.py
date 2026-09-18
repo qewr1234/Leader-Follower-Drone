@@ -116,9 +116,10 @@ CX, CY = W / 2.0, H / 2.0
 class World:
     """팔로워(NED, m/rad)와 리더의 월드 상태. 가짜 FC가 팔로워를 움직이고, 시나리오가 리더를 움직인다."""
     f_n = 0.0; f_e = 0.0; f_d = -15.0; f_yaw = 0.0
-    l_n = 4.5; l_e = 0.0; l_d = -15.0
+    l_n = 3.0; l_e = 0.0; l_d = -15.0
     visible = True
     frames = 0
+    dist = []            # (sim_t, front) — 추종 거리 이력
 
     @classmethod
     def relative_fru(cls):
@@ -248,6 +249,7 @@ class FakeCam:
         CLOCK.tick()
         FC.step(CLOCK.DT)
         scenario(CLOCK.sim)
+        World.dist.append((CLOCK.sim, World.relative_fru()[0]))
         color = np.zeros((H, W, 3), dtype=np.uint8)
         depth = np.full((H, W), 15000, dtype=np.uint16)
         if World.visible:
@@ -350,6 +352,18 @@ check("리더 출발 후 FOLLOW 진입 (3s + 0.7s 확인 안팎)", t_follow is n
 # 리더가 멈춘 뒤 팔로워가 따라붙는 동안은 상대속도가 남아 FOLLOW/LEADER_HOVER 를 오간다(히스테리시스,
 # 둘 다 allow_follow). 소실 직전(16s)에는 정착해서 LEADER_HOVER 여야 한다.
 check("리더 정지 후 소실 직전까지 정착 → LEADER_HOVER", state_at(15.9) == "LEADER_HOVER", f"{state_at(15.9)}")
+
+
+def front_at(t):
+    return min(World.dist, key=lambda d: abs(d[0] - t))[1]
+
+
+_e105 = front_at(10.5) - main.TARGET_DISTANCE_M
+_dmin = min(d for t, d in World.dist if 11.0 <= t <= 16.0)
+# 리더는 3.0s 에 출발, FOLLOW 확정은 ~5.1s 라 그 사이 0.6m 가 벌어진 채 시작한다. 같은 조건에서 P 만이면 +1.15m.
+check("FOLLOW 중(리더 0.3m/s, t=10.5s) 거리 오차 < 0.7m — 피드포워드 (KFF=0 이면 +1.15m, 정상상태 v/Kp=1.36m)",
+      abs(_e105) < 0.7, f"front-target={_e105:+.2f}m")
+check("리더 정지 후 최소 접근 거리 ≥ 2.3m (피드포워드 오버슈트 없음)", _dmin >= 2.3, f"min={_dmin:.2f}m")
 t_lost = first_time("LOST_HOLD", 16.0)
 check("4초 소실 → 2초 코스팅 뒤 LOST_HOLD", t_lost is not None and 17.8 <= t_lost <= 18.6, f"t={t_lost}")
 t_resume = None
