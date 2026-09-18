@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C1~C6 + H2 회귀 테스트.
+"""C1~C6 + H2 회귀 테스트 — 단위 검사 97개.
 
 하드웨어도 FC도 없이 순수 로직만 검증한다. cv2 / pymavlink / pyrealsense2 등은
 sys.modules에 최소 스텁을 넣어 main.py를 import 가능하게 만든다.
@@ -49,6 +49,10 @@ class _FakeMavlinkConsts:
     MAV_MODE_FLAG_SAFETY_ARMED = 128
     MAV_TYPE_GCS = 6
     MAV_CMD_NAV_LAND = 21
+    MAV_DATA_STREAM_ALL = 0
+    MAV_DATA_STREAM_EXTENDED_STATUS = 2
+    MAV_DATA_STREAM_POSITION = 6
+    MAV_DATA_STREAM_EXTRA1 = 10
 
 
 for _name in ("cv2", "pyrealsense2", "serial"):
@@ -202,11 +206,16 @@ check("rcoast: 초기화 직후 거리 확보", ek.has_range_fix())
 # bearing-only 업데이트만 반복 → 거리는 관측되지 않는다
 import numpy as np3  # noqa: E402
 Rb = np3.diag([0.03 ** 2, 0.03 ** 2])
+# coast_time을 먼저 0이 아니게 만들어 둔다. init 직후에는 0이라 "되돌린다"를 검사할 수 없다
+# (예전 검사는 이 단계가 없어 update_bearing2d가 아무 일도 안 해도 통과했다).
+ek.on_lost(0.5)
+coast_raised = ek.coast_time
 for _ in range(60):                     # 30fps 2초
     ek.predict(1 / 30)
     ek.update_bearing2d([0.0, 0.0], Rb)
-check("rcoast: bearing-only는 coast_time을 되돌린다 (기존 동작)",
-      ek.coast_time == 0.0 and ek.is_reliable())
+check("rcoast: bearing-only는 coast_time을 되돌린다 (0.5 → 0)",
+      coast_raised == 0.5 and ek.coast_time == 0.0 and ek.is_reliable(),
+      f"before={coast_raised} after={ek.coast_time}")
 for _ in range(30):                     # 다시 1초 → 총 3초 > 2.0
     ek.predict(1 / 30)
     ek.update_bearing2d([0.0, 0.0], Rb)
@@ -272,6 +281,27 @@ for _ in range(3):
     tr4.update([])
 t = tr4.update([{"bbox": [380.0, 300.0, 420.0, 340.0], "conf": 0.6, "cls_name": "person"}])
 check("tracker: 반경 상한 아래의 정상 회복은 여전히 허용", not t["is_lost"] and t["track_id"] == 1)
+
+# 게이트-선행 회귀: 게이트 안의 리더(conf 0.5)와 반대편 오검출(conf 0.95)이 같이 보이는 경우.
+# 수정 전 코드는 score = 0.75*IoU + 0.25*conf 최대인 검출 하나만 고른 뒤 그것에 게이트를
+# 걸었다. 1프레임 놓친 뒤 리더는 45px 옮겨가 IoU가 0이라 두 검출의 score가 각각
+# 0.125(리더) / 0.2375(오검출)로 오검출이 뽑히고, 오검출은 근접 게이트에서 거부되며,
+# 게이트 안의 리더는 후보로 검토조차 안 된다 → 매 프레임 lost_count만 오르다 12프레임째
+# (lost_count 13 > max_lost 12)에 트랙이 폐기된다. 게이트를 먼저 걸고 통과한 후보 중에서
+# score 최대를 고르면 첫 프레임에 리더가 뽑혀 트랙이 유지된다.
+tr6 = LeaderTracker()
+tr6.update([{"bbox": [300.0, 220.0, 340.0, 260.0], "conf": 0.9, "cls_name": "person"}])
+tr6.update([])                                  # lost_count = 1 → 근접 게이트 활성
+leader_bbox = [345.0, 265.0, 385.0, 305.0]      # 중심 이동 ≈64px < 허용 85px, IoU 0
+mixed = [{"bbox": leader_bbox, "conf": 0.5, "cls_name": "person"},
+         {"bbox": [10.0, 10.0, 50.0, 50.0], "conf": 0.95, "cls_name": "person"}]
+for _ in range(12):
+    t = tr6.update(mixed)
+_cx, _cy = (t["bbox"][0] + t["bbox"][2]) / 2, (t["bbox"][1] + t["bbox"][3]) / 2
+check("tracker: 게이트 안 리더 + 반대편 고신뢰 오검출이 함께 오면 리더로 트랙 유지",
+      tr6.track is not None and not t["is_lost"] and t["track_id"] == 1
+      and abs(_cx - 365.0) < 10 and abs(_cy - 285.0) < 10,
+      f"is_lost={t['is_lost']} id={t['track_id']} center=({_cx:.0f},{_cy:.0f})")
 
 # ---------------------------------------------------------------- FPS 독립 평활
 import numpy as np2  # noqa: E402
@@ -371,6 +401,33 @@ _follow_then_lose(m10, 100.0, 1.0)
 m10.reset()                                 # GUIDED 인계 시 main이 호출
 check("재개: reset()이 '추종한 적 있음' 기억까지 지움 (인계 후 출발 확인 재요구)",
       m10.has_followed is False and m10.state == S_WAIT_LEADER and m10.last_seen_t is None)
+
+# 착륙 확인 타이머는 가림 중에 끊어야 한다. 남겨 두면 가려진 시간이 합산돼 재획득
+# 첫 프레임에 (now - candidate_t)가 confirm_sec을 넘어 LAND가 나간다.
+from mission_manager import S_LANDING_CANDIDATE, S_CONFIRMED_LANDING  # noqa: E402
+
+_LANDING = dict(rel_est=[3.0, 0.0, 0.0], rel_vel_est=[0.0, 0.0, -0.5], leader_alt=0.3, pos_cov_trace=1.0)
+m11 = MissionManager()
+t = 100.0
+for _ in range(10):                          # 착륙 후보 1.0초 (< confirm 1.8초)
+    st, p = m11.update(now=t, leader_visible=True, **_LANDING); t += 0.1
+check("타이머: 1.0초 착륙 후보는 아직 LANDING_CANDIDATE",
+      st == S_LANDING_CANDIDATE and p["land"] is False, f"state={st}")
+for _ in range(30):                          # 3초 소실 (< lost_hold 8초)
+    st, p = m11.update(now=t, leader_visible=False, rel_est=[3.0, 0.0, 0.0], pos_cov_trace=1.0); t += 0.1
+assert st == S_LOST_HOLD, st
+t_reacq = t
+st, p = m11.update(now=t, leader_visible=True, **_LANDING); t += 0.1
+check("타이머: 3초 소실 뒤 재획득 첫 프레임에 land 안 나감 (가려진 시간 합산 금지)",
+      st == S_LANDING_CANDIDATE and p["land"] is False
+      and m11.landing_candidate_t == t_reacq,
+      f"state={st} land={p['land']} candidate_t={m11.landing_candidate_t} (기대 {t_reacq})")
+st, p = m11.update(now=t_reacq + m11.landing_confirm_sec - 0.05, leader_visible=True, **_LANDING)
+before = (st, p["land"])                    # 새로 1.8초를 채우기 직전
+st, p = m11.update(now=t_reacq + m11.landing_confirm_sec + 0.05, leader_visible=True, **_LANDING)
+check("타이머: 재획득 시점부터 confirm_sec(1.8초)을 새로 채워야 LAND",
+      before == (S_LANDING_CANDIDATE, False) and st == S_CONFIRMED_LANDING and p["land"] is True,
+      f"before={before} after={st}")
 
 # ------------------------------------------------- 현장 대비 (2026-09-07 감사)
 # ESP32는 선택 사항이다. 플래그가 켜져 있어도 장치가 없으면 startup에서 죽지 않고
@@ -484,6 +541,52 @@ check("BAT: voltage_battery=65535(미보고)는 전압으로 안 씀",
 mavlink_io.drain_messages(_Master([_SysStatus(12600)]))
 check("BAT: 정상 전압은 V로 환산", mavlink_io.last_battery_voltage == 12.6)
 
+# ------------------------------------------------- connect_fc heartbeat 대기
+# wait_heartbeat(timeout=10)은 timeout 시 None을 돌려준다. connect_fc는 포기하지 않고
+# 10초마다 대기 메시지를 찍으며 heartbeat가 올 때까지 다시 기다려야 한다.
+
+
+class _FakeFCMaster:
+    target_system, target_component = 1, 7
+
+    def __init__(self):
+        self.mav = self
+        self.hb_calls = []
+        self.stream_calls = []
+
+    def wait_heartbeat(self, timeout=None):
+        self.hb_calls.append(timeout)
+        return None if len(self.hb_calls) < 3 else self     # 처음 2번은 timeout
+
+    def request_data_stream_send(self, *a):
+        self.stream_calls.append(a)
+
+
+_fake_fc = _FakeFCMaster()
+_mavutil_stub = sys.modules["pymavlink.mavutil"]
+_mavutil_stub.mavlink_connection = lambda port, baud=None: _fake_fc
+buf = _io.StringIO()
+try:
+    with contextlib.redirect_stdout(buf):
+        _master = mavlink_io.connect_fc()
+    check("FC: heartbeat가 2번 timeout 돼도 예외 없이 master 반환 (3번째에 획득)",
+          _master is _fake_fc and _fake_fc.hb_calls == [10, 10, 10],
+          f"hb_calls={_fake_fc.hb_calls}")
+except Exception as e:
+    check("FC: heartbeat가 2번 timeout 돼도 예외 없이 master 반환 (3번째에 획득)", False,
+          f"{type(e).__name__}: {e}")
+finally:
+    del _mavutil_stub.mavlink_connection
+_out = buf.getvalue()
+# 쓰는 스트림(POSITION/EXTRA1/EXTENDED_STATUS)만 요청한다 — ALL(0) 을 요청하면 RAW_SENS/EXTRA2 까지
+# 매 프레임 파싱하게 된다.
+check("FC: 대기 메시지(10s, 20s) 출력 + 연결 후 필요한 data stream 3개만 요청 (ALL 제외)",
+      "heartbeat 대기 중 (10s)" in _out and "heartbeat 대기 중 (20s)" in _out
+      and "connected" in _out and len(_fake_fc.stream_calls) == 3
+      and all(c[:2] == (1, 7) for c in _fake_fc.stream_calls)
+      and all(c[2] != 0 for c in _fake_fc.stream_calls),
+      f"streams={len(_fake_fc.stream_calls)} out={_out.strip().splitlines()}")
+
 # ------------------------------------------------- ESP32 serial 부분 라인
 # readline()+1ms timeout은 전송 도중 읽으면 앞토막/뒤토막이 따로 잘려 패킷을 통째로 잃었다.
 from leader_telemetry import LeaderTelemetryReceiver, parse_leader_json  # noqa: E402
@@ -538,6 +641,15 @@ m_bad = build_leader_measurement_from_packet(_pk('{"lat":35.83,"lon":128.75,"alt
 check("alt: 타원체고 리더인데 팔로워 타원체고가 없으면 측정 불가로 거부 (섞어 쓰지 않음)",
       m_bad["available"] is False and m_bad["reason"] == "no_follower_ellipsoid_alt", f"{m_bad}")
 
+# MAVLink lat/lon은 deg*1e7, alt는 mm — 항상 그 배율로 나눈다. 크기로 단위를 추측하면
+# 해발 1m 미만 이륙지에서 alt=800mm 가 800m 로 남는다.
+from leader_telemetry import normalize_lat_lon_alt_from_mavlink  # noqa: E402
+
+_lla = normalize_lat_lon_alt_from_mavlink({"lat": 358300000, "lon": 1287500000, "alt": 800})
+check("lla: MAVLink 정수 (358300000, 1287500000, 800mm) → (35.83, 128.75, 0.8m)",
+      _lla is not None and all(abs(a - b) < 1e-9 for a, b in zip(_lla, (35.83, 128.75, 0.8))),
+      f"{_lla}")
+
 # ------------------------------------------------- GPS 단독 거리 → 이격 확대
 # has_range_fix()는 ESP32 GPS 상대위치로도 참이 된다. 비전이 죽어도 소실 판정은 안 나는 게
 # 맞지만(링크가 살아 있으니), GPS 오차(m 단위)만으로 3m 이격 추종을 계속하면 안 된다.
@@ -571,6 +683,137 @@ check("정리: detector.select_target 제거", not hasattr(_det, "select_target"
 _h = open("sitl/harness.py", encoding="utf-8").read()
 check("하네스: --all이 depth_loss·handover까지 포함",
       '"depth_loss", "handover"] if ARGS.all' in _h)
+
+# ------------------------------------------------- 불확실성 분기의 타이머 초기화
+# pos_cov_trace > 8.0 이면 리더가 보여도 LOST_HOLD 로 간다. 이때도 착륙 후보 타이머를 끊어야
+# 공분산이 회복된 첫 프레임에 (가려진 시간이 합산돼) CONFIRMED_LANDING 이 나지 않는다.
+m12 = MissionManager()
+t = 100.0
+_LANDING = dict(rel_est=[3.0, 0.0, 0.0], rel_vel_est=[0.0, 0.0, -0.5], leader_alt=0.3)
+for _ in range(10):                              # 1.0초 착륙 후보
+    m12.update(now=t, leader_visible=True, pos_cov_trace=1.0, **_LANDING); t += 0.1
+for _ in range(30):                              # 3초 공분산 폭주 → LOST_HOLD
+    st, _ = m12.update(now=t, leader_visible=True, pos_cov_trace=20.0, **_LANDING); t += 0.1
+check("타이머: 공분산 폭주 중 LOST_HOLD", st == S_LOST_HOLD, f"state={st}")
+st, p = m12.update(now=t, leader_visible=True, pos_cov_trace=1.0, **_LANDING)
+check("타이머: 공분산 회복 첫 프레임에 착륙 명령 없음 (타이머 새로 시작)",
+      p["land"] is False and m12.landing_candidate_t == t, f"land={p['land']} cand_t={m12.landing_candidate_t} t={t}")
+
+# ------------------------------------------------- ego-yaw 보정이 CT omega 로 새지 않음
+# 타겟이 월드에서 직진(참 선회율 0)하고 팔로워가 일정 yaw rate 로 회전하면, compensate_ego_yaw 가
+# 속도 벡터를 dpsi 만큼 돌린다. 직전 방향각(_prev_heading)을 같이 돌리지 않으면 d_heading 에
+# dpsi 가 통째로 섞여 omega 가 팔로워 yaw rate 로 수렴했다(수정 전 0.2 rad/s → omega +0.202).
+import math as _math  # noqa: E402
+
+
+def _omega_with_ego_yaw(yaw_rate, v_w=1.0):
+    ek = ImmEkf(); ek.init([0.0, 0.0, 5.0])
+    dt = 1 / 30; Rm = np3.diag([0.15 ** 2, 0.15 ** 2, 0.25 ** 2]); psi = 0.0
+    for k in range(1, 301):
+        t = k * dt
+        ek.predict(dt)
+        psi += yaw_rate * dt
+        ek.compensate_ego_yaw(yaw_rate * dt)
+        r = _math.hypot(v_w * t, 5.0); phi_c = _math.atan2(5.0, v_w * t) + psi   # 카메라 각 = 월드 각 + ψ
+        ek.update_position3d(np3.array([r * _math.cos(phi_c), 0.0, r * _math.sin(phi_c)]), Rm)
+    return ek.filters[1]._omega
+
+
+check("ego-yaw: 팔로워 yaw 0.2 rad/s 가 CT omega 로 새지 않음 (|omega| < 0.02)",
+      abs(_omega_with_ego_yaw(0.2)) < 0.02, f"omega={_omega_with_ego_yaw(0.2):+.3f}")
+check("ego-yaw: 반대 방향(-0.3 rad/s)도 동일", abs(_omega_with_ego_yaw(-0.3)) < 0.02,
+      f"omega={_omega_with_ego_yaw(-0.3):+.3f}")
+
+# ------------------------------------------------- 2차 리팩토링 회귀
+# detector 후처리: boxes.data 행렬 → ROI 오프셋·클립·클래스 필터·정렬
+from detector import _postprocess  # noqa: E402
+
+_names = {0: "person", 1: "leader_drone"}
+_data = np2.array([
+    [10.0, 20.0, 50.0, 60.0, 0.30, 1],     # leader_drone, 작은 상자
+    [5.0, 5.0, 100.0, 100.0, 0.90, 0],     # person → 필터
+    [0.0, 0.0, 200.0, 150.0, 0.30, 1],     # leader_drone, 같은 conf 더 큰 면적 → 먼저
+    [-20.0, -20.0, 30.0, 30.0, 0.95, 1],   # 음수 좌표 → 클립
+])
+_dets = _postprocess(_data, 100, 50, 640, 480, _names, "leader_drone")
+check("detector: 대상 클래스만 남고 (conf, area) 내림차순", [d["conf"] for d in _dets] == [0.95, 0.30, 0.30]
+      and _dets[1]["area"] > _dets[2]["area"], f"{[(d['conf'], d['area']) for d in _dets]}")
+check("detector: ROI 오프셋 적용 + 클립", _dets[0]["bbox"] == (80, 30, 130, 80) and _dets[2]["bbox"] == (110, 70, 150, 110),
+      f"{[d['bbox'] for d in _dets]}")
+check("detector: dict 키", set(_dets[0]) == {"bbox", "conf", "cls", "name", "area"} and _dets[0]["name"] == "leader_drone")
+_d2 = YoloDetector(model=_FakeModel(), target_class_name="leader_drone")
+check("detector: predict 없는 스텁 모델도 생성·warmup 통과 (imgsz=config, classes id 역조회)",
+      _d2.imgsz == CONFIG["detector"]["imgsz"] and _d2.target_cls_id == 0 and _d2.warmup(640, 480) is None)
+
+
+# 회귀 방지: ultralytics Model.predict 는 {**overrides, **custom(conf=0.25), **kwargs} 로 병합하므로
+# conf 를 overrides 에만 넣으면 0.25 로 덮인다. conf 가 매 호출 kwargs 로 도달해야 한다.
+class _FakeUltraModel:
+    names = {0: "leader_drone"}
+
+    def __init__(self):
+        self.overrides = {}
+        self.calls = []
+
+    def predict(self, img, **kw):
+        self.calls.append(kw)
+        return []
+
+
+_fm = _FakeUltraModel()
+with contextlib.redirect_stdout(_io.StringIO()):
+    _d3 = YoloDetector(model=_fm, conf_thres=0.6, target_class_name="leader_drone")
+    _d3.detect(np2.zeros((48, 64, 3), dtype=np2.uint8))
+check("detector: conf/iou/imgsz/classes 가 overrides 가 아닌 predict kwargs 로 매 호출 전달 (conf 0.25 덮어쓰기 회피)",
+      len(_fm.calls) == 1 and _fm.calls[0].get("conf") == 0.6 and _fm.calls[0].get("classes") == [0]
+      and "iou" in _fm.calls[0] and "imgsz" in _fm.calls[0] and "conf" not in _fm.overrides,
+      f"calls={_fm.calls} overrides={_fm.overrides}")
+
+# logger: flatten 결과가 이전과 같은가 (키 이름, ';' 조인, 6g 포맷, numpy 스칼라 변환)
+from logger import ExperimentLogger  # noqa: E402
+_row = {"a": 1, "b": {"c": np2.float64(1.5), "d": np2.int64(3), "e": np2.bool_(True), "f": None},
+        "g": [1, np2.float32(2.5), "x"], "h": np2.array([[1.23456789, 2.0]]), "i": (True, False), "s": "str", "z": 0.1}
+_flat = ExperimentLogger._flatten(_row)
+check("logger: 평탄화 결과 동일",
+      _flat == {"a": 1, "b.c": 1.5, "b.d": 3, "b.e": True, "b.f": None, "g": "1;2.5;x", "h": "1.23457;2", "i": "True;False", "s": "str", "z": 0.1}
+      and type(_flat["b.c"]) is float and type(_flat["b.d"]) is int and type(_flat["b.e"]) is bool, f"{_flat}")
+
+# measurement: 큰 ROI 서브샘플은 median 을 거의 바꾸지 않고, 작은 ROI 는 건드리지 않는다
+import measurement as _meas_mod  # noqa: E402
+_mb2 = MeasurementBuilder({"fx": 384.0, "fy": 384.0, "ppx": 320.0, "ppy": 240.0}, depth_scale=0.001)
+_rng = np2.random.default_rng(0)
+_dimg = (4000 + _rng.normal(0, 30, size=(480, 640))).astype(np2.uint16)
+_big = _mb2._depth_stats(_dimg, (100, 60, 500, 420))           # inner 220x198 > 20000px → 서브샘플
+_saved = _meas_mod.SUBSAMPLE_ABOVE_PX; _meas_mod.SUBSAMPLE_ABOVE_PX = 10**9
+_big_full = _mb2._depth_stats(_dimg, (100, 60, 500, 420))
+_meas_mod.SUBSAMPLE_ABOVE_PX = _saved
+check("measurement: 큰 ROI 서브샘플 전후 depth_m 차이 < 1cm",
+      abs(_big["depth_m"] - _big_full["depth_m"]) < 0.01 and _big["depth_valid_count"] * 3 < _big_full["depth_valid_count"],
+      f"sub={_big['depth_m']:.4f} full={_big_full['depth_m']:.4f} n={_big['depth_valid_count']}/{_big_full['depth_valid_count']}")
+_small = _mb2._depth_stats(_dimg, (300, 220, 390, 310))
+_meas_mod.SUBSAMPLE_ABOVE_PX = 10**9
+_small_full = _mb2._depth_stats(_dimg, (300, 220, 390, 310))
+_meas_mod.SUBSAMPLE_ABOVE_PX = _saved
+check("measurement: 90x90 ROI 는 서브샘플 없음 (정확히 같은 값)", _small == _small_full)
+
+# scheduler: hover 계층(p_cv>0.75) 삭제 — p_cv 가 아무리 커도 normal_detect_every 이상으로 건너뛰지 않는다
+from scheduler import PerceptionScheduler  # noqa: E402
+_de = PerceptionScheduler._choose_detect_period(img_unc=5.0, p_ct=0.05, lost_count=0, cfg=CONFIG["scheduler"])
+check("scheduler: 안정 상태 검출 주기 = normal_detect_every (hover 계층 없음)",
+      _de == CONFIG["scheduler"]["normal_detect_every"] and "hover_detect_every" not in CONFIG["scheduler"], f"detect_every={_de}")
+
+# imm_ekf: get_state() 캐시가 상태 변경(predict/update/compensate/속도 힌트) 뒤 갱신되는가
+from leader_telemetry import apply_leader_velocity_hint_to_imm  # noqa: E402
+ek3 = ImmEkf(); ek3.init([0.0, 0.0, 5.0])
+x0 = ek3.get_state()[0].copy()
+ek3.predict(0.1); x1 = ek3.get_state()[0].copy()
+ek3.update_position3d([0.2, 0.0, 5.0]); x2 = ek3.get_state()[0].copy()
+ek3.compensate_ego_yaw(0.1); x3 = ek3.get_state()[0].copy()
+apply_leader_velocity_hint_to_imm(ek3, [1.0, 0.0, 0.0], alpha=0.5); x4 = ek3.get_state()[0].copy()
+check("ekf: 캐시가 update/compensate/속도 힌트 뒤 갱신됨",
+      not np3.allclose(x1, x2) and not np3.allclose(x2, x3) and not np3.allclose(x3, x4) and abs(x4[3] - 0.5 * x3[3] - 0.5) < 1e-9,
+      f"vx: {x3[3]:.3f} → {x4[3]:.3f}")
+check("ekf: 같은 상태에서 두 번 부르면 같은 객체 (캐시 적중)", ek3.get_state()[0] is ek3.get_state()[0])
 
 # ---------------------------------------------------------------- 
 print()

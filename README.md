@@ -28,7 +28,7 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 **4.3m — 이론값 4.36m와 소수 둘째 자리 일치** |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
-| **회귀 스위트** | 단위 검사 75개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
+| **회귀 스위트** | 단위 검사 97개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 추종 동작과 Fail-safe
@@ -111,7 +111,8 @@ D435i (color+depth, 640×480@30)
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 75개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 97개 — numpy만 있으면 됨
+python3 test_closed_loop.py    # 폐루프 특성화 — 가짜 FC·가짜 시계로 실제 main.main() 결정론 실행 (--dump/--compare)
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 ```
 
@@ -145,6 +146,30 @@ python3 main.py
 SITL에 직접 붙이려면 `MARS_FC_PORT=udpin:0.0.0.0:14551 python3 main.py`.
 
 키: `q`/`ESC` 종료 · `m` MARS-IMM 토글 · `v` MAVLink 송신 토글 · `l` LAND · `h` HOLD
+
+### Jetson 배포 — TensorRT가 실제로 도는지 확인하기
+
+`.engine`이 있으면 TensorRT, 없으면 `.pt`로 **조용히** 폴백합니다. 폴백된 `.pt`는 CUDA torch가 없으면
+CPU FP32로 돌아 FPS가 한 자리수로 떨어집니다. 시작 로그 한 줄로 확인하세요:
+
+```
+[YOLO] warm-up 1.8s | backend=TensorRT device=cuda:0 fp16=True imgsz=416
+```
+
+`backend=PyTorch`나 `device=cpu`가 보이면 아래 순서로 점검합니다.
+
+```bash
+python3 -c "import torch, tensorrt; print(torch.cuda.is_available(), torch.__version__, tensorrt.__version__)"
+#   → True 여야 함. False면 PyPI torch(CPU 전용)가 깔린 것 — JetPack용 NVIDIA torch 휠로 교체
+
+# 엔진은 반드시 **같은 Jetson, 같은 JetPack/TensorRT 버전**에서 만든다 (다른 기기 엔진은 로드 실패)
+yolo export model=$MARS_MODEL_DIR/leader_drone_yolo11n.pt format=engine imgsz=416 half=True
+```
+
+- 모델 위치는 `MARS_MODEL_DIR` 환경변수로 바꿉니다(기본 `/home/dsl/DRONE`).
+- 엔진의 imgsz가 `config.py`의 416과 다르면 시작 시 크게 경고하고 **엔진 값을 씁니다**(고정 크기 엔진에 다른
+  크기를 넘기면 ultralytics가 첫 추론에서 죽습니다).
+- `MARS_SHOW_WINDOW=0`으로 창을 끄면 프레임당 4~8ms(Jetson)를 아낍니다. 창을 켜도 표시는 15Hz로만 그립니다.
 
 모델 경로와 대상 클래스는 `config.py`에서 설정합니다. 시작 시 모델의 클래스 목록과 대조해
 설정이 어긋나면 크게 경고합니다.
@@ -191,7 +216,8 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회) |
 | `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | 단위 회귀 75개 (하드웨어·FC 불필요) |
+| `test_fixes.py` | 단위 회귀 97개 (하드웨어·FC 불필요) |
+| `test_closed_loop.py` | 폐루프 특성화 테스트 — 가짜 FC·가짜 시계로 실제 `main.main()` 결정론 실행, `--dump`/`--compare`로 리팩토링 전후 스트림 비교 |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 | `docs/images/` | README 다이어그램(SVG) |
 

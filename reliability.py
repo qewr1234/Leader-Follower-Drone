@@ -45,7 +45,6 @@ class ReliabilityEstimator:
         if mad is None:
             return 0.0
 
-        # C4: max_depth_mad는 config에 정의만 되고 아무도 쓰지 않는 죽은 상수였다.
         # 깊이 outlier가 과반이면 median이 outlier에 앉는데도 신뢰도가 높게 나와
         # 제어가 포화된 전속 후진으로 갔다. 산포가 한계를 넘으면 측정을 버린다.
         if float(mad) > float(CONFIG["measurement"]["max_depth_mad"]):
@@ -59,31 +58,6 @@ class ReliabilityEstimator:
         r_mad = 1.0 / (1.0 + 8.0 * float(mad))
 
         return float(np.clip(r_valid * r_mad, 0.0, 1.0))
-
-    def gps_reliability(self, gps_data):
-        if not gps_data:
-            return 0.0
-
-        fix_type = int(gps_data.get("fix_type", 0) or 0)
-        sats = int(gps_data.get("satellites_visible", gps_data.get("satellites", 0)) or 0)
-        h_acc = gps_data.get("h_acc", None)
-        eph = gps_data.get("eph", None)
-
-        r_fix = 1.0 if fix_type >= 3 else 0.0
-        r_sat = np.clip((sats - 5) / 7.0, 0.0, 1.0)
-
-        if h_acc is not None and h_acc > 0:
-            # MAVLink GPS_RAW_INT h_acc는 mm 단위인 경우가 많음.
-            h_m = float(h_acc) / 1000.0 if h_acc > 100 else float(h_acc)
-            r_acc = 1.0 / (1.0 + h_m)
-        elif eph is not None and eph > 0:
-            # eph는 cm scale인 경우가 많음.
-            eph_m = float(eph) / 100.0
-            r_acc = 1.0 / (1.0 + eph_m)
-        else:
-            r_acc = 0.4
-
-        return float(np.clip(r_fix * r_sat * r_acc, 0.0, 1.0))
 
     def make_R_rgbd(self, r_vision, r_depth):
         r = max(float(r_vision) * float(r_depth), self.min_r)

@@ -22,17 +22,11 @@ def bbox_area(bbox):
 def iou_xyxy(a, b):
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-    iw = max(0, ix2 - ix1)
-    ih = max(0, iy2 - iy1)
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0, min(ay2, by2) - max(ay1, by1))
     inter = iw * ih
     union = bbox_area(a) + bbox_area(b) - inter
-    if union <= 0:
-        return 0.0
-    return inter / union
+    return inter / union if union > 0 else 0.0
 
 
 def clip_bbox(bbox, width, height):
@@ -53,35 +47,29 @@ def make_square_roi(cx, cy, size, width, height):
     return clip_bbox((cx - half, cy - half, cx + half, cy + half), width, height)
 
 
+def _intr(intrinsics):
+    """(fx, fy, cx, cy). RealSense 는 ppx/ppy, 일반 표기는 cx/cy — 둘 다 받는다."""
+    return (
+        intrinsics.get("fx", 384.0),
+        intrinsics.get("fy", 384.0),
+        intrinsics.get("ppx", intrinsics.get("cx", 320.0)),
+        intrinsics.get("ppy", intrinsics.get("cy", 240.0)),
+    )
+
+
 def pixel_to_camera(u, v, depth_m, intrinsics):
-    fx = intrinsics.get("fx", 384.0)
-    fy = intrinsics.get("fy", 384.0)
-    cx = intrinsics.get("ppx", intrinsics.get("cx", 320.0))
-    cy = intrinsics.get("ppy", intrinsics.get("cy", 240.0))
-    x = (u - cx) * depth_m / fx
-    y = (v - cy) * depth_m / fy
-    z = depth_m
-    return np.array([x, y, z], dtype=float)
+    fx, fy, cx, cy = _intr(intrinsics)
+    return np.array([(u - cx) * depth_m / fx, (v - cy) * depth_m / fy, depth_m], dtype=float)
 
 
 def pixel_to_bearing(u, v, intrinsics):
-    fx = intrinsics.get("fx", 384.0)
-    fy = intrinsics.get("fy", 384.0)
-    cx = intrinsics.get("ppx", intrinsics.get("cx", 320.0))
-    cy = intrinsics.get("ppy", intrinsics.get("cy", 240.0))
-    bx = (u - cx) / fx
-    by = (v - cy) / fy
-    return np.array([bx, by], dtype=float)
+    fx, fy, cx, cy = _intr(intrinsics)
+    return np.array([(u - cx) / fx, (v - cy) / fy], dtype=float)
 
 
 def camera_to_pixel(point_3d, intrinsics):
     x, y, z = point_3d[:3]
     if z <= 1e-6:
         return None
-    fx = intrinsics.get("fx", 384.0)
-    fy = intrinsics.get("fy", 384.0)
-    cx = intrinsics.get("ppx", intrinsics.get("cx", 320.0))
-    cy = intrinsics.get("ppy", intrinsics.get("cy", 240.0))
-    u = fx * x / z + cx
-    v = fy * y / z + cy
-    return np.array([u, v], dtype=float)
+    fx, fy, cx, cy = _intr(intrinsics)
+    return np.array([fx * x / z + cx, fy * y / z + cy], dtype=float)

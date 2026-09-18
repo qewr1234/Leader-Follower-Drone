@@ -1,17 +1,18 @@
 """
 scheduler.py — risk-bound MARS-IMM perception scheduler
 
-핵심:
-- IMM state covariance P를 영상 평면으로 투영
-- projected covariance ellipse 기반으로 ROI 크기 결정
-- IMM mode probability와 영상 uncertainty로 detector 주기 결정
-- heuristic gain 중심이 아니라 miss-risk 기반 설계로 보이게 만듦
+IMM 상태 공분산 P를 영상 평면에 투영해 ROI 크기를 정하고, IMM 모드 확률과 영상 불확실성으로
+검출기 호출 주기를 정한다. ROI는 정확도 장치(오검출 억제)이고, FPS 이득은 run_detector=False
+인 프레임에서만 난다 — 고정 크기 TensorRT 엔진은 ROI가 작아도 추론 비용이 같다.
 """
 
 import numpy as np
 
 from config import CONFIG
 from utils_geometry import camera_to_pixel, make_square_roi
+
+CHI2_2D_99 = 9.21          # chi-square df=2, p=0.99
+MIN_PIXEL_VAR = 4.0 ** 2   # detector bbox center noise 하한
 
 
 class PerceptionScheduler:
@@ -25,17 +26,14 @@ class PerceptionScheduler:
 
         if not cfg.get("enable_roi", True):
             return self._full_frame("roi_disabled")
-
         if imm_state is None or not imm_state.get("initialized", False):
             return self._full_frame("not_initialized")
-
         if last_track is None:
             return self._full_frame("lost_full_frame")
 
         lost_count = int(last_track.get("lost_count", 0))
         if lost_count >= cfg["lost_full_frame_threshold"]:
             return self._full_frame("lost_full_frame")
-
         if self.frame_idx % cfg["full_frame_interval"] == 0:
             return self._full_frame("periodic_full_frame")
 
@@ -52,30 +50,13 @@ class PerceptionScheduler:
 
         Sigma_uv = self._project_covariance_to_image(x, P, intrinsics)
         img_unc = float(np.sqrt(max(np.trace(Sigma_uv), 0.0)))
-
-        roi_size = self._risk_bound_roi_size(
-            Sigma_uv=Sigma_uv,
-            p_ct=p_ct,
-            lost_count=lost_count,
-            cfg=cfg,
-        )
-
-        roi = make_square_roi(uv[0], uv[1], roi_size, W, H)
-
-        detect_every = self._choose_detect_period(
-            img_unc=img_unc,
-            p_cv=p_cv,
-            p_ct=p_ct,
-            lost_count=lost_count,
-            cfg=cfg,
-        )
-
-        run_detector = (self.frame_idx % max(1, detect_every) == 0)
+        roi_size = self._risk_bound_roi_size(Sigma_uv, p_ct, lost_count, cfg)
+        detect_every = self._choose_detect_period(img_unc, p_ct, lost_count, cfg)
 
         return {
-            "run_detector": run_detector,
+            "run_detector": self.frame_idx % max(1, detect_every) == 0,
             "use_full_frame": False,
-            "roi": roi,
+            "roi": make_square_roi(uv[0], uv[1], roi_size, W, H),
             "detect_every": int(detect_every),
             "reason": "risk_bound_roi",
             "p_cv": p_cv,
@@ -85,7 +66,8 @@ class PerceptionScheduler:
             "lost_count": lost_count,
         }
 
-    def _full_frame(self, reason):
+    @staticmethod
+    def _full_frame(reason):
         return {
             "run_detector": True,
             "use_full_frame": True,
@@ -101,98 +83,33 @@ class PerceptionScheduler:
 
     @staticmethod
     def _project_covariance_to_image(x, P, intrinsics):
-        """
-        3D position covariance P[:3,:3]를 image plane covariance로 투영.
-
-        camera coordinate:
-            x = [X, Y, Z, ...]
-            u = fx * X / Z + cx
-            v = fy * Y / Z + cy
-        """
+        """P[:3,:3] 을 u = fx·X/Z + cx, v = fy·Y/Z + cy 의 야코비안으로 영상 평면에 투영."""
         X, Y, Z = float(x[0]), float(x[1]), float(x[2])
         Z = max(Z, 1e-4)
-
         fx = intrinsics.get("fx", 384.0)
         fy = intrinsics.get("fy", 384.0)
-
-        J = np.array(
-            [
-                [fx / Z, 0.0, -fx * X / (Z * Z)],
-                [0.0, fy / Z, -fy * Y / (Z * Z)],
-            ],
-            dtype=float,
-        )
-
-        P_pos = P[:3, :3]
-
-        # 수치 안정성용
-        P_pos = 0.5 * (P_pos + P_pos.T)
-        Sigma_uv = J @ P_pos @ J.T
-
-        # detector bbox center noise 최소값 추가
-        min_pixel_var = 4.0 ** 2
-        Sigma_uv += np.eye(2) * min_pixel_var
-
+        J = np.array([[fx / Z, 0.0, -fx * X / (Z * Z)],
+                      [0.0, fy / Z, -fy * Y / (Z * Z)]], dtype=float)
+        P_pos = 0.5 * (P[:3, :3] + P[:3, :3].T)
+        Sigma_uv = J @ P_pos @ J.T + np.eye(2) * MIN_PIXEL_VAR
         return 0.5 * (Sigma_uv + Sigma_uv.T)
 
     @staticmethod
     def _risk_bound_roi_size(Sigma_uv, p_ct, lost_count, cfg):
-        """
-        2D Gaussian ellipse의 chi-square bound를 이용해 ROI 크기 결정.
-
-        chi-square df=2:
-            95% ≈ 5.99
-            99% ≈ 9.21
-            99.7% ≈ 11.83
-
-        급기동 p_ct가 높거나 lost_count가 있으면 더 보수적으로 키움.
-        """
-        chi2_2d_99 = 9.21
-
-        eigvals = np.linalg.eigvalsh(Sigma_uv)
-        max_std = float(np.sqrt(max(np.max(eigvals), 1e-6)))
-
-        # ellipse radius를 square ROI 한 변으로 변환
-        radius = np.sqrt(chi2_2d_99) * max_std
-
-        # 실제 target bbox 여유분
-        base_margin = float(cfg.get("base_roi_size", 320)) * 0.35
-
-        # maneuver/lost 상황 보수적 확장
-        maneuver_margin = float(cfg.get("base_roi_size", 320)) * 0.35 * float(p_ct)
-        lost_margin = float(cfg.get("base_roi_size", 320)) * 0.15 * float(lost_count)
-
-        size = 2.0 * radius + base_margin + maneuver_margin + lost_margin
-
-        return int(
-            np.clip(
-                size,
-                cfg["min_roi_size"],
-                cfg["max_roi_size"],
-            )
-        )
+        """99% 오차 타원의 반경을 정사각 ROI 한 변으로. 급기동(p_ct)·소실(lost_count)이면 더 키운다."""
+        max_std = float(np.sqrt(max(np.max(np.linalg.eigvalsh(Sigma_uv)), 1e-6)))
+        radius = np.sqrt(CHI2_2D_99) * max_std
+        base = float(cfg.get("base_roi_size", 320))
+        size = 2.0 * radius + base * (0.35 + 0.35 * float(p_ct) + 0.15 * float(lost_count))
+        return int(np.clip(size, cfg["min_roi_size"], cfg["max_roi_size"]))
 
     @staticmethod
-    def _choose_detect_period(img_unc, p_cv, p_ct, lost_count, cfg):
-        """
-        detector 호출 주기 결정.
-
-        원리:
-        - 영상 plane uncertainty가 작고 CV mode가 강하면 detector를 덜 자주 호출
-        - CT mode / maneuver 가능성이 크면 매 프레임 호출
-        - lost_count가 있으면 recovery 우선
-        """
+    def _choose_detect_period(img_unc, p_ct, lost_count, cfg):
+        """놓치는 중이거나 기동 중이거나 영상 불확실성이 크면 매 프레임, 아니면 normal_detect_every."""
         if lost_count > 0:
             return 1
-
         if p_ct > 0.50:
             return cfg["maneuver_detect_every"]
-
-        # 영상 불확실성이 크면 detector를 자주 호출
         if img_unc > 45.0:
             return 1
-
-        if p_cv > 0.75 and img_unc < 25.0:
-            return cfg["hover_detect_every"]
-
         return cfg["normal_detect_every"]
