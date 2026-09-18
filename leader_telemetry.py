@@ -220,9 +220,12 @@ def _get_any(d, names, default=None):
     return default
 
 
-_ALT_KEYS_AMSL = ["alt_msl", "alt_amsl"]
-_ALT_KEYS_ELLIPSOID = ["alt_ellipsoid", "alt_hae", "alt_wgs84"]
-_ALT_KEYS_DEFAULT = ["alt", "altitude", "alt_m"]
+# 고도 필드 후보 (우선순위 순). 프레임 None 은 수신기의 default_alt_frame 을 쓴다는 뜻.
+_ALT_FIELDS = (
+    (("alt_msl", "alt_amsl"), "AMSL"),
+    (("alt_ellipsoid", "alt_hae", "alt_wgs84"), "ELLIPSOID"),
+    (("alt", "altitude", "alt_m"), None),
+)
 
 
 def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[LeaderPacket]:
@@ -238,16 +241,12 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
 
         # 고도는 기준계를 함께 정한다. 이름이 명시된 필드가 우선이고,
         # 그냥 "alt"면 수신기 설정(default_alt_frame)을 따른다.
-        alt = _get_any(d, _ALT_KEYS_AMSL)
-        if alt is not None:
-            alt_frame = "AMSL"
-        else:
-            alt = _get_any(d, _ALT_KEYS_ELLIPSOID)
+        alt = alt_frame = None
+        for keys, frame in _ALT_FIELDS:
+            alt = _get_any(d, keys)
             if alt is not None:
-                alt_frame = "ELLIPSOID"
-            else:
-                alt = _get_any(d, _ALT_KEYS_DEFAULT)
-                alt_frame = str(default_alt_frame).upper()
+                alt_frame = frame or str(default_alt_frame).upper()
+                break
         alt = float(alt)
         if alt_frame not in ("AMSL", "ELLIPSOID"):
             raise ValueError(f"unknown alt frame {alt_frame}")
@@ -426,6 +425,10 @@ def _follower_vel_enu_from_mavlink(vehicle_state: Dict[str, Any]):
         return None
 
 
+def _unavailable(reason, age, fresh=True):
+    return {"available": False, "fresh": fresh, "age": age, "reason": reason}
+
+
 def build_leader_measurement_from_packet(
     packet: Optional[LeaderPacket],
     follower_vehicle_state: Dict[str, Any],
@@ -458,15 +461,8 @@ def build_leader_measurement_from_packet(
         return {"available": False, "reason": "no_leader_packet"}
 
     age = now - float(packet.rx_time)
-    fresh = age <= max_age_sec
-
-    if not fresh:
-        return {
-            "available": False,
-            "fresh": False,
-            "age": age,
-            "reason": "stale_leader_packet",
-        }
+    if age > max_age_sec:
+        return _unavailable("stale_leader_packet", age, fresh=False)
 
     # follower GPS는 GPS_RAW_INT보다 GLOBAL_POSITION_INT를 우선 사용
     follower_lla = normalize_lat_lon_alt_from_mavlink(
@@ -479,34 +475,19 @@ def build_leader_measurement_from_packet(
         )
 
     if follower_lla is None:
-        return {
-            "available": False,
-            "fresh": True,
-            "age": age,
-            "reason": "no_follower_gps",
-        }
+        return _unavailable("no_follower_gps", age)
 
     # 리더가 타원체고를 보내면 팔로워도 타원체고(GPS_RAW_INT.alt_ellipsoid)로 뺀다.
     # 해발과 타원체고를 섞으면 지오이드 차이가 그대로 상대 고도가 된다.
     if packet.alt_frame == "ELLIPSOID":
         f_alt_ell = _follower_alt_ellipsoid_m(follower_vehicle_state)
         if f_alt_ell is None:
-            return {
-                "available": False,
-                "fresh": True,
-                "age": age,
-                "reason": "no_follower_ellipsoid_alt",
-            }
+            return _unavailable("no_follower_ellipsoid_alt", age)
         follower_lla = (follower_lla[0], follower_lla[1], f_alt_ell)
 
     follower_yaw = get_follower_yaw(follower_vehicle_state)
     if follower_yaw is None:
-        return {
-            "available": False,
-            "fresh": True,
-            "age": age,
-            "reason": "no_follower_yaw",
-        }
+        return _unavailable("no_follower_yaw", age)
 
     f_lat, f_lon, f_alt = follower_lla
 
@@ -609,6 +590,7 @@ def apply_leader_velocity_hint_to_imm(ekf, rel_vel_cam, alpha=0.12, shrink_vel_c
         for f in ekf.filters:
             f.x[3:6] = (1.0 - alpha) * f.x[3:6] + alpha * rel_vel_cam[:3]
             f.P[3:6, 3:6] *= float(shrink_vel_cov)
+        ekf.mark_dirty()        # get_state() 캐시 무효화 — 상태를 직접 고쳤다
         return True
 
     except Exception:

@@ -19,7 +19,7 @@
 소스에서 이유를 찾습니다. C5가 그 사례입니다(아래).
 
 ```bash
-python3 test_fixes.py                        # 단위 86개, 하드웨어 불필요
+python3 test_fixes.py                        # 단위 96개, 하드웨어 불필요
 python3 sitl/harness.py --all                # SITL 8개 시나리오
 python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 ```
@@ -45,7 +45,7 @@ python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 
 ## 수정 완료 (2026-09-07)
 
-`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 86개). 하드웨어 없이 순수 로직만 검증합니다.
+`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 96개). 하드웨어 없이 순수 로직만 검증합니다.
 
 ### C1 — 부팅 즉시 FAILSAFE_LAND
 

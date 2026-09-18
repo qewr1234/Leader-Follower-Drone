@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C1~C6 + H2 회귀 테스트 — 단위 검사 86개.
+"""C1~C6 + H2 회귀 테스트 — 단위 검사 96개.
 
 하드웨어도 FC도 없이 순수 로직만 검증한다. cv2 / pymavlink / pyrealsense2 등은
 sys.modules에 최소 스텁을 넣어 main.py를 import 가능하게 만든다.
@@ -578,10 +578,13 @@ except Exception as e:
 finally:
     del _mavutil_stub.mavlink_connection
 _out = buf.getvalue()
-check("FC: 대기 메시지(10s, 20s) 출력 + 연결 후 data stream 4개 요청",
+# 쓰는 스트림(POSITION/EXTRA1/EXTENDED_STATUS)만 요청한다 — ALL(0) 을 요청하면 RAW_SENS/EXTRA2 까지
+# 매 프레임 파싱하게 된다.
+check("FC: 대기 메시지(10s, 20s) 출력 + 연결 후 필요한 data stream 3개만 요청 (ALL 제외)",
       "heartbeat 대기 중 (10s)" in _out and "heartbeat 대기 중 (20s)" in _out
-      and "connected" in _out and len(_fake_fc.stream_calls) == 4
-      and all(c[:2] == (1, 7) for c in _fake_fc.stream_calls),
+      and "connected" in _out and len(_fake_fc.stream_calls) == 3
+      and all(c[:2] == (1, 7) for c in _fake_fc.stream_calls)
+      and all(c[2] != 0 for c in _fake_fc.stream_calls),
       f"streams={len(_fake_fc.stream_calls)} out={_out.strip().splitlines()}")
 
 # ------------------------------------------------- ESP32 serial 부분 라인
@@ -720,6 +723,73 @@ check("ego-yaw: 팔로워 yaw 0.2 rad/s 가 CT omega 로 새지 않음 (|omega| 
       abs(_omega_with_ego_yaw(0.2)) < 0.02, f"omega={_omega_with_ego_yaw(0.2):+.3f}")
 check("ego-yaw: 반대 방향(-0.3 rad/s)도 동일", abs(_omega_with_ego_yaw(-0.3)) < 0.02,
       f"omega={_omega_with_ego_yaw(-0.3):+.3f}")
+
+# ------------------------------------------------- 2차 리팩토링 회귀
+# detector 후처리: boxes.data 행렬 → ROI 오프셋·클립·클래스 필터·정렬
+from detector import _postprocess  # noqa: E402
+
+_names = {0: "person", 1: "leader_drone"}
+_data = np2.array([
+    [10.0, 20.0, 50.0, 60.0, 0.30, 1],     # leader_drone, 작은 상자
+    [5.0, 5.0, 100.0, 100.0, 0.90, 0],     # person → 필터
+    [0.0, 0.0, 200.0, 150.0, 0.30, 1],     # leader_drone, 같은 conf 더 큰 면적 → 먼저
+    [-20.0, -20.0, 30.0, 30.0, 0.95, 1],   # 음수 좌표 → 클립
+])
+_dets = _postprocess(_data, 100, 50, 640, 480, _names, "leader_drone")
+check("detector: 대상 클래스만 남고 (conf, area) 내림차순", [d["conf"] for d in _dets] == [0.95, 0.30, 0.30]
+      and _dets[1]["area"] > _dets[2]["area"], f"{[(d['conf'], d['area']) for d in _dets]}")
+check("detector: ROI 오프셋 적용 + 클립", _dets[0]["bbox"] == (80, 30, 130, 80) and _dets[2]["bbox"] == (110, 70, 150, 110),
+      f"{[d['bbox'] for d in _dets]}")
+check("detector: dict 키", set(_dets[0]) == {"bbox", "conf", "cls", "name", "area"} and _dets[0]["name"] == "leader_drone")
+_d2 = YoloDetector(model=_FakeModel(), target_class_name="leader_drone")
+check("detector: predict 없는 스텁 모델도 생성·warmup 통과 (imgsz=config, classes id 역조회)",
+      _d2.imgsz == CONFIG["detector"]["imgsz"] and _d2.target_cls_id == 0 and _d2.warmup(640, 480) is None)
+
+# logger: flatten 결과가 이전과 같은가 (키 이름, ';' 조인, 6g 포맷, numpy 스칼라 변환)
+from logger import ExperimentLogger  # noqa: E402
+_row = {"a": 1, "b": {"c": np2.float64(1.5), "d": np2.int64(3), "e": np2.bool_(True), "f": None},
+        "g": [1, np2.float32(2.5), "x"], "h": np2.array([[1.23456789, 2.0]]), "i": (True, False), "s": "str", "z": 0.1}
+_flat = ExperimentLogger._flatten(_row)
+check("logger: 평탄화 결과 동일",
+      _flat == {"a": 1, "b.c": 1.5, "b.d": 3, "b.e": True, "b.f": None, "g": "1;2.5;x", "h": "1.23457;2", "i": "True;False", "s": "str", "z": 0.1}
+      and type(_flat["b.c"]) is float and type(_flat["b.d"]) is int and type(_flat["b.e"]) is bool, f"{_flat}")
+
+# measurement: 큰 ROI 서브샘플은 median 을 거의 바꾸지 않고, 작은 ROI 는 건드리지 않는다
+import measurement as _meas_mod  # noqa: E402
+_mb2 = MeasurementBuilder({"fx": 384.0, "fy": 384.0, "ppx": 320.0, "ppy": 240.0}, depth_scale=0.001)
+_rng = np2.random.default_rng(0)
+_dimg = (4000 + _rng.normal(0, 30, size=(480, 640))).astype(np2.uint16)
+_big = _mb2._depth_stats(_dimg, (100, 60, 500, 420))           # inner 220x198 > 20000px → 서브샘플
+_saved = _meas_mod.SUBSAMPLE_ABOVE_PX; _meas_mod.SUBSAMPLE_ABOVE_PX = 10**9
+_big_full = _mb2._depth_stats(_dimg, (100, 60, 500, 420))
+_meas_mod.SUBSAMPLE_ABOVE_PX = _saved
+check("measurement: 큰 ROI 서브샘플 전후 depth_m 차이 < 1cm",
+      abs(_big["depth_m"] - _big_full["depth_m"]) < 0.01 and _big["depth_valid_count"] * 3 < _big_full["depth_valid_count"],
+      f"sub={_big['depth_m']:.4f} full={_big_full['depth_m']:.4f} n={_big['depth_valid_count']}/{_big_full['depth_valid_count']}")
+_small = _mb2._depth_stats(_dimg, (300, 220, 390, 310))
+_meas_mod.SUBSAMPLE_ABOVE_PX = 10**9
+_small_full = _mb2._depth_stats(_dimg, (300, 220, 390, 310))
+_meas_mod.SUBSAMPLE_ABOVE_PX = _saved
+check("measurement: 90x90 ROI 는 서브샘플 없음 (정확히 같은 값)", _small == _small_full)
+
+# scheduler: hover 계층(p_cv>0.75) 삭제 — p_cv 가 아무리 커도 normal_detect_every 이상으로 건너뛰지 않는다
+from scheduler import PerceptionScheduler  # noqa: E402
+_de = PerceptionScheduler._choose_detect_period(img_unc=5.0, p_ct=0.05, lost_count=0, cfg=CONFIG["scheduler"])
+check("scheduler: 안정 상태 검출 주기 = normal_detect_every (hover 계층 없음)",
+      _de == CONFIG["scheduler"]["normal_detect_every"] and "hover_detect_every" not in CONFIG["scheduler"], f"detect_every={_de}")
+
+# imm_ekf: get_state() 캐시가 상태 변경(predict/update/compensate/속도 힌트) 뒤 갱신되는가
+from leader_telemetry import apply_leader_velocity_hint_to_imm  # noqa: E402
+ek3 = ImmEkf(); ek3.init([0.0, 0.0, 5.0])
+x0 = ek3.get_state()[0].copy()
+ek3.predict(0.1); x1 = ek3.get_state()[0].copy()
+ek3.update_position3d([0.2, 0.0, 5.0]); x2 = ek3.get_state()[0].copy()
+ek3.compensate_ego_yaw(0.1); x3 = ek3.get_state()[0].copy()
+apply_leader_velocity_hint_to_imm(ek3, [1.0, 0.0, 0.0], alpha=0.5); x4 = ek3.get_state()[0].copy()
+check("ekf: 캐시가 update/compensate/속도 힌트 뒤 갱신됨",
+      not np3.allclose(x1, x2) and not np3.allclose(x2, x3) and not np3.allclose(x3, x4) and abs(x4[3] - 0.5 * x3[3] - 0.5) < 1e-9,
+      f"vx: {x3[3]:.3f} → {x4[3]:.3f}")
+check("ekf: 같은 상태에서 두 번 부르면 같은 객체 (캐시 적중)", ek3.get_state()[0] is ek3.get_state()[0])
 
 # ---------------------------------------------------------------- 
 print()

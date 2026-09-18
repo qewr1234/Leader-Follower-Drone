@@ -5,10 +5,17 @@ MARS-IMM:
 Mode-Aware Reliability-Scheduled IMM Tracking
 """
 
+import os
+
+# 모델 파일 위치. 기체마다 다르면 환경변수로: MARS_MODEL_DIR=/path python3 main.py
+MODEL_DIR = os.environ.get("MARS_MODEL_DIR", "/home/dsl/DRONE")
+
 CONFIG = {
     "detector": {
-        "pt_model": "/home/dsl/DRONE/leader_drone_yolo11n.pt",
-        "trt_model": "/home/dsl/DRONE/leader_drone_yolo11n.engine",
+        "pt_model": os.path.join(MODEL_DIR, "leader_drone_yolo11n.pt"),
+        # 같은 Jetson 에서 `yolo export model=<pt> format=engine imgsz=416 half=True` 로 생성.
+        # 이 파일이 있으면 TensorRT, 없으면 .pt 로 폴백한다 (시작 로그 [YOLO] backend= 로 확인).
+        "trt_model": os.path.join(MODEL_DIR, "leader_drone_yolo11n.engine"),
         # 현재는 사람으로 실험 중. 드론 전환 시 "leader_drone"으로 변경.
         # (커스텀 모델(.pt/.engine)에 해당 클래스가 있어야 함)
         "target_class_name": "person",
@@ -52,7 +59,6 @@ CONFIG = {
         "max_roi_size": 640,
         "lost_full_frame_threshold": 5,
         "full_frame_interval": 20,
-        "hover_detect_every": 3,
         "normal_detect_every": 2,
         "maneuver_detect_every": 1,
     },
