@@ -271,9 +271,20 @@ def preflight(m):
     while time.time() - t0 < 90:
         msg = m.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=5)
         if msg and msg.relative_alt / 1000.0 >= ARGS.alt * 0.9:
-            log(f"preflight 완료: {msg.relative_alt / 1000.0:.1f}m, GUIDED")
+            break
+    else:
+        raise RuntimeError("이륙 실패 (고도 미도달)")
+
+    # 상승이 끝날 때까지 기다린다. 90% 고도에서 바로 main 을 띄우면 리더가 상승 전 고도에 고정된 채 팔로워만
+    # 더 올라가고, air_landing 처럼 리더가 내려가는 시나리오에서 수직 FOV(±32°)를 벗어나 소실 failsafe 가 난다
+    # (2026-09-18 WSL1 체인 실행에서 재현: 1.4m 상승 + 1.8m 하강 = 4.5m 앞에서 35°).
+    t0 = time.time()
+    while time.time() - t0 < 30:
+        msg = m.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=5)
+        if msg and abs(msg.relative_alt / 1000.0 - ARGS.alt) <= 0.5 and abs(msg.vz) <= 30:   # vz: cm/s
+            log(f"preflight 완료: {msg.relative_alt / 1000.0:.1f}m, GUIDED (상승 정착)")
             return
-    raise RuntimeError("이륙 실패 (고도 미도달)")
+    log(f"preflight: 상승 정착 대기 30s 초과 — 그대로 진행 ({msg.relative_alt / 1000.0 if msg else float('nan'):.1f}m)")
 
 
 # ----------------------------------------------------------------- 시나리오
@@ -396,7 +407,7 @@ def run_scenario(name):
 
             if t == "LOCAL_POSITION_NED":
                 front, _, _ = World.relative_fru()
-                ranges.append((now, front, -World.f_d))
+                ranges.append((now, front, -World.f_d, in_fov()))     # fov 는 그 시점 값을 기록 (출력 시점 값이 아니라)
 
             if t != "HEARTBEAT":
                 continue
@@ -546,8 +557,8 @@ def run_scenario(name):
 
     log(f"mode 이력: {[f'{t:.0f}s:{s}' for t, s in seen_modes]}")
     if os.environ.get("HARNESS_TRACE"):
-        for t, r, agl in ranges[::10]:
-            log(f"  t={t:5.1f}s front={r:5.2f}m agl={agl:5.1f}m fov={in_fov()}")
+        for t, r, agl, fov in ranges[::10]:
+            log(f"  t={t:5.1f}s front={r:5.2f}m agl={agl:5.1f}m fov={fov}")
 
     if name == "handover":
         if guided_at[0] is None:
@@ -569,9 +580,9 @@ def run_scenario(name):
 
     if name in ("depth_range", "hover_hold") and len(ranges) > 10:
         target = float(main.TARGET_DISTANCE_M)
-        settle = [r for t, r, _ in ranges if t > ARGS.duration * 0.6]
+        settle = [r for t, r, _, _ in ranges if t > ARGS.duration * 0.6]
         final = sum(settle) / len(settle) if settle else ranges[-1][1]
-        peak = max(r for _, r, _ in ranges)
+        peak = max(r for _, r, _, _ in ranges)
         log(f"리더까지 거리: 최대 {peak:.1f}m → 후반 평균 {final:.1f}m "
             f"(목표 {target:.1f}m)")
         if name == "depth_range":
