@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C1~C6 + H2 회귀 테스트 — 단위 검사 96개.
+"""C1~C6 + H2 회귀 테스트 — 단위 검사 97개.
 
 하드웨어도 FC도 없이 순수 로직만 검증한다. cv2 / pymavlink / pyrealsense2 등은
 sys.modules에 최소 스텁을 넣어 main.py를 import 가능하게 만든다.
@@ -744,6 +744,30 @@ check("detector: dict 키", set(_dets[0]) == {"bbox", "conf", "cls", "name", "ar
 _d2 = YoloDetector(model=_FakeModel(), target_class_name="leader_drone")
 check("detector: predict 없는 스텁 모델도 생성·warmup 통과 (imgsz=config, classes id 역조회)",
       _d2.imgsz == CONFIG["detector"]["imgsz"] and _d2.target_cls_id == 0 and _d2.warmup(640, 480) is None)
+
+
+# 회귀 방지: ultralytics Model.predict 는 {**overrides, **custom(conf=0.25), **kwargs} 로 병합하므로
+# conf 를 overrides 에만 넣으면 0.25 로 덮인다. conf 가 매 호출 kwargs 로 도달해야 한다.
+class _FakeUltraModel:
+    names = {0: "leader_drone"}
+
+    def __init__(self):
+        self.overrides = {}
+        self.calls = []
+
+    def predict(self, img, **kw):
+        self.calls.append(kw)
+        return []
+
+
+_fm = _FakeUltraModel()
+with contextlib.redirect_stdout(_io.StringIO()):
+    _d3 = YoloDetector(model=_fm, conf_thres=0.6, target_class_name="leader_drone")
+    _d3.detect(np2.zeros((48, 64, 3), dtype=np2.uint8))
+check("detector: conf/iou/imgsz/classes 가 overrides 가 아닌 predict kwargs 로 매 호출 전달 (conf 0.25 덮어쓰기 회피)",
+      len(_fm.calls) == 1 and _fm.calls[0].get("conf") == 0.6 and _fm.calls[0].get("classes") == [0]
+      and "iou" in _fm.calls[0] and "imgsz" in _fm.calls[0] and "conf" not in _fm.overrides,
+      f"calls={_fm.calls} overrides={_fm.overrides}")
 
 # logger: flatten 결과가 이전과 같은가 (키 이름, ';' 조인, 6g 포맷, numpy 스칼라 변환)
 from logger import ExperimentLogger  # noqa: E402

@@ -121,15 +121,12 @@ class YoloDetector:
                 print(f"[YOLO]    이대로 두면 검출이 영원히 0건입니다. config.py의 target_class_name을 고치세요.")
                 print("=" * 78)
 
-        # 바뀌지 않는 인자는 한 번만 넣는다 (매 호출 cfg 재병합 비용 제거). 스텁 모델이면 호출마다 넘긴다.
+        # 매 호출 kwargs 로 넘긴다. model.overrides 에 넣으면 ultralytics Model.predict 가
+        # {**overrides, **custom(conf=0.25), **kwargs} 로 병합해 conf 가 0.25 로 덮인다 — kwargs 만 살아남는다.
         self._static = dict(verbose=False, conf=self.conf_thres, iou=IOU_THRES, imgsz=self.imgsz, **self.predict_kwargs)
-        overrides = getattr(self.model, "overrides", None)
-        self._fixed = isinstance(overrides, dict)
-        if self._fixed:
-            overrides.update(self._static)
 
     def _predict_kwargs(self):
-        kw = {} if self._fixed else dict(self._static)
+        kw = dict(self._static)
         if self.target_cls_id is not None:
             kw["classes"] = [self.target_cls_id]      # NMS 단계에서 GPU 측 필터
         return kw
@@ -149,7 +146,7 @@ class YoloDetector:
         p = getattr(self.model, "predictor", None)
         m = getattr(p, "model", None)
         print(f"[YOLO] warm-up {time.time() - t0:.1f}s | backend={'TensorRT' if self.is_engine else 'PyTorch'} "
-              f"device={getattr(p, 'device', '?')} fp16={getattr(m, 'fp16', '?')} imgsz={self.imgsz}")
+              f"device={getattr(p, 'device', '?')} fp16={getattr(m, 'fp16', '?')} imgsz={self.imgsz} conf={self.conf_thres}")
 
     def detect(self, image, roi=None):
         H, W = image.shape[:2]

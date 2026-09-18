@@ -87,7 +87,7 @@ UNCERTAINTY_SLOWDOWN_TRACE = CONFIG["controller"].get("uncertainty_slowdown_trac
 SETPOINT_PERIOD_SEC = 0.10
 # C2: LAND 가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
 LAND_RETRY_SEC = 2.0
-CAM_FAIL_LIMIT = 30      # 카메라 프레임 연속 실패 한계 (약 CAM_FAIL_LIMIT/FPS 초)
+CAM_FAIL_LIMIT = 30      # 카메라 연속 실패 한계. 스톨 1회 = camera 타임아웃 0.5s 라 약 15초 뒤 포기 (그동안 FC 의 GUID_TIMEOUT 이 먼저 든다)
 FC_FAIL_LIMIT = 30       # FC 링크(drain) 연속 예외 한계
 MIN_AGL_M = 1.5          # 이 고도(AGL) 아래에서는 하강 명령을 내지 않는다
 
@@ -259,7 +259,9 @@ ESP_IDLE = {"esp_update_used": "none", "esp_vel_hint_used": False, "esp_gate_d2"
 
 
 def fuse_esp32(ekf, rel, leader_meas):
-    """ESP32 GPS 상대위치를 게이트 후 위치 업데이트(source='gps'), 상대속도는 약한 힌트로."""
+    """ESP32 GPS 상대위치를 게이트 후 위치 업데이트(source='gps'), 상대속도는 약한 힌트로.
+    새 패킷일 때만 불린다 — 위치뿐 아니라 속도 힌트(alpha 0.10, P 수축 0.98)도 패킷 주기(5~10Hz)로 적용되므로
+    실효 시정수는 프레임당 적용이던 때보다 길다. 같은 관측을 매 프레임 되풀이하는 것보다 이쪽이 맞다."""
     z_esp = np.asarray(leader_meas["rel_cam"], dtype=float)
     age = float(leader_meas.get("age", 999.0))
     r_esp_time = float(np.exp(-age / max(LEADER_MAX_AGE_SEC, 1e-6)))
@@ -470,17 +472,16 @@ def main():
             # ---------------- 카메라 (예외·None 은 드롭, 연속 실패면 포기) ----------------
             try:
                 color_image, depth_image = cam.get_frames()
-                cam_fail_streak = 0
             except Exception as exc:
+                color_image, depth_image = None, None
+                print(f"[WARN] 카메라 프레임 실패 {cam_fail_streak + 1}회: {type(exc).__name__}: {exc}")
+            if color_image is None:          # 예외도, 컬러/깊이 결손(None)도 같은 드롭 — 둘 다 연속 실패로 센다
                 cam_fail_streak += 1
-                print(f"[WARN] 카메라 프레임 실패 {cam_fail_streak}회: {type(exc).__name__}: {exc}")
                 if cam_fail_streak >= CAM_FAIL_LIMIT:
                     print(f"[ERR] 카메라 연속 실패 {CAM_FAIL_LIMIT}회 — 종료")
                     break
                 continue
-            if color_image is None:
-                print("[WARN] frame dropped")
-                continue
+            cam_fail_streak = 0
 
             prev_time = now
             frame_idx += 1
