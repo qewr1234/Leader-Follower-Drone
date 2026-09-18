@@ -23,3 +23,9 @@ python3 -c "import xml.dom.minidom as m; m.parse('docs/images/architecture.svg')
 그림이 실제로 어떻게 보이는지는 브라우저로 SVG 파일을 직접 열어보면 됩니다.
 GitHub 본문 폭(약 860px)으로 줄어들어도 읽히도록 글자 크기를 잡아뒀으니,
 텍스트를 크게 늘릴 때는 그 폭에서 확인하는 편이 좋습니다.
+
+## 안정성 분석 그림 (`stability_*.png`)
+
+`python3 analysis/stability_margins.py --plots` 가 생성합니다(손으로 고치지 않음). 보드 선도(`stability_bode_forward`),
+스트링 안정성(`stability_string`), 4단 체인 응답(`stability_chain_step`), FC 시정수·지연 강건성(`stability_robustness`),
+IMM-EKF 실측 주파수응답(`stability_ekf_frf`). 설명은 [../STABILITY_MARGINS.md](../STABILITY_MARGINS.md).
