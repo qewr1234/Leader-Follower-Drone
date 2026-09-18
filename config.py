@@ -73,6 +73,12 @@ CONFIG = {
     },
     "controller": {
         "uncertainty_slowdown_trace": 4.0,
+        # 리더 속도 피드포워드: cmd = KFF·v_leader + Kp·e + Kd·v_rel.
+        # 없으면 정상상태 거리 오차 = v_leader/Kp (0.3m/s→1.4m, 1m/s→4.5m 로 깊이창 10m 밖으로 밀려 소실).
+        # KFF<1 로 두는 이유는 EKF 속도 지연을 통한 자기 속도 양성 되먹임의 이득 여유 (main.leader_velocity_ff 주석).
+        "leader_vel_ff_gain": 0.8,
+        "leader_vel_ff_tau_sec": 0.7,        # 피드포워드 1차 저역통과 시정수
+        "leader_vel_ff_deadband_mps": 0.10,  # 이 아래 리더 속도는 0, 2배까지 선형 램프 (호버 중 추정 잡음으로 기어가지 않게)
     },
     "logger": {
         "enabled": True,

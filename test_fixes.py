@@ -930,6 +930,53 @@ check("camera: ROI 설정 실패는 예외 없이 False, 1초 뒤 재시도해 �
 _cam3 = _camera.D435i()
 check("camera: 컬러 센서 없으면(하네스) set_exposure_roi 는 조용히 False", _cam3.set_exposure_roi((0, 0, 10, 10), 0.0) is False)
 
+# ------------------------------------------------- 리더 속도 피드포워드
+_kff = main.KFF_LEADER_VEL
+_c0 = main.compute_velocity_cmd_from_estimate([3.0, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0)
+_c1 = main.compute_velocity_cmd_from_estimate([3.0, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0, None, [0.3, 0.1, 0.05])
+check("FF: 목표 거리(오차 0)에서 리더 속도만큼 명령 KFF·v — FRU up 은 BODY_NED vz 부호 반전, 인자 없으면 기존과 동일(0)",
+      np3.allclose(_c0[:3], 0.0) and abs(_c1[0] - _kff * 0.3) < 1e-9 and abs(_c1[1] - _kff * 0.1) < 1e-9
+      and abs(_c1[2] + _kff * 0.05) < 1e-9, f"cmd={_c1.round(3)}")
+_vf = main.follower_velocity_fru({"local_position": {"vx": 1.0, "vy": 0.0, "vz": -0.2}, "attitude": {"yaw": _math.pi / 2}})
+check("FF: 자기 속도 NED→FRU (동쪽을 보며 북진 = 좌측 이동, vz 부호 반전), 값 없으면 None",
+      np3.allclose(_vf, [0.0, -1.0, 0.2], atol=1e-12) and main.follower_velocity_fru({"local_position": {}, "attitude": {}}) is None,
+      f"fru={_vf.round(3)}")
+_db = main.FF_DEADBAND_MPS
+_f_small = main.leader_velocity_ff([0, 0, 0], [0.5 * _db, 0, 0], 100.0)
+_f_half = main.leader_velocity_ff([0, 0, 0], [1.5 * _db, 0, 0], 100.0)
+_f_tau = main.leader_velocity_ff([0, 0, 0], [0.3, 0, 0], main.FF_TAU_SEC)
+_f_none = main.leader_velocity_ff([0.3, 0, 0], None, 100.0)
+check("FF: 데드밴드(0.5·db→0, 1.5·db→절반 램프), 시정수 τ 에서 63%, None 이면 0 으로 감쇠",
+      _f_small[0] == 0.0 and abs(_f_half[0] - 0.75 * _db) < 1e-9 and abs(_f_tau[0] - 0.3 * (1 - _math.exp(-1))) < 1e-9
+      and abs(_f_none[0]) < 1e-9, f"{_f_small[0]:.3f} {_f_half[0]:.3f} {_f_tau[0]:.3f} {_f_none[0]:.3f}")
+
+
+def _sim_1d(kff, v_l=0.3, tau_fc=0.3, delta_ekf=1.0, T=40.0):
+    """1축 폐루프: FC 속도루프 1차 지연 τ, EKF 상대속도 1차 지연 δ(최악 1s), 리더 v_l 등속. (정상상태 오차, 최대 |오차|) 반환."""
+    saved = main.KFF_LEADER_VEL; main.KFF_LEADER_VEL = kff
+    dt = 1 / 30; front, v_f, v_rel_est = 3.0, 0.0, 0.0; ff = np3.zeros(3); cmd = np3.zeros(4); e_max = 0.0
+    try:
+        for _ in range(int(T / dt)):
+            v_rel = v_l - v_f
+            v_rel_est += (v_rel - v_rel_est) * (dt / delta_ekf)
+            ff = main.leader_velocity_ff(ff, [v_f + v_rel_est, 0.0, 0.0], dt)
+            u = main.compute_velocity_cmd_from_estimate([front, 0, 0], [v_rel_est, 0, 0], 1.0, None, ff)
+            cmd = main.smooth_velocity_cmd(cmd, u, alpha=0.28, dt=dt)
+            v_f += (cmd[0] - v_f) * (dt / tau_fc)
+            front += v_rel * dt
+            e_max = max(e_max, abs(front - 3.0))
+    finally:
+        main.KFF_LEADER_VEL = saved
+    return front - 3.0, e_max
+
+
+_e_ff, _emax_ff = _sim_1d(_kff)
+_e_p, _ = _sim_1d(0.0)
+_e_theory_ff, _e_theory_p = (1 - _kff) * 0.3 / main.KP_FORWARD, 0.3 / main.KP_FORWARD
+check("FF: 1축 폐루프(FC τ=0.3s, EKF 지연 1s) 정상상태 오차 = (1-KFF)·v/Kp, P 만이면 v/Kp — 발산·진동 없음",
+      abs(_e_ff - _e_theory_ff) < 0.05 and abs(_e_p - _e_theory_p) < 0.05 and _emax_ff < 1.0,
+      f"ff={_e_ff:.2f}m(이론 {_e_theory_ff:.2f}) p={_e_p:.2f}m(이론 {_e_theory_p:.2f}) max|e|={_emax_ff:.2f}")
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "
