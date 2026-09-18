@@ -977,6 +977,26 @@ check("FF: 1축 폐루프(FC τ=0.3s, EKF 지연 1s) 정상상태 오차 = (1-KF
       abs(_e_ff - _e_theory_ff) < 0.05 and abs(_e_p - _e_theory_p) < 0.05 and _emax_ff < 1.0,
       f"ff={_e_ff:.2f}m(이론 {_e_theory_ff:.2f}) p={_e_p:.2f}m(이론 {_e_theory_p:.2f}) max|e|={_emax_ff:.2f}")
 
+# ------------------------------------------------- 미션: 리더 절대 속도(자기 속도 + 상대 속도) 기준
+_mv = dict(rel_est=[3.0, 0.0, 0.0], leader_alt=50.0, pos_cov_trace=1.0)
+m20 = MissionManager(); t = 0.0
+for _ in range(12):                              # 리더 출발 → FOLLOW 확정
+    st, _ = m20.update(now=t, leader_visible=True, rel_vel_est=[0.3, 0, 0], leader_vel_body=[0.3, 0, 0], **_mv); t += 0.1
+check("미션: 출발 확인 후 FOLLOW", st == S_FOLLOW, f"state={st}")
+st, _ = m20.update(now=t, leader_visible=True, rel_vel_est=[0.0, 0, 0], leader_vel_body=[0.3, 0, 0], **_mv); t += 0.1
+check("미션: 따라잡아 상대 속도 0 이어도 리더 절대 속도 0.3 이면 FOLLOW 유지", st == S_FOLLOW, f"state={st}")
+st, _ = m20.update(now=t, leader_visible=True, rel_vel_est=[-0.3, 0, 0], leader_vel_body=[0.0, 0, 0], **_mv); t += 0.1
+check("미션: 리더 정지(후미는 아직 이동, 상대 -0.3) → 절대 속도 0 이라 LEADER_HOVER", st == S_LEADER_HOVER, f"state={st}")
+st, _ = m20.update(now=t, leader_visible=True, rel_vel_est=[0.5, 0, 0], leader_vel_body=[0.5, 0, 0], leader_vel_world=[0.0, 0, 0], **_mv); t += 0.1
+check("미션: ESP32 절대 속도가 있으면 최우선 (0 → LEADER_HOVER 유지)", st == S_LEADER_HOVER, f"state={st}")
+st, _ = m20.update(now=t, leader_visible=True, rel_vel_est=[0.5, 0, 0], **_mv); t += 0.1
+check("미션: 둘 다 없으면 상대 속도 폴백 (0.5 → FOLLOW)", st == S_FOLLOW, f"state={st}")
+m21 = MissionManager(); t = 0.0
+for _ in range(25):                              # 후미가 하강 중이면 상대 vz 는 +, 리더 절대 vz 는 -0.5 (진짜 착륙)
+    st, p = m21.update(now=t, leader_visible=True, rel_est=[3.0, 0, 0], rel_vel_est=[0.0, 0, +0.3],
+                       leader_vel_body=[0.0, 0, -0.5], leader_alt=0.3, pos_cov_trace=1.0); t += 0.1
+check("미션: 착륙 판정도 절대 vz 로 (상대 vz 가 + 여도 리더가 하강하면 CONFIRMED_LANDING)", p["land"] is True, f"state={st}")
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "

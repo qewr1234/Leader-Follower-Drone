@@ -65,13 +65,16 @@ class MissionManager:
         self.has_followed = False
 
     def update(self, now, leader_visible, rel_est=None, rel_vel_est=None,
-               leader_alt=None, leader_vel_world=None, pos_cov_trace=999.0):
+               leader_alt=None, leader_vel_world=None, pos_cov_trace=999.0, leader_vel_body=None):
         """
         - leader_visible: 거리를 아는가 (RGB-D 또는 ESP32) — main 이 ekf.has_range_fix() 로 준다
         - rel_est / rel_vel_est: 후미 기준 선두 상대 위치·속도 [front, right, up]
         - leader_alt: 선두 절대(대지) 고도. None 이면 착륙 판정을 하지 않는다 (C3)
-        - leader_vel_world: ESP32/GPS 선두 절대 속도 (있으면 상대속도 대신 이걸로 출발/착륙 판단)
+        - leader_vel_world: ESP32/GPS 선두 절대 속도 ENU (있으면 최우선)
+        - leader_vel_body: 선두 절대 속도 FRU = 후미 자기 속도(FC) + 상대 속도(EKF). ESP32 가 없을 때의 기본 소스.
+          상대 속도만 쓰면 후미가 선두 속도를 맞추는 순간 0 이 되어 '선두 정지' 로 오판한다.
         - pos_cov_trace: IMM 위치 공분산 trace
+        상대 속도(rel_vel_est)는 위 둘이 모두 없을 때(자기 속도 미수신)의 폴백이다.
         """
         if not leader_visible:
             # 가림 중에는 확인 타이머를 끊는다. 남겨 두면 가려진 시간이 타이머에 합산돼
@@ -84,7 +87,7 @@ class MissionManager:
             return self._go(S_LOST_HOLD if lost < self.lost_hold_sec else S_FAILSAFE_LAND)
 
         self.last_seen_t = now
-        hspeed, vz, z_for_landing = self._extract_motion(rel_vel_est, leader_alt, leader_vel_world)
+        hspeed, vz, z_for_landing = self._extract_motion(rel_vel_est, leader_alt, leader_vel_world, leader_vel_body)
 
         # 추정 불확실성이 너무 크면 FOLLOW 금지
         if pos_cov_trace > 8.0:
@@ -117,8 +120,8 @@ class MissionManager:
                 self.start_candidate_t = now
             return self._go(S_FOLLOW if now - self.start_candidate_t >= self.start_confirm_sec else S_READY_HOVER)
 
-        # FOLLOW ↔ LEADER_HOVER 히스테리시스 (진입 0.18, 복귀 0.25 m/s). 둘 다 allow_follow 라
-        # '따라잡아서 상대속도가 준 것'과 '리더가 멈춘 것'을 혼동해도 제어는 끊기지 않는다.
+        # FOLLOW ↔ LEADER_HOVER 히스테리시스 (진입 0.18, 복귀 0.25 m/s). 선두 절대 속도 기준이라 따라잡아서
+        # 상대속도가 줄어도 FOLLOW 가 유지된다. 둘 다 allow_follow 라 폴백(상대 속도)으로 오판해도 제어는 안 끊긴다.
         if self.state in (S_FOLLOW, S_LEADER_HOVER):
             if self.state == S_FOLLOW and hspeed < self.hover_speed_thresh:
                 return self._go(S_LEADER_HOVER)
@@ -127,7 +130,7 @@ class MissionManager:
             return self._go(self.state)
 
         # 잠깐 놓쳤다가(LOST_HOLD) 또는 착륙 후보가 풀려서(LANDING_CANDIDATE) 온 경우, 이미 추종하던
-        # 리더라면 바로 재개한다 — READY_HOVER 로 떨어뜨리면 hspeed(상대속도)가 0 인 호버 리더에게는
+        # 리더라면 바로 재개한다 — READY_HOVER 로 떨어뜨리면 hspeed 가 0 인 호버 리더에게는
         # 영원히 돌아가지 못하고, yaw 제어도 멈춘 채 시야 이탈 → 소실 착륙으로 간다.
         # FAILSAFE_LAND / CONFIRMED_LANDING 에서 온 경우는 READY_HOVER — 착륙 명령 뒤에는 출발 확인을 다시.
         if self.has_followed and self.state in (S_LOST_HOLD, S_LANDING_CANDIDATE):
@@ -138,9 +141,9 @@ class MissionManager:
     def command_policy(self):
         return dict(_POLICY.get(self.state, _POLICY_UNKNOWN))
 
-    def _extract_motion(self, rel_vel_est, leader_alt, leader_vel_world):
-        """(수평 속도, 수직 속도(up +), 착륙 판정용 고도). 선두 절대 속도가 있으면 그것을, 없으면 상대속도."""
-        v = leader_vel_world if leader_vel_world is not None else rel_vel_est
+    def _extract_motion(self, rel_vel_est, leader_alt, leader_vel_world, leader_vel_body=None):
+        """(수평 속도, 수직 속도(up +), 착륙 판정용 고도). 속도 소스 우선순위: ESP32 절대(ENU) > 자기+상대(FRU) > 상대."""
+        v = leader_vel_world if leader_vel_world is not None else (leader_vel_body if leader_vel_body is not None else rel_vel_est)
         hspeed = vz = 0.0
         if v is not None:
             v = np.asarray(v, dtype=float)

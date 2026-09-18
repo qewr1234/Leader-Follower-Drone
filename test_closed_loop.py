@@ -364,6 +364,9 @@ _dmin = min(d for t, d in World.dist if 11.0 <= t <= 16.0)
 check("FOLLOW 중(리더 0.3m/s, t=10.5s) 거리 오차 < 0.7m — 피드포워드 (KFF=0 이면 +1.15m, 정상상태 v/Kp=1.36m)",
       abs(_e105) < 0.7, f"front-target={_e105:+.2f}m")
 check("리더 정지 후 최소 접근 거리 ≥ 2.3m (피드포워드 오버슈트 없음)", _dmin >= 2.3, f"min={_dmin:.2f}m")
+check("추종 중(t=8s) 상태는 FOLLOW — 리더 절대 속도 기준 (상대 속도면 따라잡는 순간 LEADER_HOVER 로 오판)",
+      state_at(8.0) == "FOLLOW", f"{state_at(8.0)}")
+check("리더 정지(11s) 후 2.5s 안에 LEADER_HOVER", state_at(13.5) == "LEADER_HOVER", f"{state_at(13.5)}")
 t_lost = first_time("LOST_HOLD", 16.0)
 check("4초 소실 → 2초 코스팅 뒤 LOST_HOLD", t_lost is not None and 17.8 <= t_lost <= 18.6, f"t={t_lost}")
 t_resume = None

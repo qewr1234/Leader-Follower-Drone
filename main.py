@@ -621,20 +621,25 @@ def main():
             vision_range_ok = bool(ekf.has_vision_range_fix())
             target_distance_m = TARGET_DISTANCE_M if vision_range_ok else TARGET_DISTANCE_GPS_ONLY_M
 
-            mission_state, mission_policy = mission.update(
-                now=now, leader_visible=leader_visible_for_mission,
-                rel_est=rel_fru if ekf.initialized else None, rel_vel_est=rel_vel_fru if ekf.initialized else None,
-                leader_alt=leader_alt_est, leader_vel_world=leader_vel_world, pos_cov_trace=pos_cov_trace)
-
-            # ---------------- 명령 ----------------
-            # 리더 속도 피드포워드: 자기 속도(FC)·자세가 신선하고 EKF 가 거리를 아는 추종 상태에서만. 아니면 0 으로 감쇠.
+            # 리더 절대 속도(FRU) = FC 자기 속도 + EKF 상대 속도. 미션(출발/정지/착륙 판단)과 피드포워드가 같이 쓴다.
+            # 상대 속도만 보면 후미가 선두 속도를 맞추는 순간 0 이 되어 '선두 정지' 로 오판한다. 자기 속도·자세가
+            # 신선하고 EKF 가 신뢰할 수 있을 때만 만들고, 없으면 미션은 상대 속도로 폴백한다.
             v_leader_fru = None
-            if mission_policy["allow_follow"] and ekf.initialized and ekf.is_reliable() and ekf.has_range_fix() \
-                    and local_pos_fresh and attitude_fresh:
+            if ekf.initialized and ekf.is_reliable() and local_pos_fresh and attitude_fresh:
                 v_f = follower_velocity_fru(vehicle_state)
                 if v_f is not None:
                     v_leader_fru = v_f + rel_vel_fru
-            ff_fru = leader_velocity_ff(ff_fru, v_leader_fru, dt)
+
+            mission_state, mission_policy = mission.update(
+                now=now, leader_visible=leader_visible_for_mission,
+                rel_est=rel_fru if ekf.initialized else None, rel_vel_est=rel_vel_fru if ekf.initialized else None,
+                leader_alt=leader_alt_est, leader_vel_world=leader_vel_world, pos_cov_trace=pos_cov_trace,
+                leader_vel_body=v_leader_fru)
+
+            # ---------------- 명령 ----------------
+            # 리더 속도 피드포워드: 거리를 아는 추종 상태에서만. 아니면 0 으로 감쇠.
+            ff_fru = leader_velocity_ff(
+                ff_fru, v_leader_fru if (mission_policy["allow_follow"] and ekf.has_range_fix()) else None, dt)
 
             desired_body_cmd = np.zeros(4)
             if mission_policy["land"]:
