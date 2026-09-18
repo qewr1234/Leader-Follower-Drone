@@ -275,27 +275,38 @@ class ImmEkf:
     def on_lost(self, dt):
         self.coast_time += float(dt)
 
-    def compensate_ego_yaw(self, dpsi):
-        """후미 기체가 dpsi(rad, 우회전 +)만큼 yaw했을 때 카메라 프레임 기준 상대상태를 역회전.
+    def compensate_ego_rotation(self, T):
+        """팔로워 자세(roll/pitch/yaw)가 바뀌어 카메라 프레임이 돌았을 때 상대상태를 역회전.
 
-        yaw 우회전 시 타겟은 카메라 프레임에서 왼쪽으로 이동:
-            [x'; z'] = [[cos, -sin], [sin, cos]] @ [x; z]   (x=right, z=forward)
+        T: 3x3, 이전 카메라 프레임 좌표 → 현재 카메라 프레임 좌표. 위치·속도에 같은 회전을 적용하고
+        P 도 함께 돌린다(ω×r 항은 무시 — 프레임 간격 33ms 에서 mm 수준). CT 필터의 직전 진행 방향각도
+        같이 옮긴다 — 안 옮기면 팔로워 자신의 회전이 omega 로 샌다.
         """
-        if not self.initialized or abs(float(dpsi)) < 1e-6:
+        if not self.initialized:
             return
-        c, s = np.cos(dpsi), np.sin(dpsi)
-        G = np.eye(6)
-        G[0, 0] = G[2, 2] = G[3, 3] = G[5, 5] = c
-        G[0, 2] = G[3, 5] = -s
-        G[2, 0] = G[5, 3] = s
+        T = np.asarray(T, dtype=float)
+        if np.abs(T - np.eye(3)).max() < 1e-9:
+            return
+        G = np.zeros((6, 6))
+        G[:3, :3] = T
+        G[3:, 3:] = T
         for f in self.filters:
+            h0 = np.arctan2(f.x[5], f.x[3]) if f._prev_heading is not None else None
             f.x = G @ f.x
             f.P = G @ f.P @ G.T
-            # CT 필터의 회전율은 진행 방향각의 변화로 추정한다. 속도를 dpsi 만큼 돌렸으니
-            # 직전 방향각도 같이 돌려야 팔로워 자신의 yaw rate 가 omega 로 새지 않는다.
-            if f._prev_heading is not None:
-                f._prev_heading = _wrap(f._prev_heading + dpsi)
+            if h0 is not None:
+                # 진행 방향각(x-z 평면 투영)이 이 회전으로 얼마나 변했는지를 직전 방향각에도 더한다.
+                # 순수 yaw 면 정확히 dpsi. roll/pitch 로 y 성분이 섞이면 투영각 변화가 dpsi 와 달라
+                # 단위벡터를 돌리는 방식으로는 omega 가 샌다.
+                f._prev_heading = _wrap(f._prev_heading + _wrap(np.arctan2(f.x[5], f.x[3]) - h0))
         self._fused = None
+
+    def compensate_ego_yaw(self, dpsi):
+        """yaw 만 바뀐 경우(우회전 +). 타겟은 카메라 프레임에서 왼쪽으로: [x'; z'] = [[c,-s],[s,c]] @ [x; z]."""
+        if abs(float(dpsi)) < 1e-6:
+            return
+        c, s = np.cos(dpsi), np.sin(dpsi)
+        self.compensate_ego_rotation([[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]])
 
     def get_state(self):
         if not self.initialized:
