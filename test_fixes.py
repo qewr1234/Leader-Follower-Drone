@@ -530,6 +530,22 @@ check("HB: 같은 시스템의 다른 컴포넌트 heartbeat는 무시",
       mavlink_io.get_vehicle_state()["mode"]["name"] == "GUIDED",
       f"mode={mavlink_io.get_vehicle_state()['mode']['name']}")
 mavlink_io.drain_messages(_Master([_HB(255, 190, "LOITER", mav_type=6)]))     # GCS
+
+
+class _Master0(_Master):
+    """pymavlink 2.4.4x 실제 동작: heartbeat 뒤에도 target_component 가 0 (SITL 에서 FC=? 로 재현됨)."""
+    target_system, target_component = 1, 0
+
+
+_m0 = _Master0([_HB(1, 1, "LOITER")])
+mavlink_io.drain_messages(_m0)
+check("HB: target_component=0 (pymavlink 2.4.4x) 이어도 FC heartbeat 를 받아들이고 컴포넌트를 1 로 고정",
+      mavlink_io.get_vehicle_state()["mode"]["name"] == "LOITER" and _m0.target_component == 1,
+      f"mode={mavlink_io.get_vehicle_state()['mode']['name']} comp={_m0.target_component}")
+_hb_cam = _HB(1, 100, "Mode(0)", mav_type=2); _hb_cam.autopilot = 8          # 카메라: autopilot INVALID
+mavlink_io.drain_messages(_Master0([_hb_cam]))
+check("HB: target_component=0 이어도 autopilot=INVALID 인 컴포넌트는 무시", mavlink_io.get_vehicle_state()["mode"]["name"] == "LOITER")
+mavlink_io.drain_messages(_Master([_HB(1, 1, "GUIDED")]))                    # 다음 검사들의 전제 복원
 check("HB: GCS heartbeat는 무시 (기존 동작 유지)",
       mavlink_io.get_vehicle_state()["mode"]["name"] == "GUIDED")
 

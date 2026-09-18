@@ -26,6 +26,33 @@ _STATE_FIELDS = {
     "ATTITUDE": ("attitude", ("roll", "pitch", "yaw", "rollspeed", "pitchspeed", "yawspeed")),
 }
 
+# 기체가 아닌 heartbeat 발신자(규격 고정값. 테스트 스텁에 없을 수 있어 기본값을 둔다).
+_NON_VEHICLE_TYPES = frozenset(getattr(mavutil.mavlink, n, d) for n, d in (
+    ("MAV_TYPE_GCS", 6), ("MAV_TYPE_ONBOARD_CONTROLLER", 18), ("MAV_TYPE_GIMBAL", 26), ("MAV_TYPE_ADSB", 27)))
+_AUTOPILOT_INVALID = getattr(mavutil.mavlink, "MAV_AUTOPILOT_INVALID", 8)
+_COMP_GIMBAL = getattr(mavutil.mavlink, "MAV_COMP_ID_GIMBAL", 154)
+
+
+def is_fc_heartbeat(master, msg):
+    """FC 본체(autopilot)의 heartbeat 인가.
+
+    pymavlink 2.4.4x 는 heartbeat 로 target_system 만 잠그고 target_component 는 0 으로 둔다. 컴포넌트 ID
+    일치를 요구하면 FC heartbeat 를 전부 버려 모드가 '?' 로 남고 setpoint 송신이 막힌다 (SITL 에서 재현).
+    그래서 같은 시스템 + 기체형(GCS/짐벌/ADSB/온보드 아님) + autopilot 유효로 판별하고, 처음 받아들인
+    컴포넌트를 master.target_component 에 고정해 이후 다른 컴포넌트(카메라·라우터)가 섞이지 않게 한다."""
+    if msg.get_srcSystem() != master.target_system:
+        return False
+    comp = msg.get_srcComponent()
+    if master.target_component not in (0, comp) or comp == _COMP_GIMBAL:
+        return False
+    if getattr(msg, "type", None) in _NON_VEHICLE_TYPES or getattr(msg, "autopilot", None) == _AUTOPILOT_INVALID:
+        return False
+    if master.target_component == 0:
+        master.target_component = comp
+        print(f"[FC] autopilot component={comp} 로 고정")
+    return True
+
+
 _vehicle_state = {
     "gps": {},
     "global_position": {},
@@ -82,9 +109,7 @@ def drain_messages(master):
             # 컴포넌트(짐벌, 카메라, mavlink-router)의 heartbeat 가 섞여 모드 문자열이 왕복하고,
             # main 의 GUIDED 진입 에지가 매번 발동해 미션이 계속 리셋된다.
             try:
-                if (msg.get_srcSystem() == master.target_system
-                        and msg.get_srcComponent() == master.target_component
-                        and msg.type != mavutil.mavlink.MAV_TYPE_GCS):
+                if is_fc_heartbeat(master, msg):
                     _vehicle_state["mode"] = {
                         "name": mavutil.mode_string_v10(msg),
                         "armed": bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED),
