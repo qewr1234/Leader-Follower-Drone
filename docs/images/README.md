@@ -29,3 +29,12 @@ GitHub 본문 폭(약 860px)으로 줄어들어도 읽히도록 글자 크기를
 `python3 analysis/stability_margins.py --plots` 가 생성합니다(손으로 고치지 않음). 보드 선도(`stability_bode_forward`),
 스트링 안정성(`stability_string`), 4단 체인 응답(`stability_chain_step`), FC 시정수·지연 강건성(`stability_robustness`),
 IMM-EKF 실측 주파수응답(`stability_ekf_frf`). 설명은 [../STABILITY_MARGINS.md](../STABILITY_MARGINS.md).
+
+## README 그림 (`readme_*.png`)
+
+```bash
+python3 test_closed_loop.py --dump /tmp/cl.json
+python3 analysis/readme_figures.py --closed-loop /tmp/cl.json
+```
+`readme_string_stability.png`(선형 모델 곡선 + SITL 실측점), `readme_closed_loop.png`(폐루프 40초 타임라인). SITL 실측값은
+스크립트 상단 `SITL` 상수에 있으니 재실측하면 거기를 고칩니다. 그림 안 글자는 영어(컨테이너에 한글 폰트 없음).
