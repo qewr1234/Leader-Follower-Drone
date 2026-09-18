@@ -761,7 +761,9 @@ def main():
                 time.sleep(0.1)
         except Exception as exc:
             print(f"[WARN] hold send failed: {exc}")
-        for closer in ((leader_rx.close if leader_rx is not None else None), cam.stop):
+        # FC 소켓도 닫는다. 안 닫으면 udpin 포트를 계속 쥐고 있어 같은 프로세스에서 다시 연결할 때(SITL 하네스가
+        # 시나리오마다 main 을 재실행) 새 소켓이 패킷을 못 받아 heartbeat 를 영원히 기다린다.
+        for closer in ((leader_rx.close if leader_rx is not None else None), cam.stop, getattr(master, "close", None)):
             try:
                 if closer:
                     closer()
