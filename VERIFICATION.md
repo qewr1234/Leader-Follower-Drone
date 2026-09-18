@@ -19,7 +19,7 @@
 소스에서 이유를 찾습니다. C5가 그 사례입니다(아래).
 
 ```bash
-python3 test_fixes.py                        # 단위 119개, 하드웨어 불필요
+python3 test_fixes.py                        # 단위 123개, 하드웨어 불필요
 python3 sitl/harness.py --all                # SITL 8개 시나리오
 python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 ```
@@ -45,7 +45,7 @@ python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 
 ## 수정 완료 (2026-09-07)
 
-`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 119개). 하드웨어 없이 순수 로직만 검증합니다.
+`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 123개). 하드웨어 없이 순수 로직만 검증합니다.
 
 ### C1 — 부팅 즉시 FAILSAFE_LAND
 
@@ -225,6 +225,21 @@ ArduCopter SITL에서 재검증해 통과를 확인했습니다.
 
 **GUIDED 인계 LAND는 C1 수정의 사각지대였습니다.** C1 가드는 "리더를 한 번도 못 봄"만 막고,
 "보다가 상승 중에 놓침"은 막지 못했습니다. 이 저장소의 계획된 운용 절차에서 100% 발생합니다.
+
+## SITL 회귀 재검증 (2026-09-18, Windows/WSL1)
+
+PR #2~#5 의 리팩토링·자세 보정·피드포워드·미션 절대 속도 변경 뒤 ArduCopter SITL 8개 시나리오를 다시 돌려
+**전부 PASS** (시나리오당 프레임 985~1019개). 상세는 `sitl/README.md` 의 2026-09-18 표.
+
+이 과정에서 SITL 이 잡아낸 저장소 결함 2건:
+- pymavlink 2.4.4x 는 heartbeat 로 `target_component` 를 갱신하지 않아 0 으로 남는데, 2차 리팩토링의
+  HEARTBEAT 필터가 컴포넌트 일치를 요구해 FC 모드가 `?` 로 남고 setpoint 송신이 막혔다. 단위 검사는 가짜
+  master 가 컴포넌트 1 이라 통과시켰다. → autopilot 유효성 기준으로 판별하고 첫 heartbeat 의 컴포넌트로 고정.
+- main 종료 시 FC 소켓을 닫지 않아 같은 프로세스에서 재연결하면 heartbeat 를 영원히 기다렸다 (하네스에서만
+  드러나지만 자원 누수 자체는 실기에도 해당).
+
+STAT 줄에 `vL`(리더 절대 속도), `ff`(피드포워드), `fresh=LP/ATT`, `rx[Hz]`(수신율)를 추가해 이런 종류의
+"조용히 꺼짐" 을 현장에서 한 줄로 볼 수 있게 했다. 피드포워드는 SITL 에서 `vL=0.28 ff=+0.28` 로 확인.
 
 ## 남은 결함
 

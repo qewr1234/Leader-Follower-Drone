@@ -530,6 +530,22 @@ check("HB: 같은 시스템의 다른 컴포넌트 heartbeat는 무시",
       mavlink_io.get_vehicle_state()["mode"]["name"] == "GUIDED",
       f"mode={mavlink_io.get_vehicle_state()['mode']['name']}")
 mavlink_io.drain_messages(_Master([_HB(255, 190, "LOITER", mav_type=6)]))     # GCS
+
+
+class _Master0(_Master):
+    """pymavlink 2.4.4x 실제 동작: heartbeat 뒤에도 target_component 가 0 (SITL 에서 FC=? 로 재현됨)."""
+    target_system, target_component = 1, 0
+
+
+_m0 = _Master0([_HB(1, 1, "LOITER")])
+mavlink_io.drain_messages(_m0)
+check("HB: target_component=0 (pymavlink 2.4.4x) 이어도 FC heartbeat 를 받아들이고 컴포넌트를 1 로 고정",
+      mavlink_io.get_vehicle_state()["mode"]["name"] == "LOITER" and _m0.target_component == 1,
+      f"mode={mavlink_io.get_vehicle_state()['mode']['name']} comp={_m0.target_component}")
+_hb_cam = _HB(1, 100, "Mode(0)", mav_type=2); _hb_cam.autopilot = 8          # 카메라: autopilot INVALID
+mavlink_io.drain_messages(_Master0([_hb_cam]))
+check("HB: target_component=0 이어도 autopilot=INVALID 인 컴포넌트는 무시", mavlink_io.get_vehicle_state()["mode"]["name"] == "LOITER")
+mavlink_io.drain_messages(_Master([_HB(1, 1, "GUIDED")]))                    # 다음 검사들의 전제 복원
 check("HB: GCS heartbeat는 무시 (기존 동작 유지)",
       mavlink_io.get_vehicle_state()["mode"]["name"] == "GUIDED")
 
@@ -996,6 +1012,15 @@ for _ in range(25):                              # 후미가 하강 중이면 �
     st, p = m21.update(now=t, leader_visible=True, rel_est=[3.0, 0, 0], rel_vel_est=[0.0, 0, +0.3],
                        leader_vel_body=[0.0, 0, -0.5], leader_alt=0.3, pos_cov_trace=1.0); t += 0.1
 check("미션: 착륙 판정도 절대 vz 로 (상대 vz 가 + 여도 리더가 하강하면 CONFIRMED_LANDING)", p["land"] is True, f"state={st}")
+
+# ------------------------------------------------- mavlink_io: 수신율 진단
+mavlink_io._rate_t0 = None; mavlink_io._rate_counts.clear()
+_t = 1000.0
+check("rx: 첫 호출은 기준 시각만 잡음", mavlink_io.stream_rates_text(_t) == "rx[Hz] -")
+mavlink_io.drain_messages(_Master([_HB(1, 1, "GUIDED") for _ in range(2)] + [_SysStatus(12000)]))
+_rx = mavlink_io.stream_rates_text(_t + 2.0)
+check("rx: 2초에 HB 2개 → HB=1, 나머지 0, 호출 뒤 카운터 리셋",
+      _rx == "rx[Hz] HB=1 LP=0 ATT=0 GP=0" and mavlink_io.stream_rates_text(_t + 3.0) == "rx[Hz] HB=0 LP=0 ATT=0 GP=0", _rx)
 
 # ---------------------------------------------------------------- 
 print()

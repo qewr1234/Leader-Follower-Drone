@@ -34,13 +34,39 @@ pip install pymavlink empy==3.3.4 pexpect future
 첫 하트비트까지 30초 남짓 걸립니다. 로그에 `Waiting for internal clock bits`가 떠 있어도
 정상이며, 곧 하트비트가 나옵니다.
 
+## 2-b. Windows (WSL1, 빌드 없이)
+
+가상화를 못 켜는 PC 는 WSL1 로도 됩니다. ArduPilot 을 빌드하지 않고 배포된 리눅스 SITL 바이너리를 씁니다
+(WSL1 에서 빌드는 30~60분, wxpython 컴파일이 특히 오래 걸리며 하네스에는 필요 없습니다).
+
+```bash
+# Ubuntu (WSL1) 안에서
+mkdir -p ~/sitl && cd ~/sitl
+wget https://firmware.ardupilot.org/Copter/stable/SITL_x86_64_linux_gnu/arducopter
+wget https://raw.githubusercontent.com/ArduPilot/ardupilot/master/Tools/autotest/default_params/copter.parm
+chmod +x arducopter
+./arducopter -I0 --model + --speedup 1 --defaults copter.parm --home 35.83,128.75,50,0 \
+    --serial0 udpclient:127.0.0.1:14551 --serial1 udpclient:127.0.0.1:14552
+```
+
+저장소는 `/mnt/c/...` 보다 WSL 홈(`~`)에 clone 하는 편이 빠릅니다. 하네스는 `numpy`, `pymavlink` 만 있으면 됩니다.
+
+**콘솔 주의.** 기본 Ubuntu 콘솔은 QuickEdit 모드라 창을 클릭하거나 텍스트를 드래그하면 출력이 막히고
+`print` 에서 프로세스 전체가 멈춥니다. 하네스 로그에 `FPS=0.2` 가 찍히거나 `main 이 15초 안에 종료되지 않음`
+경고가 나오면 그것입니다. **Windows Terminal** 에서 Ubuntu 탭을 열어 돌리고, 실행 중에는 창을 건드리지 마세요.
+
 ## 3. 회귀 실행
 
 ```bash
 python3 sitl/harness.py --all      # ArduCopter 시나리오 8개. px4_setmode는 PX4 엔드포인트 필요
 ```
 
-하네스가 GUIDED 진입 → ARM → 이륙까지 알아서 하고, 시나리오마다 다시 이륙시킵니다.
+하네스가 GUIDED 진입 → ARM → 이륙까지 알아서 하고, 시나리오마다 다시 이륙시킵니다. 직전 시나리오가
+LAND 로 끝났으면(`depth_loss` 등) 착지·시동 해제를 기다린 뒤 이륙합니다 — ArduCopter 는 공중에서 보낸
+GUIDED 이륙 명령을 거부합니다.
+
+각 시나리오는 `프레임 N개 · PASS/FAIL` 로 끝납니다. **프레임 수가 1000개 안팎이 아니면 그 PASS/FAIL 은
+믿지 마세요** — main 이 돌지 않은 채 시나리오만 흘러간 것입니다.
 
 | 시나리오 | 검증 대상 | 실패 조건 |
 |---|---|---|
@@ -90,6 +116,31 @@ git worktree remove --force /tmp/mars_before
 
 C4 수정 후의 4.3m는 P 제어 평형거리 이론값 `TARGET + v/KP_FORWARD = 3.0 + 0.3/0.22 = 4.36m`와
 소수 둘째 자리까지 일치합니다.
+
+### 2026-09-18 실측 — Windows/WSL1, 배포 바이너리, 피드포워드 포함
+
+pymavlink 2.4.49, `arducopter` stable 배포 바이너리(빌드 없음), 시나리오당 프레임 985~1019개.
+
+| 시나리오 | 결과 | 관측 |
+|---|---|---|
+| `boot_no_leader` | PASS | 35초 GUIDED 유지, LAND 없음 |
+| `pilot_takeover` | PASS | 18.0s LAND → 조종사 LOITER, 재 LAND 없음 |
+| `air_landing` | PASS | 공중 착륙 판정 없음. 체인 실행에서 리더가 수직 FOV 를 벗어나 소실 failsafe 가 난 것은 preflight 상승 정착 대기로 해결 |
+| `depth_range` | PASS | 후반 3.9m (피드포워드 전 4.4m). `vL=0.28 ff=+0.28 fresh=LP1/ATT1`, FOLLOW 유지. 3.3m 까지 못 간 것은 MAX_VX 0.35 − 리더 0.3 = 0.05 m/s 의 추격 여유 때문 (아래) |
+| `hover_hold` | PASS | 후반 3.0m |
+| `hold_heading` | PASS | 기수 편차 0.0° |
+| `depth_loss` | PASS | 깊이 소실 → LAND 10.0초 |
+| `handover` | PASS | GUIDED 인계 후 LAND 없음 |
+
+이 실행이 잡아낸 저장소 결함 2건과 하네스 결함 4건은 커밋 이력(cc427b5, e217a1f, 90fb807, e22ebee)에 있습니다.
+가장 큰 것은 pymavlink 2.4.4x 가 `target_component` 를 0 으로 두는데 HEARTBEAT 필터가 컴포넌트 일치를
+요구해 FC 모드가 영원히 `?` 로 남던 회귀 — 단위 검사는 가짜 master 의 컴포넌트를 1 로 두고 있어 못 잡았고
+SITL 만 잡았습니다.
+
+**`depth_range` 3.9m 해석.** 명령 = 0.8·v_L + 0.22·e 가 e > 0.6m 에서 0.35 m/s 상한에 걸린다. 리더가 0.3 m/s
+라 추격 여유가 0.05 m/s 뿐이어서 FOLLOW 확정 시점의 2.1m 격차를 좁히는 데 30초가 걸리고, 후반 21~35초 평균은
+3.8m 로 계산된다(관측 3.9m). 시나리오가 20초 더 길면 (1−KFF)·v/Kp = 0.27m 로 수렴한다. 운용상 의미:
+`MAX_VX` 0.35 는 첫 비행용 보수값이고 리더가 그보다 빠르면 어떤 제어기로도 못 따라간다 — 지상 확인 뒤 올릴 것.
 
 ### 대조군은 결함별로 격리해야 합니다
 
