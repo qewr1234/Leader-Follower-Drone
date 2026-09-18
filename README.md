@@ -28,7 +28,7 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 **4.3m — 이론값 4.36m와 소수 둘째 자리 일치** |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
-| **회귀 스위트** | 단위 검사 97개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
+| **회귀 스위트** | 단위 검사 109개 + SITL 시나리오 8개, 전부 **차등 검증** 방식 |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 추종 동작과 Fail-safe
@@ -104,6 +104,12 @@ D435i (color+depth, 640×480@30)
   화면 표시가 전부 돌면서 명령은 전송되지 않습니다.
 - **카메라 hiccup 내성.** 프레임 드롭은 드롭으로 처리하고, 헤드리스(`MARS_SHOW_WINDOW=0`)
   환경에서도 동작합니다.
+- **돌풍에 기운 기체를 리더 이동으로 오해하지 않습니다.** FC의 ATTITUDE(roll/pitch/yaw) 변화량으로
+  매 프레임 EKF 상대상태를 역회전합니다(`ego_rotation_cam`). 10° pitch면 640px 화면에서 타겟이
+  68px 움직이는데, 보정 없이는 이것이 속도 명령으로 나갑니다.
+- **실외 노출.** 컬러 센서에 AE priority off(30fps 고정)·노출 상한 8ms(모션 블러)·역광 보정을 걸고,
+  AE 측광 영역을 추적 bbox로 따라가게 해 하늘 평균이 아니라 리더에 노출을 맞춥니다
+  (`config.py` `camera.*` 키, 미지원 옵션은 로그만 남기고 건너뜀).
 
 ## 검증 방법
 
@@ -111,7 +117,7 @@ D435i (color+depth, 640×480@30)
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 97개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 109개 — numpy만 있으면 됨
 python3 test_closed_loop.py    # 폐루프 특성화 — 가짜 FC·가짜 시계로 실제 main.main() 결정론 실행 (--dump/--compare)
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 ```
@@ -213,10 +219,10 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `measurement.py` | bbox + depth → RGB-D 3D / bearing 2D 측정 |
 | `tracker.py` | IoU 단일 표적 트래커 (bbox 지수 평활, 근접 게이트) |
 | `detector.py` | YOLO11n 래퍼 (TensorRT `.engine` 우선) |
-| `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회) |
+| `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회, 실외 노출 옵션·AE 측광 ROI) |
 | `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | 단위 회귀 97개 (하드웨어·FC 불필요) |
+| `test_fixes.py` | 단위 회귀 109개 (하드웨어·FC 불필요) |
 | `test_closed_loop.py` | 폐루프 특성화 테스트 — 가짜 FC·가짜 시계로 실제 `main.main()` 결정론 실행, `--dump`/`--compare`로 리팩토링 전후 스트림 비교 |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 | `docs/images/` | README 다이어그램(SVG) |

@@ -14,11 +14,80 @@ Jetson 에서 프레임당 수 ms 를 쓴다 — BUILD_WITH_CUDA=ON 으로 직�
 
 import numpy as np
 
+from config import CONFIG
+
 try:
     import pyrealsense2 as rs
 except ImportError as exc:
     rs = None
     _IMPORT_ERROR = exc
+
+# AE 측광 ROI 갱신 최소 간격(초)과, 다시 보낼 만한 중심 이동(프레임 폭 대비). set_region_of_interest 는
+# USB 제어 전송이라 매 프레임 부르지 않는다.
+AE_ROI_MIN_INTERVAL_SEC = 1.0
+AE_ROI_MOVE_FRAC = 0.10
+AE_ROI_SCALE = 1.5
+AE_ROI_MIN_PX = 32
+
+
+def _rs_option(name):
+    return getattr(getattr(rs, "option", None), name, None)
+
+
+def _set_option(sensor, name, value):
+    """지원하면 범위로 잘라 설정하고 True. 옵션이 없거나(구버전 librealsense) 실패하면 로그만 남기고 False."""
+    opt = _rs_option(name)
+    try:
+        if opt is None or not sensor.supports(opt):
+            print(f"[CAM] 옵션 {name} 미지원 — 건너뜀")
+            return False
+        rng = sensor.get_option_range(opt)
+        v = min(max(float(value), float(rng.min)), float(rng.max))
+        sensor.set_option(opt, v)
+        return True
+    except Exception as exc:
+        print(f"[CAM] 옵션 {name}={value} 설정 실패: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _exposure_unit_us(sensor):
+    """컬러 센서 노출 옵션의 단위(µs). D4xx RGB 는 범위 1~10000 인 100µs 단위, 그 외는 µs 로 본다."""
+    opt = _rs_option("exposure")
+    try:
+        if opt is not None and sensor.supports(opt) and float(sensor.get_option_range(opt).max) <= 10000:
+            return 100.0
+    except Exception:
+        pass
+    return 1.0
+
+
+def apply_color_exposure_options(sensor, cfg):
+    """실외용 컬러 AE 설정. 30fps 고정(AE priority off), 노출 상한, 역광 보정. 항목별로 독립 적용."""
+    _set_option(sensor, "enable_auto_exposure", 1)
+    _set_option(sensor, "auto_exposure_priority", 1 if cfg.get("color_auto_exposure_priority", False) else 0)
+    _set_option(sensor, "backlight_compensation", 1 if cfg.get("color_backlight_compensation", True) else 0)
+    max_us = float(cfg.get("color_exposure_max_us", 0) or 0)
+    if max_us > 0:
+        _set_option(sensor, "auto_exposure_limit_toggle", 1)          # 신버전은 토글이 있어야 limit 가 먹는다
+        if _set_option(sensor, "auto_exposure_limit", max_us / _exposure_unit_us(sensor)):
+            print(f"[CAM] 컬러 AE 노출 상한 {max_us:.0f}µs")
+
+
+def roi_from_bbox(bbox, width, height, scale=AE_ROI_SCALE, min_px=AE_ROI_MIN_PX):
+    """bbox 를 scale 배로 키워 프레임 안으로 자른 (x1, y1, x2, y2). None 이면 전체 프레임."""
+    if bbox is None:
+        return (0, 0, width - 1, height - 1)
+    x1, y1, x2, y2 = bbox
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    hw = max((x2 - x1) * scale / 2.0, min_px / 2.0)
+    hh = max((y2 - y1) * scale / 2.0, min_px / 2.0)
+    rx1, ry1 = int(max(0, cx - hw)), int(max(0, cy - hh))
+    rx2, ry2 = int(min(width - 1, cx + hw)), int(min(height - 1, cy + hh))
+    if rx2 - rx1 < min_px:
+        rx1, rx2 = max(0, min(rx1, width - 1 - min_px)), min(width - 1, max(rx2, rx1 + min_px))
+    if ry2 - ry1 < min_px:
+        ry1, ry2 = max(0, min(ry1, height - 1 - min_px)), min(height - 1, max(ry2, ry1 + min_px))
+    return (rx1, ry1, rx2, ry2)
 
 
 class D435i:
@@ -38,6 +107,9 @@ class D435i:
         self.profile = None
         self.depth_scale = 0.001
         self.intrinsics = None
+        self._color_sensor = None
+        self._ae_roi_last = None          # 마지막으로 보낸 (x1,y1,x2,y2)
+        self._ae_roi_last_t = -1e9
 
     def start(self):
         self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
@@ -50,6 +122,47 @@ class D435i:
         intr = self.profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
         self.intrinsics = {"fx": intr.fx, "fy": intr.fy, "ppx": intr.ppx, "ppy": intr.ppy}
         print(f"[CAM] D435i started. depth_scale={self.depth_scale:.6f}")
+
+        self._color_sensor = self._find_color_sensor()
+        if self._color_sensor is None:
+            print("[CAM] 컬러 센서를 찾지 못해 노출 옵션을 건너뜁니다")
+        else:
+            apply_color_exposure_options(self._color_sensor, CONFIG["camera"])
+
+    def _find_color_sensor(self):
+        try:
+            for s in self.profile.get_device().query_sensors():
+                is_color = getattr(s, "is_color_sensor", None)
+                if (is_color() if is_color else False) or "RGB" in str(s.get_info(rs.camera_info.name)):
+                    return s
+        except Exception as exc:
+            print(f"[CAM] 센서 열거 실패: {type(exc).__name__}: {exc}")
+        return None
+
+    def set_exposure_roi(self, bbox, now):
+        """AE 측광 영역을 추적 bbox(1.5배) 로, bbox 가 None 이면 전체 프레임으로.
+        1초에 한 번, 그리고 bbox→bbox 는 중심이 프레임의 10% 이상 움직였을 때만 보낸다. 실패는 1초 뒤 재시도."""
+        if self._color_sensor is None:
+            return False
+        roi = roi_from_bbox(bbox, self.width, self.height)
+        if roi == self._ae_roi_last or now - self._ae_roi_last_t < AE_ROI_MIN_INTERVAL_SEC:
+            return False
+        full = roi_from_bbox(None, self.width, self.height)
+        if bbox is not None and self._ae_roi_last not in (None, full):
+            dx = abs((roi[0] + roi[2]) - (self._ae_roi_last[0] + self._ae_roi_last[2])) / 2.0
+            dy = abs((roi[1] + roi[3]) - (self._ae_roi_last[1] + self._ae_roi_last[3])) / 2.0
+            if dx < AE_ROI_MOVE_FRAC * self.width and dy < AE_ROI_MOVE_FRAC * self.height:
+                return False
+        self._ae_roi_last_t = now
+        try:
+            r = rs.region_of_interest()
+            r.min_x, r.min_y, r.max_x, r.max_y = roi
+            self._color_sensor.as_roi_sensor().set_region_of_interest(r)
+        except Exception as exc:
+            print(f"[CAM] AE ROI {roi} 설정 실패: {type(exc).__name__}: {exc}")
+            return False
+        self._ae_roi_last = roi
+        return True
 
     def stop(self):
         self.pipeline.stop()

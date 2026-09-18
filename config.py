@@ -29,6 +29,15 @@ CONFIG = {
         "fps": 30,
         "depth_min_m": 0.30,
         "depth_max_m": 10.00,   # C4: TARGET_DISTANCE_M(3.0) 대비 여유 7m
+        # ---- 실외 노출 (컬러 센서 librealsense 옵션. 펌웨어/버전이 미지원인 옵션은 건너뛰고 로그) ----
+        # False: 저조도에서도 30fps 유지(노출 상한 = 1/fps). True 면 AE 가 fps 를 떨어뜨려 제어 주기가 흔들린다.
+        "color_auto_exposure_priority": False,
+        # AE 노출 상한(µs). 이동 중 모션 블러 억제. 0 이면 상한 없음. (auto_exposure_limit, librealsense ≥ 2.50)
+        "color_exposure_max_us": 8000,
+        # 하늘 배경 역광에서 어두운 피사체 쪽으로 노출 보정.
+        "color_backlight_compensation": True,
+        # AE 측광 영역을 추적 bbox(1.5배)로 옮긴다(≤1Hz). 하늘 평균이 아니라 리더에 노출을 맞춘다. 소실 시 전체로 복귀.
+        "ae_roi_follow_track": True,
     },
     "measurement": {
         "bbox_inner_ratio": 0.55,

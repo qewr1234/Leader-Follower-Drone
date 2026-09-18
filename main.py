@@ -107,6 +107,30 @@ def camera_xyz_to_fru(x_cam):
     return np.array([x[2], x[0], -x[1]], dtype=float)
 
 
+# 카메라 프레임(x=우, y=하, z=전) ← 기체 FRD(x=전, y=우, z=하)
+_CAM_FROM_BODY = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
+
+
+def rot_body_to_ned(roll, pitch, yaw):
+    """MAVLink ATTITUDE(ZYX 오일러) → 기체→NED 회전행렬 Rz(yaw)·Ry(pitch)·Rx(roll)."""
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return np.array([[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                     [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                     [-sp, cp * sr, cp * cr]])
+
+
+def ego_rotation_cam(prev_rpy, cur_rpy):
+    """팔로워 자세가 prev→cur 로 바뀌었을 때, 이전 카메라 프레임의 벡터를 현재 카메라 프레임으로 옮기는 3x3.
+
+    리더가 월드에 고정돼 있어도 기체가 돌면 카메라 안에서 움직여 보인다 — yaw 만 아니라 돌풍에 의한
+    roll/pitch 도 마찬가지다(10° pitch ≈ 640px 화면에서 68px). p_b2 = R2ᵀ·R1·p_b1 을 카메라 프레임으로 옮긴 것.
+    """
+    d_rb = rot_body_to_ned(*cur_rpy).T @ rot_body_to_ned(*prev_rpy)
+    return _CAM_FROM_BODY @ d_rb @ _CAM_FROM_BODY.T
+
+
 def fru_to_body_ned_velocity(v_fru):
     """FRU [forward, right, up] → BODY_NED [forward, right, down]."""
     v = np.asarray(v_fru, dtype=float)
@@ -381,6 +405,8 @@ def main():
         warmup(cam_cfg["width"], cam_cfg["height"])   # 엔진 역직렬화·첫 추론 지연을 루프 밖에서
     cam = D435i(width=cam_cfg["width"], height=cam_cfg["height"], fps=cam_cfg["fps"])
     cam.start()
+    # 하네스/테스트의 FakeCam 에는 없다. 있으면 AE 측광 영역을 추적 bbox 로 따라가게 한다.
+    set_ae_roi = getattr(cam, "set_exposure_roi", None) if cam_cfg.get("ae_roi_follow_track", True) else None
     intrinsics = cam.intrinsics
     print(f"[CAM] fx={intrinsics['fx']:.1f} fy={intrinsics['fy']:.1f} ppx={intrinsics['ppx']:.1f} ppy={intrinsics['ppy']:.1f}")
 
@@ -406,7 +432,7 @@ def main():
     fps_counter, fps_t0, fps_display = 0, time.time(), 0.0
     prev_body_cmd = np.zeros(4)
     current_body_cmd = np.zeros(4)
-    prev_yaw_for_comp = None
+    prev_rpy_for_comp = None      # 직전 프레임 팔로워 (roll, pitch, yaw)
 
     print("=" * 90)
     print("[INFO] q/ESC 종료 | m: MARS-IMM on/off | v: MAVLink velocity 송신 on/off | l: LAND | h: HOLD")
@@ -491,16 +517,15 @@ def main():
                 fps_display = fps_counter / max(now - fps_t0, 1e-6)
                 fps_counter, fps_t0 = 0, now
 
-            # ---------------- IMM predict (팔로워 yaw 만큼 상대상태를 역회전한 뒤) ----------------
-            cur_yaw = vehicle_state.get("attitude", {}).get("yaw", None)
-            if attitude_fresh and cur_yaw is not None:
-                cur_yaw = float(cur_yaw)
-                if prev_yaw_for_comp is not None and ekf.initialized:
-                    d = cur_yaw - prev_yaw_for_comp
-                    ekf.compensate_ego_yaw(math.atan2(math.sin(d), math.cos(d)))
-                prev_yaw_for_comp = cur_yaw
+            # ---------------- IMM predict (팔로워 자세 변화만큼 상대상태를 역회전한 뒤) ----------------
+            att = vehicle_state.get("attitude", {})
+            if attitude_fresh and att.get("yaw") is not None:
+                cur_rpy = (float(att.get("roll") or 0.0), float(att.get("pitch") or 0.0), float(att["yaw"]))
+                if prev_rpy_for_comp is not None and ekf.initialized:
+                    ekf.compensate_ego_rotation(ego_rotation_cam(prev_rpy_for_comp, cur_rpy))
+                prev_rpy_for_comp = cur_rpy
             else:
-                prev_yaw_for_comp = None
+                prev_rpy_for_comp = None
             if ekf.initialized:
                 ekf.predict(dt)
 
@@ -515,6 +540,8 @@ def main():
             else:
                 track = tracker.predict_only()
             last_track = track
+            if set_ae_roi is not None:
+                set_ae_roi(track["bbox"] if (track is not None and not track.get("is_lost", False)) else None, now)
 
             # ---------------- 측정 → 융합 ----------------
             rgbd_meas = meas_builder.build_rgbd(track, depth_image)

@@ -815,6 +815,121 @@ check("ekf: 캐시가 update/compensate/속도 힌트 뒤 갱신됨",
       f"vx: {x3[3]:.3f} → {x4[3]:.3f}")
 check("ekf: 같은 상태에서 두 번 부르면 같은 객체 (캐시 적중)", ek3.get_state()[0] is ek3.get_state()[0])
 
+# ------------------------------------------------- 자세(roll/pitch/yaw) 보정 — 돌풍에 기운 기체가 리더 이동으로 보이지 않게
+from main import ego_rotation_cam, rot_body_to_ned, _CAM_FROM_BODY  # noqa: E402
+
+_d = 0.2; _c, _s = _math.cos(_d), _math.sin(_d)
+_T_yaw = ego_rotation_cam((0.0, 0.0, 0.0), (0.0, 0.0, _d))
+check("자세보정: yaw 만 바뀌면 기존 compensate_ego_yaw 행렬과 동일",
+      np3.allclose(_T_yaw, [[_c, 0, -_s], [0, 1, 0], [_s, 0, _c]], atol=1e-12))
+_ahead = np3.array([0.0, 0.0, 5.0])                                      # 정면 5m (카메라 z)
+_p = ego_rotation_cam((0.0, 0.0, 0.0), (0.0, _math.radians(10), 0.0)) @ _ahead
+check("자세보정: 기수 10° 들리면 정면 타겟이 영상에서 아래(+y)로 내려감",
+      _p[1] > 0.8 and abs(_p[0]) < 1e-9 and abs(_p[1] - 5 * _math.sin(_math.radians(10))) < 1e-9, f"p={_p.round(3)}")
+_p = ego_rotation_cam((0.0, 0.0, 0.0), (_math.radians(10), 0.0, 0.0)) @ np3.array([5.0, 0.0, 0.0])
+check("자세보정: 우측 롤 10° 이면 우측 타겟이 영상에서 위(-y)로 올라감, 정면 타겟은 불변",
+      _p[1] < -0.8 and abs(_p[0] - 5 * _math.cos(_math.radians(10))) < 1e-9
+      and np3.allclose(ego_rotation_cam((0.0, 0.0, 0.0), (_math.radians(10), 0.0, 0.0)) @ _ahead, _ahead), f"p={_p.round(3)}")
+_a, _b, _cc = (0.1, -0.2, 1.0), (-0.3, 0.25, 1.4), (0.05, 0.4, -2.0)
+check("자세보정: 왕복은 항등, 합성은 결합적",
+      np3.allclose(ego_rotation_cam(_a, _b) @ ego_rotation_cam(_b, _a), np3.eye(3), atol=1e-12)
+      and np3.allclose(ego_rotation_cam(_a, _cc), ego_rotation_cam(_b, _cc) @ ego_rotation_cam(_a, _b), atol=1e-12))
+
+
+def _sim_attitude(compensate, T_end=10.0, v=1.0):
+    """리더: 북쪽 5m 앞에서 동쪽으로 v m/s 직진(참 선회율 0). 팔로워: yaw 0.2rad/s + pitch ±10°(0.5Hz) + roll ±8°(0.7Hz).
+    반환: (월드 속도 추정 오차[m/s], CT omega)."""
+    ek = ImmEkf(); dt = 1 / 30; Rm = np3.diag([0.15 ** 2, 0.15 ** 2, 0.25 ** 2]); prev = None
+    for k in range(int(T_end / dt) + 1):
+        t = k * dt
+        rpy = (_math.radians(8) * _math.sin(2 * _math.pi * 0.7 * t), _math.radians(10) * _math.sin(2 * _math.pi * 0.5 * t), 0.2 * t)
+        R = rot_body_to_ned(*rpy)
+        z = _CAM_FROM_BODY @ R.T @ np3.array([5.0, v * t, 0.0])
+        if not ek.initialized:
+            ek.init(z)
+        else:
+            ek.predict(dt)
+            if compensate and prev is not None:
+                ek.compensate_ego_rotation(ego_rotation_cam(prev, rpy))
+            ek.update_position3d(z, Rm)
+        prev = rpy
+    x = ek.get_state()[0]
+    v_w = R @ _CAM_FROM_BODY.T @ x[3:6]
+    return float(np3.linalg.norm(v_w - [0.0, v, 0.0])), float(ek.filters[1]._omega)
+
+
+_e_on, _w_on = _sim_attitude(True)
+_e_off, _w_off = _sim_attitude(False)
+check("자세보정: yaw+pitch+roll 동시 요동 중에도 월드 속도 오차 < 0.15 m/s, CT omega < 0.05",
+      _e_on < 0.15 and abs(_w_on) < 0.05, f"err={_e_on:.3f} omega={_w_on:+.3f}")
+check("자세보정: 보정 없이는 같은 시나리오에서 오차가 더 큼 (회귀 방지용 대조)",
+      _e_off > _e_on * 2, f"err on/off = {_e_on:.3f}/{_e_off:.3f}")
+
+# ------------------------------------------------- camera: 실외 노출 옵션·AE 측광 ROI (pyrealsense2 스텁)
+import camera as _camera  # noqa: E402
+_rs = sys.modules["pyrealsense2"]
+_rs.option = types.SimpleNamespace(**{n: n for n in ("enable_auto_exposure", "auto_exposure_priority", "backlight_compensation",
+                                                     "auto_exposure_limit", "auto_exposure_limit_toggle", "exposure")})
+_rs.camera_info = types.SimpleNamespace(name="name")
+_rs.pipeline = _rs.config = lambda: None
+
+
+class _FakeRoi:
+    pass
+
+
+_rs.region_of_interest = _FakeRoi
+
+
+class _FakeColorSensor:
+    def __init__(self, supported, fail_roi=False):
+        self.supported, self.set, self.rois, self.fail_roi = set(supported), [], [], fail_roi
+    def supports(self, opt): return opt in self.supported
+    def get_option_range(self, opt): return types.SimpleNamespace(min=0.0, max=10000.0 if opt in ("exposure", "auto_exposure_limit") else 1.0)
+    def set_option(self, opt, v): self.set.append((opt, v))
+    def as_roi_sensor(self): return self
+    def set_region_of_interest(self, r):
+        if self.fail_roi:
+            raise RuntimeError("busy")
+        self.rois.append((r.min_x, r.min_y, r.max_x, r.max_y))
+
+
+_cfg_cam = {"color_auto_exposure_priority": False, "color_exposure_max_us": 8000, "color_backlight_compensation": True}
+_sn = _FakeColorSensor(vars(_rs.option).keys())
+_camera.apply_color_exposure_options(_sn, _cfg_cam)
+check("camera: AE priority off·역광보정 on·노출 상한 8000µs → 80 (RGB 100µs 단위)",
+      ("auto_exposure_priority", 0.0) in _sn.set and ("backlight_compensation", 1.0) in _sn.set
+      and ("auto_exposure_limit", 80.0) in _sn.set and ("enable_auto_exposure", 1.0) in _sn.set, f"set={_sn.set}")
+_sn_old = _FakeColorSensor(["enable_auto_exposure", "auto_exposure_priority", "backlight_compensation"])
+_camera.apply_color_exposure_options(_sn_old, _cfg_cam)
+check("camera: 구버전(auto_exposure_limit 없음)도 예외 없이 나머지 옵션 적용",
+      len(_sn_old.set) == 3 and not any(o == "auto_exposure_limit" for o, _ in _sn_old.set), f"set={_sn_old.set}")
+
+_r = _camera.roi_from_bbox((300, 200, 340, 230), 640, 480)
+check("camera: AE ROI 는 bbox 1.5배를 프레임 안에서, 최소 32px",
+      _r == (290, 192, 350, 237) and _camera.roi_from_bbox(None, 640, 480) == (0, 0, 639, 479)
+      and _camera.roi_from_bbox((0, 0, 4, 4), 640, 480)[2:] >= (32, 32)
+      and _camera.roi_from_bbox((630, 470, 639, 479), 640, 480) == (607, 447, 639, 479), f"roi={_r}")
+
+_cam = _camera.D435i(); _cam._color_sensor = _FakeColorSensor(vars(_rs.option).keys())
+_sent = [_cam.set_exposure_roi((300, 200, 340, 230), 0.0),     # 첫 bbox → 전송
+         _cam.set_exposure_roi((400, 200, 440, 230), 0.5),     # 1초 안 → 억제
+         _cam.set_exposure_roi((320, 210, 360, 240), 1.5),     # 중심 이동 20px < 64px → 억제
+         _cam.set_exposure_roi((420, 200, 460, 230), 1.6),     # 120px 이동 → 전송
+         _cam.set_exposure_roi(None, 2.0),                     # 소실: 1초 안 → 억제
+         _cam.set_exposure_roi(None, 3.0),                     # 소실: 전체 프레임 → 전송
+         _cam.set_exposure_roi(None, 9.0)]                     # 같은 ROI → 억제
+check("camera: AE ROI 는 1Hz·10% 이동·소실 시 전체 복귀 규칙대로만 전송",
+      _sent == [True, False, False, True, False, True, False] and len(_cam._color_sensor.rois) == 3
+      and _cam._color_sensor.rois[-1] == (0, 0, 639, 479), f"sent={_sent} rois={_cam._color_sensor.rois}")
+_cam2 = _camera.D435i(); _cam2._color_sensor = _FakeColorSensor(vars(_rs.option).keys(), fail_roi=True)
+_ok1 = _cam2.set_exposure_roi((300, 200, 340, 230), 0.0); _ok2 = _cam2.set_exposure_roi((300, 200, 340, 230), 0.5)
+_cam2._color_sensor.fail_roi = False; _ok3 = _cam2.set_exposure_roi((300, 200, 340, 230), 1.1)
+check("camera: ROI 설정 실패는 예외 없이 False, 1초 뒤 재시도해 성공",
+      (_ok1, _ok2, _ok3) == (False, False, True), f"{(_ok1, _ok2, _ok3)}")
+_cam3 = _camera.D435i()
+check("camera: 컬러 센서 없으면(하네스) set_exposure_roi 는 조용히 False", _cam3.set_exposure_roi((0, 0, 10, 10), 0.0) is False)
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "
