@@ -361,7 +361,7 @@ def front_at(t):
 _e105 = front_at(10.5) - main.TARGET_DISTANCE_M
 _dmin = min(d for t, d in World.dist if 11.0 <= t <= 16.0)
 # 리더는 3.0s 에 출발, FOLLOW 확정은 ~5.1s 라 그 사이 0.6m 가 벌어진 채 시작한다. 같은 조건에서 P 만이면 +1.15m.
-check("FOLLOW 중(리더 0.3m/s, t=10.5s) 거리 오차 < 0.7m — 피드포워드 (KFF=0 이면 +1.15m, 정상상태 v/Kp=1.36m)",
+check("FOLLOW 중(리더 0.3m/s, t=10.5s) 거리 오차 < 0.7m — 피드포워드 (KFF=0 이면 +1.15m, 정상상태 v/Kp=1.36m. FF 저역통과 2s·데드존 0.05 뒤 정상상태 0.45m)",
       abs(_e105) < 0.7, f"front-target={_e105:+.2f}m")
 check("리더 정지 후 최소 접근 거리 ≥ 2.3m (피드포워드 오버슈트 없음)", _dmin >= 2.3, f"min={_dmin:.2f}m")
 check("추종 중(t=8s) 상태는 FOLLOW — 리더 절대 속도 기준 (상대 속도면 따라잡는 순간 LEADER_HOVER 로 오판)",

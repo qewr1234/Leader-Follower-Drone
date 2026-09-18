@@ -37,7 +37,7 @@ _P = argparse.ArgumentParser(description=__doc__,
 _P.add_argument("--scenario", default="boot_no_leader",
                 choices=["boot_no_leader", "pilot_takeover", "hold_heading",
                          "air_landing", "depth_range", "hover_hold", "px4_setmode",
-                         "depth_loss", "handover"])
+                         "depth_loss", "handover", "leader_sine"])
 _P.add_argument("--all", action="store_true", help="모든 시나리오를 순서대로")
 _P.add_argument("--repo", default=str(__import__("pathlib").Path(__file__).resolve().parent.parent),
                 help="검사할 저장소 경로 (대조군은 수정 전 worktree를 지정)")
@@ -58,6 +58,12 @@ import numpy as np  # noqa: E402
 
 W, H = 640, 480
 FX = FY = 384.0
+
+# leader_sine: 리더 속도 = SINE_MEAN + SINE_AMP·sin(SINE_W·t). 1.15 rad/s 는 수정 전 설계의 |Γ| 피크 주파수
+# (docs/STABILITY_MARGINS.md). 평균 0.25 는 출발 확인(0.25 m/s, 0.7s) 을 넘기면서 팔로워가 MAX_VX 0.35 에 닿지 않는 값.
+SINE_W, SINE_MEAN, SINE_AMP = 1.15, 0.25, 0.05
+SINE_SETTLE = 20.0                       # FOLLOW 진입 + FF 저역통과 2s + 과도 정착
+SINE_DURATION = SINE_SETTLE + 6 * 2 * 3.14159 / SINE_W   # 정착 뒤 6주기 (≈53s)
 CX, CY = W / 2.0, H / 2.0
 
 
@@ -344,6 +350,9 @@ def run_scenario(name):
     T0 = time.time()
     World.reset()
     gen = World.generation
+    _duration_saved = ARGS.duration
+    if name == "leader_sine":
+        ARGS.duration = max(ARGS.duration, SINE_DURATION)   # 정착 20s + 정현파 6주기
     verdict = {"pass": True, "why": []}
 
     def fail(why):
@@ -372,7 +381,8 @@ def run_scenario(name):
         main.get_vehicle_state = _no_local_position
         log("LOCAL_POSITION_NED 차단 → leader_alt_est=None 조건 재현")
 
-    seen_modes, headings, ranges = [], [], []
+    seen_modes, headings, ranges, vels = [], [], [], []
+    sine_t0 = [None]
     land_seen_at = [None]
     took_over_at = [None]
     depth_lost_at = [None]
@@ -408,6 +418,7 @@ def run_scenario(name):
             if t == "LOCAL_POSITION_NED":
                 front, _, _ = World.relative_fru()
                 ranges.append((now, front, -World.f_d, in_fov()))     # fov 는 그 시점 값을 기록 (출력 시점 값이 아니라)
+                vels.append((now, float(msg.vx)))                     # 팔로워 북쪽 속도 (리더는 북진)
 
             if t != "HEARTBEAT":
                 continue
@@ -519,6 +530,23 @@ def run_scenario(name):
                 World.l_n += 0.3 * 0.1
                 time.sleep(0.1)
 
+        elif name == "leader_sine":
+            # 스트링 안정성: 리더 속도의 정현파 성분이 팔로워 속도에서 몇 배가 되는가. 선형 모델(docs/STABILITY_MARGINS.md)
+            # 은 수정 전(FF τ 0.7s) 1.8배, 현재(τ 2.0s + 자기 속도 정합) 0.67배를 예측한다. 등속·계단 시나리오는
+            # 1.15 rad/s 성분이 작아 이 결함을 자극하지 못했다.
+            log(f"시나리오: 리더 {SINE_MEAN} ± {SINE_AMP} m/s 정현파 전진 (ω={SINE_W} rad/s, 주기 {2 * 3.14159 / SINE_W:.1f}s) "
+                f"— 팔로워 속도 진폭비 ≤ 1 인가 (스트링 안정성)")
+            while (not World.stop and World.generation == gen) and not World.have_fix:
+                time.sleep(0.2)
+            t_prev = time.time()
+            sine_t0[0] = t_prev - T0
+            while (not World.stop and World.generation == gen):
+                tn = time.time()
+                v = SINE_MEAN + SINE_AMP * np.sin(SINE_W * (tn - T0 - sine_t0[0]))
+                World.l_n += v * (tn - t_prev)
+                t_prev = tn
+                time.sleep(0.05)
+
         elif name == "hover_hold":
             log("시나리오: 리더 전진 후 정지 → 팔로워가 정위치를 유지하는가 (H2)")
             while (not World.stop and World.generation == gen) and not World.have_fix:
@@ -596,6 +624,32 @@ def run_scenario(name):
                 fail(f"H2: 리더 정지 후 목표거리 {target:.1f}m로 수렴하지 못함 "
                      f"(후반 {final:.1f}m). 정위치 유지가 동작하지 않는다")
 
+    if name == "leader_sine":
+        if sine_t0[0] is None:
+            fail("정현파를 시작하지 못함 (월드 기준점 없음 — 시나리오 오류)")
+        else:
+            t_fit0 = sine_t0[0] + SINE_SETTLE
+            sel = [(t, v) for t, v in vels if t >= t_fit0]
+            if len(sel) < 100:
+                fail(f"속도 샘플 부족 ({len(sel)}개) — 판정 불가")
+            else:
+                ts = np.array([t - sine_t0[0] for t, _ in sel]); vs = np.array([v for _, v in sel])
+                M = np.column_stack([np.cos(SINE_W * ts), np.sin(SINE_W * ts), np.ones_like(ts)])
+                (a, b, c), *_ = np.linalg.lstsq(M, vs, rcond=None)
+                amp_f = float(np.hypot(a, b)); ratio = amp_f / SINE_AMP
+                rsel = [(t - sine_t0[0], r) for t, r, _, _ in ranges if t >= t_fit0]
+                rt = np.array([t for t, _ in rsel]); rs = np.array([r for _, r in rsel])
+                Mr = np.column_stack([np.cos(SINE_W * rt), np.sin(SINE_W * rt), np.ones_like(rt)])
+                (ra, rb, rc), *_ = np.linalg.lstsq(Mr, rs, rcond=None)
+                log(f"정현파 정착 후 {ts[-1] - ts[0]:.0f}s ({len(sel)}샘플): 팔로워 평균 속도 {c:.2f} m/s, "
+                    f"속도 진폭 {amp_f:.3f} m/s / 리더 {SINE_AMP} → 진폭비 {ratio:.2f} "
+                    f"(선형 예측: 수정 전 1.8, 현재 0.67) · 거리 평균 {rc:.2f}m, 거리 진폭 {np.hypot(ra, rb):.2f}m")
+                if c < 0.12:
+                    fail(f"추종이 시작되지 않음 (팔로워 평균 속도 {c:.2f} m/s) — 진폭비 판정 무효")
+                elif ratio > 1.0:
+                    fail(f"스트링 불안정: 리더 속도 변동이 팔로워에서 {ratio:.2f}배로 증폭 (ω={SINE_W} rad/s). "
+                         f"체인 n 단 뒤에는 {ratio:.2f}^n 배")
+
     if name == "hold_heading":
         late = [h for t, h in headings if t > 10.0]
         if len(late) > 5:
@@ -609,6 +663,7 @@ def run_scenario(name):
     # air_landing 의 LOCAL_POSITION_NED 차단을 원복한다. 안 하면 이후 시나리오가 전부 자기 속도·고도 없이
     # 돌아 피드포워드가 꺼지고(vL=nan, fresh=LP0) 미션이 상대 속도 폴백으로 간다 — 2026-09-18 WSL1 실측.
     main.get_vehicle_state = _real_state
+    ARGS.duration = _duration_saved
     pilot.close()
     print(f"프레임 {World.frames}개 · {'PASS' if verdict['pass'] else 'FAIL'} ({name})")
     if verdict["why"]:
@@ -617,10 +672,10 @@ def run_scenario(name):
 
 
 if __name__ == "__main__":
-    # ArduCopter SITL로 도는 8개 전부. px4_setmode만 PX4 엔드포인트가 필요해 제외한다.
+    # ArduCopter SITL로 도는 9개 전부. px4_setmode만 PX4 엔드포인트가 필요해 제외한다.
     names = ["boot_no_leader", "pilot_takeover", "air_landing",
              "depth_range", "hover_hold", "hold_heading",
-             "depth_loss", "handover"] if ARGS.all \
+             "depth_loss", "handover", "leader_sine"] if ARGS.all \
         else [ARGS.scenario]
     print(f"저장소: {ARGS.repo}")
     results = {}

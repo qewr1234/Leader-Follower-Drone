@@ -58,7 +58,7 @@ chmod +x arducopter
 ## 3. 회귀 실행
 
 ```bash
-python3 sitl/harness.py --all      # ArduCopter 시나리오 8개. px4_setmode는 PX4 엔드포인트 필요
+python3 sitl/harness.py --all      # ArduCopter 시나리오 9개. px4_setmode는 PX4 엔드포인트 필요
 ```
 
 하네스가 GUIDED 진입 → ARM → 이륙까지 알아서 하고, 시나리오마다 다시 이륙시킵니다. 직전 시나리오가
@@ -79,6 +79,7 @@ GUIDED 이륙 명령을 거부합니다.
 | `px4_setmode` | **C6** | PX4의 3-튜플 `mode_mapping`에서 `set_mode`가 예외 |
 | `depth_loss` | 거리 게이트 | 깊이만 죽었을 때(검출은 유지) 10초 뒤 착륙하지 않음 |
 | `handover` | GUIDED 인계 | 수동 상승 후 GUIDED로 넘기는 순간 LAND가 나감 |
+| `leader_sine` | 스트링 안정성 | 리더 0.25 ± 0.05 m/s 정현파(1.15 rad/s)에 대한 팔로워 속도 진폭비 > 1 (증폭) |
 
 월드는 **폐루프**입니다 — 팔로워가 실제로 움직이면 리더까지의 거리가 변합니다. 팔로워 위치와
 기수는 SITL의 `LOCAL_POSITION_NED` / `ATTITUDE`로 갱신되며, 그래야 정위치 유지(H2)나 거리
@@ -252,3 +253,26 @@ python3 sitl/harness.py --scenario px4_setmode --fc-port udpin:0.0.0.0:14540
 `cv2`(전부 no-op) · `pyrealsense2` · `ultralytics` · `serial`, 그리고 `camera.D435i`와
 `detector.YoloDetector`를 합성 리더를 만드는 가짜로 교체합니다. 깊이 영상은 리더 bbox 안만
 실제 거리, 나머지는 15m 배경(depth_max 10m 밖)입니다. **그 외에는 저장소 코드가 그대로 돕니다.**
+
+## leader_sine — 스트링 안정성 (2026-09-18 추가, 미실행)
+
+[docs/STABILITY_MARGINS.md](../docs/STABILITY_MARGINS.md) 의 선형 모델이 처음의 피드포워드 구현에서 1.15 rad/s 공진
+(리더 속도 변동 1.8배 증폭)을 예측했는데, 등속·계단 시나리오는 그 주파수를 자극하지 않아 8개가 전부 통과했습니다.
+`leader_sine` 은 리더를 `0.25 + 0.05·sin(1.15 t)` m/s 로 전진시키고, 정착 20 s 뒤 6주기 동안 팔로워의
+`LOCAL_POSITION_NED.vx` 를 최소제곱으로 맞춰 **속도 진폭비**를 냅니다. 1 을 넘으면 FAIL. 시나리오 길이는 자동으로
+약 53 s 가 됩니다.
+
+```bash
+python3 sitl/harness.py --scenario leader_sine                       # 현재 코드 (선형 예측 0.70)
+git worktree add --detach /tmp/mars_before e4b4cd7                   # 수정 전 (FF 저역통과 0.7s, 정합 없음, 램프 데드밴드)
+python3 sitl/harness.py --scenario leader_sine --repo /tmp/mars_before   # 대조군 (비선형 시뮬 예측 2.3 → FAIL 이어야 함)
+git worktree remove --force /tmp/mars_before
+```
+
+로그의 `진폭비 x.xx (선형 예측: 수정 전 1.8, 현재 0.67)` 줄이 결과입니다. 실제 FC 속도루프가 모델(0.3 s)보다 느리면
+두 값 다 조금 내려갑니다(강건성 표). 결과가 나오면 아래 표에 채웁니다.
+
+| 저장소 | 진폭비 | 판정 |
+|---|---|---|
+| 현재 | (미실행) | |
+| 수정 전 e4b4cd7 | (미실행) | |

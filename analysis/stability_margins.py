@@ -96,6 +96,9 @@ TAU_SMOOTH = -(1.0 / FPS) / math.log(1.0 - SMOOTH_ALPHA)        # 0.1015 s: smoo
 
 
 # ---------------------------------------------------------------- 파라미터
+BEFORE = dict(tau_ff=0.7, tau_m=0.0, legacy_ff=True, deadband=0.10)   # 2026-09-18 수정 전 설계 (FF 저역통과 0.7s, 자기 속도 정합 없음, 0.10 램프 데드밴드)
+
+
 class Params:
     """선형 모델 파라미터. 기본값 = 현재 코드 + FC/지연 가정 (docs/STABILITY_MARGINS.md 의 '가정' 절)."""
 
@@ -108,7 +111,8 @@ class Params:
         self.tau_s = TAU_SMOOTH
         self.Td = 0.10          # 검출·추론 ~40ms + 10Hz ZOH 평균 50ms
         self.Tm = 0.10          # LOCAL_POSITION_NED 10Hz 수신 지연 (자기 속도)
-        self.tau_m = 0.0        # [제안] 자기 속도 정합 저역통과 시정수. 0 = 현재 코드 (필터 없음). EKF 속도 지연(≈0.3s)에 맞추면 양성 되먹임이 사라진다
+        self.tau_m = main.FF_SELF_TAU_SEC   # 자기 속도 정합 저역통과 (main.self_velocity_lpf). 0 이면 필터 없음 = 수정 전 설계
+        self.legacy_ff = False  # 체인 시뮬레이션에서 수정 전 leader_velocity_ff(램프 데드밴드) 를 쓴다
         self.scale = 1.0        # 불확실성 감속 배율 (1.0 / 0.75 / 0.55)
         self.deadband = None    # 체인 시뮬레이션에서 main.FF_DEADBAND_MPS 를 덮어쓸 값 (None = 코드 값)
         for k, v in kw.items():
@@ -290,6 +294,19 @@ def string_stability(p, w, frf):
 
 
 # ---------------------------------------------------------------- 비선형 체인 시뮬레이션 (실제 main.* 함수 + 실제 ImmEkf)
+def _legacy_leader_velocity_ff(prev_ff, leader_vel_fru, dt):
+    """2026-09-18 수정 전 main.leader_velocity_ff: 데드밴드 DB 위로 2·DB 까지 선형 램프 (국소 기울기 최대 3)."""
+    target = np.zeros(3)
+    if leader_vel_fru is not None:
+        v = np.asarray(leader_vel_fru, dtype=float)
+        speed = float(np.linalg.norm(v))
+        if speed > main.FF_DEADBAND_MPS:
+            target = v * min(max((speed - main.FF_DEADBAND_MPS) / main.FF_DEADBAND_MPS, 0.0), 1.0)
+    prev = np.asarray(prev_ff, dtype=float)
+    a = 1.0 - math.exp(-max(float(dt), 0.0) / max(main.FF_TAU_SEC, 1e-3))
+    return prev + a * (target - prev)
+
+
 class _Follower:
     def __init__(self, x0, p):
         self.x = float(x0); self.v = 0.0
@@ -339,7 +356,8 @@ def chain_sim(n_followers=4, v_leader=0.3, T=50.0, p=None, profile="step", omega
                 f.vmeas.append(f.v); v_self = f.vmeas.pop(0)
                 if p.tau_m > 0:
                     f.v_self_f += (v_self - f.v_self_f) * (1.0 - math.exp(-dt / p.tau_m)); v_self = f.v_self_f
-                f.ff = main.leader_velocity_ff(f.ff, [v_self + relv[0], 0.0, 0.0], dt)
+                ff_fn = _legacy_leader_velocity_ff if p.legacy_ff else main.leader_velocity_ff
+                f.ff = ff_fn(f.ff, [v_self + relv[0], 0.0, 0.0], dt)
                 u = main.compute_velocity_cmd_from_estimate(rel, relv, 1.0, None, f.ff)
                 f.cmd = main.smooth_velocity_cmd(f.cmd, u, alpha=SMOOTH_ALPHA, dt=dt)
                 if k % send_every == 0:
@@ -408,9 +426,17 @@ def compute_all(frf_data, chain=True):
         r.update(string_stability(p, W, frf))
         r["self_fb_peak"] = float(np.max(np.abs(self_feedback_path(p, W, frf))))
         res["axes"][name] = r
-    # 전후축 KFF 스윕 (P+D 만 / 설계 / KFF=1 / KFF=1 & 저역통과 없음)
-    for label, kw in (("kff0", dict(kff=0.0)), ("kff0.8", dict()), ("kff1.0", dict(kff=1.0)),
-                      ("kff1.0_nolpf", dict(kff=1.0, tau_ff=1e-3))):
+    # 수정 전 설계 (축별)
+    res["before"] = {}
+    for name, (kp, kd) in (("forward", (main.KP_FORWARD, main.KD_FORWARD)), ("right", (main.KP_RIGHT, main.KD_RIGHT)),
+                           ("up", (main.KP_UP, main.KD_UP))):
+        p = base.copy(kp=kp, kd=kd, **BEFORE)
+        r = margins(open_loop(p, W, frf), W); r.update(string_stability(p, W, frf))
+        r["self_fb_peak"] = float(np.max(np.abs(self_feedback_path(p, W, frf))))
+        res["before"][name] = r
+    # 전후축 KFF 스윕 (P+D 만 / 현재 / 수정 전 / KFF=1 / KFF=1 & 저역통과·정합 없음)
+    for label, kw in (("kff0", dict(kff=0.0)), ("kff0.8", dict()), ("before", dict(**BEFORE)), ("kff1.0", dict(kff=1.0)),
+                      ("kff1.0_nolpf", dict(kff=1.0, tau_ff=1e-3, tau_m=0.0))):
         p = base.copy(**kw)
         r = margins(open_loop(p, W, frf), W)
         r.update(string_stability(p, W, frf))
@@ -433,9 +459,9 @@ def compute_all(frf_data, chain=True):
             r = margins(open_loop(p, W, frf), W); r.update(string_stability(p, W, frf))
             r["ss_err_per_mps"] = (1.0 - kff) / p.kp
             res["recommended_grid"][f"kff{kff}_kd{kd}"] = r
-    res["recommended_params"] = {"tau_ff": 2.0, "tau_m": 0.3, "kff": 0.8, "kd": main.KD_FORWARD}
-    # 데드밴드 램프의 국소 이득: target = v·(|v|−DB)/DB (DB<|v|<2DB) → d/d|v| 최대 = (2·2DB − DB)/DB = 3
-    res["deadband_ramp_max_slope"] = 3.0
+    res["recommended_params"] = {"tau_ff": base.tau_ff, "tau_m": base.tau_m, "kff": base.kff, "kd": base.kd}
+    # 데드밴드: 수정 전 램프 target = v·(|v|−DB)/DB (DB<|v|<2DB) 의 국소 기울기 최대 3, 현재 소프트 데드존은 1
+    res["deadband_slope"] = {"before_ramp_max": 3.0, "current_soft": 1.0}
     # 불확실성 감속
     for sc in (0.75, 0.55):
         p = base.copy(scale=sc)
@@ -456,38 +482,43 @@ def compute_all(frf_data, chain=True):
     res["sampling"] = {"setpoint_hz": SETPOINT_HZ, "nyquist_rad_s": math.pi * SETPOINT_HZ,
                        "w_gc_over_nyquist": res["axes"]["forward"]["w_gc"] / (math.pi * SETPOINT_HZ)}
     if chain:
+        pb = base.copy(**BEFORE)
+        w_sine = res["before"]["forward"]["w_peak"]          # 수정 전 설계의 |Γ| 피크 주파수 (≈1.15) 에서 비교
         h = chain_sim(p=base)
         res["chain_step"] = chain_summary(h, t_from=0.0)
         h0 = chain_sim(p=base.copy(kff=0.0))
         res["chain_step_kff0"] = chain_summary(h0, t_from=0.0)
-        wpk = res["axes"]["forward"]["w_peak"]
-        w_sine = wpk if 0.05 <= wpk <= 3.0 else 0.5
+        hb = chain_sim(p=pb)
+        res["chain_step_before"] = chain_summary(hb, t_from=0.0)
         hs = chain_sim(p=base, profile="sine", omega=w_sine, v_leader=0.15, T=80.0)
         res["chain_sine"] = dict(omega=w_sine, **chain_sine_amplitudes(hs, w_sine, t_from=30.0))
         hs0 = chain_sim(p=base.copy(kff=0.0), profile="sine", omega=w_sine, v_leader=0.15, T=80.0)
         res["chain_sine_kff0"] = dict(omega=w_sine, **chain_sine_amplitudes(hs0, w_sine, t_from=30.0))
-        rp = res["recommended_params"]
-        pm_ = base.copy(tau_ff=rp["tau_ff"], tau_m=rp["tau_m"], kff=rp["kff"], kd=rp["kd"])
-        hm = chain_sim(p=pm_)
-        res["chain_step_recommended"] = chain_summary(hm, t_from=0.0)
-        hsm = chain_sim(p=pm_, profile="sine", omega=w_sine, v_leader=0.15, T=80.0)
-        res["chain_sine_recommended"] = dict(omega=w_sine, **chain_sine_amplitudes(hsm, w_sine, t_from=30.0))
-        gr = string_stability(pm_, W, frf)
-        hsr = chain_sim(p=pm_, profile="sine", omega=gr["w_peak"], v_leader=0.15, T=120.0)
-        res["chain_sine_recommended_at_own_peak"] = dict(omega=gr["w_peak"], **chain_sine_amplitudes(hsr, gr["w_peak"], t_from=40.0))
+        hsb = chain_sim(p=pb, profile="sine", omega=w_sine, v_leader=0.15, T=80.0)
+        res["chain_sine_before"] = dict(omega=w_sine, **chain_sine_amplitudes(hsb, w_sine, t_from=30.0))
+        gr = res["axes"]["forward"]
+        hsr = chain_sim(p=base, profile="sine", omega=gr["w_peak"], v_leader=0.15, T=120.0)
+        res["chain_sine_at_own_peak"] = dict(omega=gr["w_peak"], **chain_sine_amplitudes(hsr, gr["w_peak"], t_from=40.0))
+        # SITL leader_sine 시나리오와 같은 조건 (리더 0.25 ± 0.05, 1.15 rad/s), 1단
+        res["sitl_like"] = {}
+        for label, pv in (("current", base), ("before", pb)):
+            hv = chain_sim(n_followers=1, p=pv, profile="sine", omega=1.15, v_leader=0.25, amp=0.05, T=80.0)
+            res["sitl_like"][label] = chain_sine_amplitudes(hv, 1.15, t_from=30.0)["stage_ratios"][0]
         # 선형 모델 검증: 데드밴드·포화 밖의 작은 진폭 (리더 0.30 ± 0.02 m/s), 2단
         res["validation"] = []
-        for label, pv in (("current", base), ("kff0", base.copy(kff=0.0)), ("recommended", pm_)):
+        for label, pv in (("current", base), ("kff0", base.copy(kff=0.0)), ("before", pb)):
             for wv in (1.15, 0.35):
                 hv = chain_sim(n_followers=2, p=pv, profile="sine", omega=wv, v_leader=0.30, amp=0.02, T=80.0)
                 av = chain_sine_amplitudes(hv, wv, t_from=30.0)
                 res["validation"].append({"case": label, "omega": wv,
                                           "linear": float(abs(leader_to_follower(pv, np.array([wv]), frf)[0])),
                                           "nonlinear_stage1": av["stage_ratios"][0], "nonlinear_stage2": av["stage_ratios"][1]})
-        # 데드밴드 램프 구간(리더 0.15 ± 0.03 m/s) 의 비선형 증폭
-        hd = chain_sim(n_followers=2, p=base, profile="sine", omega=1.15, v_leader=0.15, amp=0.03, T=80.0)
-        res["deadband_lowspeed_ratios"] = chain_sine_amplitudes(hd, 1.15, t_from=30.0)["stage_ratios"]
-        res["_hist"] = {"step": h, "step_kff0": h0, "step_recommended": hm}
+        # 데드밴드 구간(리더 0.15 ± 0.03 m/s) 의 비선형 증폭: 수정 전 램프 vs 현재 소프트 데드존
+        res["deadband_lowspeed_ratios"] = {}
+        for label, pv in (("current", base), ("before", pb)):
+            hd = chain_sim(n_followers=2, p=pv, profile="sine", omega=1.15, v_leader=0.15, amp=0.03, T=80.0)
+            res["deadband_lowspeed_ratios"][label] = chain_sine_amplitudes(hd, 1.15, t_from=30.0)["stage_ratios"]
+        res["_hist"] = {"step": h, "step_kff0": h0, "step_before": hb}
     return res
 
 
@@ -510,7 +541,7 @@ def print_tables(res):
     for label, r in res["kff_sweep"].items():
         print(f"| {label} | {_fmt(r['pm_deg'])} | {_fmt(r['gm_db'])} | {_fmt(r['Ms'],2)} | {_fmt(r.get('self_fb_peak'),2)} | "
               f"{_fmt(r['peak'],3)} | {'예' if r['string_stable'] else '아니오'} | {_fmt(r.get('ss_err_per_mps'),2)} |")
-    print("\n[개선안 스윕: τ_ff × τ_m → GM / Ms / |Γ|피크(ω) / 양성되먹임 피크]")
+    print("\n[τ_ff × τ_m 스윕 (수정 전 = 0.7/0, 현재 = 2.0/0.3) → GM / Ms / |Γ|피크(ω) / 양성되먹임 피크]")
     tms = (0.0, 0.3, 0.5)
     print("| τ_ff \\ τ_m | " + " | ".join(f"{tm}s" for tm in tms) + " |")
     print("|---|" + "---|" * len(tms))
@@ -520,7 +551,7 @@ def print_tables(res):
             r = res["proposed"][f"tau_ff{tff}_tau_m{tm}"]
             row.append(f"{_fmt(r['gm_db'])}dB / {_fmt(r['Ms'],2)} / {_fmt(r['peak'],2)}({_fmt(r['w_peak'],2)}) / {_fmt(r['self_fb_peak'],2)}")
         print(f"| {tff}s | " + " | ".join(row) + " |")
-    print("\n[권고 후보 (τ_ff 2.0, τ_m 0.3): KFF × Kd → PM / GM / Ms / |Γ|피크 / 정상상태 오차]")
+    print("\n[KFF × Kd 교환표 (τ_ff 2.0, τ_m 0.3): PM / GM / Ms / |Γ|피크 / 정상상태 오차]")
     print("| KFF \\ Kd | 0.05 | 0.10 | 0.15 |")
     print("|---|---|---|---|")
     for kff in (0.6, 0.7, 0.8):
@@ -550,18 +581,21 @@ def print_tables(res):
         print("\n[체인 4단 계단(0.3 m/s)] max|e| KFF=0.8: " + ", ".join(f"{v:.2f}" for v in c["max_abs_err_m"]) +
               " | KFF=0: " + ", ".join(f"{v:.2f}" for v in c0["max_abs_err_m"]))
         print("  최소 간격 KFF=0.8: " + ", ".join(f"{v:.2f}" for v in c["min_spacing_m"]))
-        cm = res["chain_step_recommended"]
-        print("  [권고안] max|e|: " + ", ".join(f"{v:.2f}" for v in cm["max_abs_err_m"]) +
+        cm = res["chain_step_before"]
+        print("  [수정 전] max|e|: " + ", ".join(f"{v:.2f}" for v in cm["max_abs_err_m"]) +
               " 최소 간격: " + ", ".join(f"{v:.2f}" for v in cm["min_spacing_m"]))
-        s, s0, sm = res["chain_sine"], res["chain_sine_kff0"], res["chain_sine_recommended"]
+        s, s0, sm = res["chain_sine"], res["chain_sine_kff0"], res["chain_sine_before"]
         print(f"[체인 정현파 ω={s['omega']:.2f}, 리더 0.15±0.15] 단별 진폭비 현재: " + ", ".join(f"{v:.3f}" for v in s["stage_ratios"]) +
               " | KFF=0: " + ", ".join(f"{v:.3f}" for v in s0["stage_ratios"]) +
-              " | 권고안: " + ", ".join(f"{v:.3f}" for v in sm["stage_ratios"]))
-        sr = res["chain_sine_recommended_at_own_peak"]
-        print(f"[권고안 자체 피크 ω={sr['omega']:.2f}] 단별 진폭비: " + ", ".join(f"{v:.3f}" for v in sr["stage_ratios"]))
+              " | 수정 전: " + ", ".join(f"{v:.3f}" for v in sm["stage_ratios"]))
+        sr = res["chain_sine_at_own_peak"]
+        print(f"[현재 설계 자체 피크 ω={sr['omega']:.2f}] 단별 진폭비: " + ", ".join(f"{v:.3f}" for v in sr["stage_ratios"]))
+        print(f"[SITL leader_sine 조건 (0.25±0.05, 1.15)] 1단 진폭비 현재 {res['sitl_like']['current']:.3f} / 수정 전 {res['sitl_like']['before']:.3f}")
         print("[선형 모델 검증: 리더 0.30±0.02 m/s] " + "; ".join(
             f"{v['case']}@{v['omega']}: 선형 {v['linear']:.3f} / 비선형 {v['nonlinear_stage1']:.3f}" for v in res["validation"]))
-        print("[데드밴드 램프 구간 리더 0.15±0.03 @1.15] 단별 진폭비: " + ", ".join(f"{v:.3f}" for v in res["deadband_lowspeed_ratios"]))
+        d = res["deadband_lowspeed_ratios"]
+        print("[데드밴드 구간 리더 0.15±0.03 @1.15] 단별 진폭비 현재(소프트): " + ", ".join(f"{v:.3f}" for v in d["current"]) +
+              " | 수정 전(램프): " + ", ".join(f"{v:.3f}" for v in d["before"]))
 
 
 def make_plots(res, frf_data):
@@ -572,19 +606,19 @@ def make_plots(res, frf_data):
     os.makedirs(IMG_DIR, exist_ok=True)
     # 1) 전후축 보드 (KFF 0 / 0.8 / 1.0)
     fig, ax = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
-    for label, kw, c in (("P+D only (KFF=0)", dict(kff=0.0), "gray"), ("current (KFF=0.8, FF LPF 0.7s)", {}, "tab:blue"),
-                         ("KFF=1.0, no LPF", dict(kff=1.0, tau_ff=1e-3), "tab:red"),
-                         ("recommended (FF LPF 2.0s + self-vel LPF 0.3s)", dict(tau_ff=2.0, tau_m=0.3), "tab:green")):
+    for label, kw, c in (("P+D only (KFF=0)", dict(kff=0.0), "gray"), ("before 2026-09-18 (FF LPF 0.7s, no self-vel LPF)", dict(**BEFORE), "tab:red"),
+                         ("KFF=1.0, no LPF", dict(kff=1.0, tau_ff=1e-3, tau_m=0.0), "tab:purple"),
+                         ("current (FF LPF 2.0s + self-vel LPF 0.3s)", {}, "tab:green")):
         L = open_loop(base.copy(**kw), W, frf)
         ax[0].semilogx(W, 20 * np.log10(np.abs(L)), color=c, label=label)
         ax[1].semilogx(W, np.degrees(np.unwrap(np.angle(L))), color=c)
     r = res["axes"]["forward"]
     ax[0].axhline(0, color="k", lw=0.6); ax[1].axhline(-180, color="k", lw=0.6)
     if r["w_gc"]:
-        ax[0].axvline(r["w_gc"], color="tab:blue", ls=":", lw=0.8); ax[1].axvline(r["w_gc"], color="tab:blue", ls=":", lw=0.8)
+        ax[0].axvline(r["w_gc"], color="tab:green", ls=":", lw=0.8); ax[1].axvline(r["w_gc"], color="tab:green", ls=":", lw=0.8)
         ax[1].annotate(f"PM {r['pm_deg']:.0f}° @ {r['w_gc']:.2f} rad/s", (r["w_gc"], -180 + r["pm_deg"]), textcoords="offset points", xytext=(8, 6))
     if r["w_pc"]:
-        ax[0].axvline(r["w_pc"], color="tab:blue", ls="--", lw=0.8)
+        ax[0].axvline(r["w_pc"], color="tab:green", ls="--", lw=0.8)
         ax[0].annotate(f"GM {r['gm_db']:.1f} dB @ {r['w_pc']:.1f} rad/s", (r["w_pc"], -r["gm_db"]), textcoords="offset points", xytext=(-140, 8))
     ax[0].set_ylabel("|L| [dB]"); ax[1].set_ylabel("∠L [deg]"); ax[1].set_xlabel("ω [rad/s]")
     ax[0].set_title(f"Forward-axis open loop L(jω)  (τ_fc={base.tau_fc}s, Td={base.Td}s, EKF FRF measured)")
@@ -593,9 +627,10 @@ def make_plots(res, frf_data):
     fig.tight_layout(); fig.savefig(os.path.join(IMG_DIR, "stability_bode_forward.png"), dpi=130); plt.close(fig)
     # 2) 스트링 안정성
     fig, ax = plt.subplots(figsize=(8, 4.2))
-    for label, kw, c in (("KFF=0", dict(kff=0.0), "gray"), ("KFF=0.8 (current)", {}, "tab:blue"), ("KFF=1.0", dict(kff=1.0), "tab:orange"),
-                         ("KFF=1.0, no LPF", dict(kff=1.0, tau_ff=1e-3), "tab:red"),
-                         ("recommended: FF LPF 2.0s + self-vel LPF 0.3s", dict(tau_ff=2.0, tau_m=0.3), "tab:green")):
+    for label, kw, c in (("KFF=0", dict(kff=0.0), "gray"), ("before 2026-09-18 (KFF 0.8, FF LPF 0.7s)", dict(**BEFORE), "tab:red"),
+                         ("before, KFF=1.0", dict(kff=1.0, tau_ff=0.7, tau_m=0.0), "tab:orange"),
+                         ("KFF=1.0, no LPF", dict(kff=1.0, tau_ff=1e-3, tau_m=0.0), "tab:purple"),
+                         ("current (KFF 0.8, FF LPF 2.0s + self-vel LPF 0.3s)", {}, "tab:green")):
         G = np.abs(leader_to_follower(base.copy(**kw), W, frf))
         ax.semilogx(W, G, color=c, label=f"{label}  peak {G.max():.3f}")
     ax.axhline(1.0, color="k", lw=0.8, ls="--")
@@ -606,8 +641,8 @@ def make_plots(res, frf_data):
     # 3) 체인 계단 응답
     if "_hist" in res:
         fig, ax = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
-        for j, (key, title) in enumerate((("step", "KFF=0.8 (current)"), ("step_kff0", "KFF=0 (P+D only)"),
-                                          ("step_recommended", "recommended: FF LPF 2.0s + self-velocity LPF 0.3s"))):
+        for j, (key, title) in enumerate((("step", "current (KFF 0.8, FF LPF 2.0s + self-velocity LPF 0.3s)"), ("step_kff0", "KFF=0 (P+D only)"),
+                                          ("step_before", "before 2026-09-18 (FF LPF 0.7s, no self-velocity LPF)"))):
             h = res["_hist"][key]
             for i, e in enumerate(h["err"]):
                 ax[j].plot(h["t"], e, label=f"follower {i+1}")
