@@ -593,7 +593,10 @@ def main():
                             send_body_velocity(master, *current_body_cmd[:3], yaw_rate=current_body_cmd[3])
                         except Exception as exc:
                             print(f"[WARN] FC link: setpoint 송신 실패: {type(exc).__name__}: {exc}")
-                    last_setpoint_time = now
+                    # 위상 고정: 다음 송신 시각을 '지금'이 아니라 '직전 예정 시각 + 주기'로 잡는다. '지금'으로
+                    # 잡으면 프레임 경계에 맞춰 늦어져 30fps 에서 3×(1/30)<0.1 → 4프레임마다(7.5Hz)만 나갔다.
+                    # 오래 멈췄다 돌아오면(카메라 스톨) 한 번에 따라잡지 않고 다음 주기부터 다시 센다.
+                    last_setpoint_time = max(last_setpoint_time + SETPOINT_PERIOD_SEC, now - SETPOINT_PERIOD_SEC)
 
             # ---------------- 화면 (DISPLAY_EVERY 프레임마다) ----------------
             if show_window and frame_idx % DISPLAY_EVERY == 0:

@@ -341,8 +341,8 @@ print(f"프레임 {World.frames}, setpoint {len(FC.setpoints)}개, 모드 변경
 print("상태 이력:", [f"{t:.1f}s:{s}" for _, t, s in STATES])
 
 hz = len([s for s in FC.setpoints if 5.0 <= s[1] <= 15.0]) / 10.0
-# dt 가 정확히 1/30 이면 3*(1/30) < 0.10 이라 4프레임마다 나간다(7.5Hz). 실기(24~26fps)에선 8.3Hz.
-check("setpoint 송신율 7~11Hz", 7.0 <= hz <= 11.0, f"{hz:.1f}Hz")
+# 위상 고정 송신이라 프레임 간격(1/30)과 무관하게 평균 10Hz 여야 한다 (프레임 경계 정렬 방식이면 7.5Hz 였다).
+check("setpoint 송신율 9.5~10.5Hz (위상 고정)", 9.5 <= hz <= 10.5, f"{hz:.1f}Hz")
 check("GUIDED 진입 후 READY_HOVER", state_at(2.5) == "READY_HOVER", f"{state_at(2.5)}")
 t_follow = first_time("FOLLOW")
 check("리더 출발 후 FOLLOW 진입 (3s + 0.7s 확인 안팎)", t_follow is not None and 3.5 <= t_follow <= 5.5, f"t={t_follow}")
