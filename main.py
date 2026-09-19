@@ -96,6 +96,16 @@ MIN_SEPARATION_KP = float(CONFIG["controller"].get("min_separation_kp", 0.6))
 EVADE_RADIUS_M = float(CONFIG["controller"].get("evade_radius_m", 1.5))
 EVADE_SPEED_MPS = float(CONFIG["controller"].get("evade_speed_mps", 0.22))
 EVADE_RAMP_M = max(float(CONFIG["controller"].get("evade_ramp_m", 0.3)), 1e-6)
+EVADE_SIDE_DEADBAND_M = float(CONFIG["controller"].get("evade_side_deadband_m", 0.30))
+
+# 회피 방향 래치. 0=미결정, +1=오른쪽, -1=왼쪽. 반경을 벗어나면 풀린다.
+_evade_side = 0
+
+
+def reset_evade_side():
+    """GUIDED 진입처럼 상태를 새로 시작할 때 회피 방향 래치를 푼다."""
+    global _evade_side
+    _evade_side = 0
 
 SETPOINT_PERIOD_SEC = 0.10
 # C2: LAND 가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
@@ -298,6 +308,8 @@ def enforce_min_separation(cmd_fru, rel_fru):
     rel = np.asarray(rel_fru, dtype=float)[:3]
     dist = float(np.linalg.norm(rel))
     if dist >= MIN_SEPARATION_M or dist < 1e-6:
+        if dist >= EVADE_RADIUS_M:
+            globals()["_evade_side"] = 0
         return cmd
 
     u = rel / dist                                  # 리더 쪽 단위 벡터 (FRU)
@@ -306,11 +318,17 @@ def enforce_min_separation(cmd_fru, rel_fru):
     if v_along > v_allowed:
         cmd = cmd + (v_allowed - v_along) * u
 
+    global _evade_side
     if dist < EVADE_RADIUS_M:
-        # 수평면에서 시선에 수직인 방향. 리더가 정면(right≈0)이면 부호가 정해지지 않으므로 오른쪽으로 통일한다.
-        lat = -1.0 if rel[1] > 0.0 else 1.0         # 리더가 오른쪽이면 왼쪽(-)으로 비킨다
+        # 방향은 한 번만 정하고 반경을 벗어날 때까지 유지한다. 매 프레임 right 부호로 고르면, 리더가 정면일 때
+        # 추정 잡음으로 부호가 뒤집혀 좌우 명령이 서로 상쇄된다 — SITL 에서 0.22 m/s 를 명령하고도 기체 측면
+        # 속도는 0.01 m/s 였다. 데드밴드 안이면 부호를 보지 않고 오른쪽으로 통일한다.
+        if _evade_side == 0:
+            _evade_side = -1 if rel[1] > EVADE_SIDE_DEADBAND_M else 1
         frac = clamp((EVADE_RADIUS_M - dist) / EVADE_RAMP_M, 0.0, 1.0)
-        cmd[1] += lat * EVADE_SPEED_MPS * frac
+        cmd[1] += _evade_side * EVADE_SPEED_MPS * frac
+    else:
+        _evade_side = 0
 
     lim = (MAX_VX, MAX_VY, MAX_VZ)
     for i in range(3):
@@ -586,6 +604,7 @@ def main():
                 prev_body_cmd = np.zeros(4)
                 ff_fru = np.zeros(3)
                 v_self_lpf = None
+                reset_evade_side()
                 last_land_send = 0.0
                 print(f"[SYS] {fc_mode} 진입 — 미션/명령 리셋")
             prev_fc_accepts = fc_accepts_setpoints

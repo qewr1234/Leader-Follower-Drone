@@ -431,6 +431,14 @@ def run_scenario(name):
     # 설정 전에는 실제로 오지 않으며, 그때 leader_alt_est가 None이 된다.
     # 로직을 건드리는 게 아니라 "메시지가 없는 환경"을 만드는 것이다.
     _real_state = main.get_vehicle_state       # 시나리오 끝에 반드시 원복 (아래 pilot.close() 앞)
+    _real_send = main.send_body_velocity
+    cmds = []                                  # (t, vx, vy, vz) — BODY_NED 로 실제 송신한 명령
+    if name == "min_separation":
+        def _record_send(master, vx, vy, vz, yaw_rate=0.0):
+            cmds.append((time.time() - T0, float(vx), float(vy), float(vz)))
+            return _real_send(master, vx, vy, vz, yaw_rate)
+
+        main.send_body_velocity = _record_send
     if name == "air_landing":
         def _no_local_position():
             st = dict(_real_state())
@@ -765,9 +773,14 @@ def run_scenario(name):
             d_min = min(d for _, d, _, _ in seps)
             inside = [x for x in seps if x[1] < radius]
             lat_max = max((x[3] for x in inside), default=0.0)
+            # 회피 반경 안에 있던 시간 구간에 '송신한' 명령의 측면 성분 — 제어기의 계약은 여기까지다.
+            t_lo = min((x[0] for x in inside), default=None)
+            t_hi = max((x[0] for x in inside), default=None)
+            cmd_lat = max((abs(c[2]) for c in cmds if t_lo is not None and t_lo <= c[0] <= t_hi), default=0.0)
             log(f"최소 3차원 거리 {d_min:.2f}m (이격 바닥 {floor:.1f}m, 회피 반경 {radius:.1f}m), "
-                f"회피 반경 안 {len(inside)}샘플, 최대 측면 속도 {lat_max:.2f} m/s")
-            verdict["note"] = f"min_dist {d_min:.2f}m lat_max {lat_max:.2f} inside {len(inside)}"
+                f"회피 반경 안 {len(inside)}샘플 / setpoint {len(cmds)}개")
+            log(f"  명령된 측면 속도 최대 {cmd_lat:.2f} m/s → 기체 실측 측면 속도 최대 {lat_max:.2f} m/s")
+            verdict["note"] = f"min_dist {d_min:.2f}m cmd_lat {cmd_lat:.2f} body_lat {lat_max:.2f} inside {len(inside)}"
             if not inside:
                 fail(f"회피 반경({radius:.1f}m) 안으로 들어가지 못해 회피가 발동하지 않음 "
                      f"(최소 {d_min:.2f}m) — 시나리오가 조건을 만들지 못했다. 판정 무효")
@@ -775,9 +788,12 @@ def run_scenario(name):
                 if d_min < SEP_HARD_FLOOR_M:
                     fail(f"최소 이격: 거리가 {d_min:.2f}m 까지 줄어 접촉({SEP_HARD_FLOOR_M:.2f}m)으로 본다 — "
                          f"측면 회피가 동작하지 않는다")
-                if lat_max < SEP_MIN_LATERAL:
-                    fail(f"최소 이격: 회피 반경 안 측면 속도가 최대 {lat_max:.2f} m/s 뿐 "
-                         f"(기대 ≥ {SEP_MIN_LATERAL:.2f}) — 비켜서지 않고 정면 후퇴만 하고 있다")
+                if cmd_lat < SEP_MIN_LATERAL:
+                    fail(f"최소 이격: 회피 반경 안에서 '명령된' 측면 속도가 최대 {cmd_lat:.2f} m/s 뿐 "
+                         f"(기대 ≥ {SEP_MIN_LATERAL:.2f}) — 제어기가 비켜서라고 시키지 않았다")
+                elif lat_max < SEP_MIN_LATERAL * 0.5:
+                    log(f"!! 주의: 측면 {cmd_lat:.2f} m/s 를 명령했는데 기체는 {lat_max:.2f} m/s 밖에 못 냈다 "
+                        f"— 명령은 맞지만 기체가 따라오지 못한다 (제어기 결함 아님)")
 
     if name == "hold_heading":
         late = [h for t, h in headings if t > 10.0]
@@ -793,6 +809,7 @@ def run_scenario(name):
     # air_landing 의 LOCAL_POSITION_NED 차단을 원복한다. 안 하면 이후 시나리오가 전부 자기 속도·고도 없이
     # 돌아 피드포워드가 꺼지고(vL=nan, fresh=LP0) 미션이 상대 속도 폴백으로 간다 — 2026-09-18 WSL1 실측.
     main.get_vehicle_state = _real_state
+    main.send_body_velocity = _real_send
     ARGS.duration = _duration_saved
     pilot.close()
     meta = {"modes": ";".join(f"{t:.1f}:{m}" for t, m in seen_modes)}

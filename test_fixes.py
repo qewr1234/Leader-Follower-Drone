@@ -1156,13 +1156,40 @@ check("이격: 거리 1.42m 위에서는 P 항이 제약보다 강하다 — 1�
       f"교차 {_cross:.3f}m")
 
 # 측면 회피: 후퇴가 포화된 뒤의 마지막 수단
+main.reset_evade_side()
 _ev_r = main.enforce_min_separation([0.0, 0.0, 0.0], [_rad - 0.5, 0.0, 0.0])
 check("회피: 회피 반경 안에서 리더가 정면이면 측면 속도가 붙는다 (부호는 오른쪽으로 통일)",
       _ev_r[1] > 0.05, f"{_ev_r}")
+main.reset_evade_side()
 _ev_left = main.enforce_min_separation([0.0, 0.0, 0.0], [0.5, 1.0, 0.0])
 check("회피: 리더가 오른쪽에 있으면 왼쪽으로 비킨다", _ev_left[1] < 0.0, f"{_ev_left}")
+# 방향 래치: 리더가 정면이면 right 부호가 추정 잡음으로 뒤집힌다. 매 프레임 부호로 고르면 좌우가 상쇄돼
+# 명령은 0.22 m/s 인데 기체는 안 움직인다 — SITL 실측 0.01 m/s (2026-09-20).
+main.reset_evade_side()
+_chatter = [main.enforce_min_separation([-0.35, 0.0, 0.0], [1.17, r, 0.0])[1] for r in (0.05, -0.05, 0.04, -0.06, 0.02)]
+check("회피: 리더가 정면일 때 right 부호가 흔들려도 방향이 뒤집히지 않는다 (래치) — 좌우 상쇄로 무효화되던 결함",
+      all(v > 0.15 for v in _chatter), f"{[round(v, 3) for v in _chatter]}")
+main.reset_evade_side()
+main.enforce_min_separation([0.0, 0.0, 0.0], [1.2, 0.0, 0.0])
+_side_in = main._evade_side
+_vy_keep = main.enforce_min_separation([0.0, 0.0, 0.0], [1.2, 0.5, 0.0])[1]
+main.enforce_min_separation([0.0, 0.0, 0.0], [1.8, 0.0, 0.0])
+_side_out = main._evade_side
+_vy_new = main.enforce_min_separation([0.0, 0.0, 0.0], [1.0, 0.6, 0.0])[1]
+check("회피: 래치는 반경을 벗어나면 풀리고, 다시 들어올 때 리더 반대쪽으로 새로 정해진다",
+      _side_in == 1 and _side_out == 0 and _vy_new < -0.15, f"in={_side_in} out={_side_out} vy_new={_vy_new:.3f}")
+main.reset_evade_side()
+_vy_db = main.enforce_min_separation([0.0, 0.0, 0.0], [1.2, 0.1, 0.0])[1]
+check("회피: 좌우 오차가 데드밴드(0.3m) 안이면 부호를 보지 않고 한쪽으로 통일",
+      _vy_db > 0.15 and main.EVADE_SIDE_DEADBAND_M >= 0.2, f"vy={_vy_db:.3f}")
+main.reset_evade_side()
+check("회피: reset_evade_side() 가 래치를 푼다 (GUIDED 진입 리셋에 연결)",
+      main._evade_side == 0 and "reset_evade_side()" in open("main.py", encoding="utf-8").read().split("GUIDED 진입")[0][-400:])
+
+main.reset_evade_side()
 _ev_none = main.enforce_min_separation([0.0, 0.0, 0.0], [_rad + 0.3, 0.0, 0.0])
 check("회피: 회피 반경 밖에서는 측면 속도를 넣지 않는다", abs(_ev_none[1]) < 1e-9, f"{_ev_none}")
+main.reset_evade_side()
 _ev_lim = main.enforce_min_separation([0.0, main.MAX_VY, 0.0], [0.2, -1.0, 0.0])
 check("회피: 측면 성분도 MAX_VY 로 포화된다", abs(_ev_lim[1]) <= main.MAX_VY + 1e-9, f"{_ev_lim}")
 
