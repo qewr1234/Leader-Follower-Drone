@@ -73,7 +73,12 @@ SINE_DURATION = SINE_SETTLE + 6 * 2 * 3.14159 / SINE_W   # 정착 뒤 6주기 (�
 # 접근 속도가 MAX_VX(0.35) 보다 크므로 정면 후퇴로는 원리적으로 벗어날 수 없다 — 측면 회피가 유일한 수단이다.
 # 오프라인 모의(실제 main.* 제어 함수) 예측: 회피 없으면 0.01m(접촉), 있으면 0.41m, 측면 속도 0.27 m/s.
 SEP_SPEED, SEP_STRAIGHT = 0.30, 10.0
-SEP_CHARGE, SEP_CHARGE_SEC = 0.70, 8.0
+# 돌진은 '고정 시간' 이 아니라 '실제 거리가 SEP_ENTER_M 아래로 들어갈 때까지' 한다. 오프라인 모의는 고정
+# 8초면 접촉을 예측했지만 SITL 실측은 1.90m 로 회피 반경에 닿지도 않았다 — 실기 후퇴가 모델보다 좋다.
+# 조건 형성을 예측에 맡기지 않는다.
+SEP_CHARGE, SEP_CHARGE_MAX_SEC, SEP_ENTER_M = 0.70, 20.0, 1.20
+SEP_HOLD_SEC = 6.0
+SEP_DURATION = SEP_STRAIGHT + SEP_CHARGE_MAX_SEC + SEP_HOLD_SEC
 SEP_HARD_FLOOR_M = 0.15       # 이 아래면 접촉으로 본다
 SEP_MIN_LATERAL = 0.12        # 회피 반경 안에서 관측돼야 하는 시선수직(수평) 속도 [m/s]
 CX, CY = W / 2.0, H / 2.0
@@ -405,6 +410,8 @@ def run_scenario(name):
     _duration_saved = ARGS.duration
     if name == "leader_sine":
         ARGS.duration = max(ARGS.duration, SINE_DURATION)   # 정착 20s + 정현파 6주기
+    if name == "min_separation":
+        ARGS.duration = max(ARGS.duration, SEP_DURATION)    # 직진 + 돌진(최대) + 회복
     verdict = {"pass": True, "why": []}
 
     def fail(why):
@@ -618,9 +625,9 @@ def run_scenario(name):
                 time.sleep(0.05)
 
         elif name == "min_separation":
-            log(f"시나리오: 리더 {SEP_SPEED} m/s 로 {SEP_STRAIGHT:.0f}초 북진(추종 정착) → "
-                f"팔로워 쪽으로 {SEP_CHARGE} m/s 돌진 {SEP_CHARGE_SEC:.0f}초. 접근 속도가 "
-                f"MAX_VX({main.MAX_VX}) 보다 커서 후퇴로는 못 벗어난다 — 측면 회피가 동작하는가")
+            log(f"시나리오: 리더 {SEP_SPEED} m/s 로 {SEP_STRAIGHT:.0f}초 북진(추종 정착) → 팔로워 쪽으로 "
+                f"{SEP_CHARGE} m/s 돌진. 접근 속도가 MAX_VX({main.MAX_VX}) 보다 커서 후퇴로는 못 벗어난다 "
+                f"— 측면 회피가 동작하는가")
             log(f"판정 기준: 접촉 {SEP_HARD_FLOOR_M:.2f}m, 회피 반경 {SEP_RADIUS_M:.1f}m, 측면 ≥ {SEP_MIN_LATERAL:.2f} m/s")
             while (not World.stop and World.generation == gen) and not World.have_fix:
                 time.sleep(0.2)
@@ -628,12 +635,21 @@ def run_scenario(name):
             while (not World.stop and World.generation == gen) and time.time() - t0 < SEP_STRAIGHT:
                 World.l_n += SEP_SPEED * 0.1
                 time.sleep(0.1)
-            log(f"리더 돌진 시작 ({SEP_CHARGE} m/s, 정면)")
-            t0 = time.time()
-            while (not World.stop and World.generation == gen) and time.time() - t0 < SEP_CHARGE_SEC:
-                World.l_n -= SEP_CHARGE * 0.1
-                time.sleep(0.1)
-            log("돌진 종료, 리더 정지 — 팔로워가 목표 거리로 회복하는지 관측")
+            d_start = float(np.sqrt((World.l_n - World.f_n) ** 2 + (World.l_e - World.f_e) ** 2
+                                    + (World.l_d - World.f_d) ** 2))
+            log(f"리더 돌진 시작 ({SEP_CHARGE} m/s, 정면). 현재 거리 {d_start:.2f}m → {SEP_ENTER_M:.1f}m 까지 밀어붙인다")
+            t0 = t_prev = time.time()
+            d_now = d_start
+            while (not World.stop and World.generation == gen) and time.time() - t0 < SEP_CHARGE_MAX_SEC:
+                d_now = float(np.sqrt((World.l_n - World.f_n) ** 2 + (World.l_e - World.f_e) ** 2
+                                      + (World.l_d - World.f_d) ** 2))
+                if d_now <= SEP_ENTER_M:
+                    break
+                tn = time.time()
+                World.l_n -= SEP_CHARGE * (tn - t_prev)     # 경과 시간으로 적분 (고정 스텝은 타이머 정확도에 좌우된다)
+                t_prev = tn
+                time.sleep(0.05)
+            log(f"돌진 종료 ({time.time() - t0:.1f}초, 거리 {d_now:.2f}m), 리더 정지 — 회복 관측")
 
         elif name == "hover_hold":
             log("시나리오: 리더 전진 후 정지 → 팔로워가 정위치를 유지하는가 (H2)")
