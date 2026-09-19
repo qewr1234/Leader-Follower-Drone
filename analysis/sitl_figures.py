@@ -84,9 +84,10 @@ def _mode_shading(ax, t, modes, ymax_text):
         if m in MODE_TINT:
             col, al = MODE_TINT[m]
             ax.axvspan(t[a], t[min(b, len(t) - 1)], color=col, alpha=al, lw=0)
-    for i in change[1:-1]:
+    for j, i in enumerate(change[1:-1]):
         ax.axvline(t[i], color=C["ink2"], lw=0.8, ls=(0, (3, 2)))
-        ax.text(t[i] + 0.3, ymax_text, f"{modes[i]}\n{t[i]:.0f} s", fontsize=7.5, color=C["ink2"], va="top")
+        ax.text(t[i] + 0.3, ymax_text - (0.0 if j % 2 == 0 else 3.4), f"{modes[i]}\n{t[i]:.0f} s",
+                fontsize=7.5, color=C["ink2"], va="top")
 
 
 def fig_regression(run, summary, out_name="sitl_regression.png"):
@@ -106,7 +107,17 @@ def fig_regression(run, summary, out_name="sitl_regression.png"):
             ax.text(t[0] + 0.5, target + 0.08, f"target {target:.1f} m", fontsize=7.5, color=C["ink2"])
             late = r["front_m"][t > t[-1] * 0.6]
             if late.size:
-                ax.text(t[-1], float(np.nanmean(late)) + 0.1, f"late mean {np.nanmean(late):.1f} m", ha="right", fontsize=7.5)
+                ax.text(t[-1], float(np.nanmean(late)) + 0.12, f"late mean {np.nanmean(late):.1f} m", ha="right", fontsize=7.5)
+            if name == "depth_range":
+                # 정상상태 오차 = (v − KFF·(v − DB))/Kp. v 0.3, KFF 0.8, DB 0.05, Kp 0.22 → 0.45 m
+                ss = target + 0.45
+                ax.axhline(ss, color=C["aqua"], lw=1.0, ls=(0, (2, 2)))
+                ax.text(t[0] + 0.5, ss + 0.08, f"theory {ss:.2f} m", fontsize=7.5, color=C["aqua"])
+                tail = r["front_m"][t > t[-1] - 3.0]
+                if tail.size and float(np.nanmean(tail)) - ss > 0.15:
+                    ax.text(t[0] + 0.5, float(np.nanmin(r["front_m"])) - 0.45,
+                            f"still converging at end of run ({np.nanmean(tail):.2f} m at {t[-1]:.0f} s)",
+                            fontsize=7.5, color=C["ink2"])
             ax.set_ylabel("distance to leader [m]")
             ax.set_ylim(min(2.0, float(np.nanmin(r["front_m"])) - 0.3), float(np.nanmax(r["front_m"])) + 0.8)
         elif name == "hold_heading":
@@ -124,6 +135,9 @@ def fig_regression(run, summary, out_name="sitl_regression.png"):
             ax.set_ylim(0, ymax + 1.5)
             _mode_shading(ax, t, r["fc_mode"], ymax + 1.2)
             ax.set_ylabel("follower altitude AGL [m]")
+            if name in ("pilot_takeover", "handover") and float(np.nanmin(agl)) < 1.0:
+                ax.text(t[-1], 2.4, "descends under SITL LOITER\n(no RC throttle in the harness)", ha="right", fontsize=7.5,
+                        color=C["ink2"], va="bottom")
             if name == "air_landing":
                 ax.plot(t, agl + (r["leader_d"] - r["fol_d"]) * -1.0, color=C["orange"], lw=1.4)   # 리더 고도 = 팔로워 AGL + (up)
                 ax.text(t[-1], float(np.nanmin(agl + (r["leader_d"] - r["fol_d"]) * -1.0)) - 1.0, "leader (descends)", ha="right",

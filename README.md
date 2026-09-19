@@ -104,6 +104,15 @@ EKF 상대 속도의 합입니다.
 1.80배), 파랑이 현재(최대 1.13배). 점은 같은 주파수에서 ArduCopter SITL 로 실측한 값으로, 수정 전 코드 1.95배(FAIL),
 현재 코드 0.72 / 0.43배(PASS). 곡선은 `analysis/stability_margins.py`, 그림은 `analysis/readme_figures.py` 가 만듭니다.
 
+<p align="center">
+  <img src="docs/images/sitl_leader_sine.png" alt="ArduCopter SITL 의 leader_sine 시나리오: 수정 전 코드와 현재 코드의 리더·팔로워 속도" width="100%">
+</p>
+
+같은 시나리오를 ArduCopter SITL 에서 실제로 비행시킨 기록입니다(`sitl/results/`, 그림은 `analysis/sitl_figures.py`).
+리더가 0.25 ± 0.05 m/s 로 5.5 초 주기로 가감속할 때, **수정 전 코드(위)는 팔로워 속도 진폭이 2.15배로 커지고 위상도
+반대로 돌아갑니다.** 현재 코드(아래)는 0.70배로 리더보다 완만하게 따라갑니다. 차등 검증이라 수정 전 코드에서 결함이
+실제로 재현되는 것까지 확인했습니다.
+
 ## 안전 설계
 
 비행 안전과 관련된 동작은 전부 SITL에서 실제 비행으로 검증했습니다.

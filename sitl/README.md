@@ -276,6 +276,8 @@ git worktree remove --force /tmp/mars_before
 |---|---|---|---|
 | 현재 (82b4f74) | **0.43** (단독 실행) / **0.72** (`--all` 안에서) | PASS | 팔로워 평균 0.27 m/s, 거리 평균 4.28 / 3.37 m, 거리 진폭 0.03 / 0.06 m. 미션 FOLLOW 유지 |
 | 수정 전 e4b4cd7 | **1.95** | **FAIL** | 속도 진폭 0.097 m/s, 거리 진폭 0.11 m. 추정 리더 속도가 0.15~0.42 로 흔들려 미션이 FOLLOW↔LEADER_HOVER 를 5.5 s 주기로 오갔음 |
+| 현재 (CSV 실행 `20260919-090834_current`) | **0.70** | PASS | 속도 진폭 0.035 m/s. CSV 와 그림이 저장소에 있음 |
+| 수정 전 (CSV 실행 `20260919-091549_mars_before`) | **2.15** | **FAIL** | 속도 진폭 0.107 m/s. 진폭뿐 아니라 위상이 반대로 돌아 리더 가속 구간에 팔로워가 감속 |
 
 2026-09-18 WSL1 실측(ArduCopter 4.5 SITL). 선형 모델 예측(현재 0.67, 수정 전 1.8)과 비선형 체인 시뮬 예측(0.70, 2.3) 사이에
 들어옵니다. 현재 코드의 두 값 차이(0.43 / 0.72)는 단독 실행 중 콘솔 정지(FPS=0.1 한 번)가 정착 구간에 걸린 영향으로 보이며
@@ -305,3 +307,14 @@ git add sitl/results && git commit -m "SITL 결과 CSV" && git push         # �
 python3 analysis/sitl_figures.py sitl/results/<시각>_current --before sitl/results/<시각>_mars_before
 #  → docs/images/sitl_regression.png (8개 시나리오 실측), docs/images/sitl_leader_sine.png (리더 vs 팔로워 속도, 진폭비)
 ```
+
+## 6. 하네스 한계 — 조종사 역할이 고도를 유지하지 못한다 (2026-09-19 CSV 로 발견)
+
+`pilot_takeover` 와 `handover` 는 `pilot.set_mode("LOITER")` 로 조종사 탈환을 흉내냅니다. 그런데 RC 입력이 없는
+SITL 에서 LOITER 는 스로틀 채널을 최소로 읽어 기체가 지면까지 내려갑니다 (`agl_m` 이 0 으로 떨어지는 것을 CSV 에서
+확인). 판정 자체는 유효합니다 — 우리 코드가 LAND 를 다시 보내지 않는 것, 인계 직후 LAND 가 없는 것을 봅니다. 다만
+`handover` 가 의도한 "수동으로 12 초 상승한 뒤 공중에서 인계" 는 실제로는 지상에서의 인계였습니다.
+
+고치려면 조종사 링크가 LOITER 중 RC override 로 스로틀을 중립 이상으로 보내야 합니다
+(`pilot.mav.rc_channels_override_send`). 고친 뒤에는 `handover` 의 인계 고도가 15 m 근처로 유지되는지 CSV 의
+`agl_m` 으로 확인하면 됩니다.
