@@ -697,8 +697,8 @@ check("정리: mavlink_io 모터 테스트 계열 제거",
       not any(hasattr(mavlink_io, n) for n in ("motor_test_percent", "trigger_motors", "stop_all_motors")))
 check("정리: detector.select_target 제거", not hasattr(_det, "select_target"))
 _h = open("sitl/harness.py", encoding="utf-8").read()
-check("하네스: --all이 depth_loss·handover·leader_sine까지 포함",
-      '"depth_loss", "handover", "leader_sine"] if ARGS.all' in _h)
+check("하네스: --all이 depth_loss·handover 까지 포함",
+      '"depth_loss", "handover"' in _h)
 
 # ------------------------------------------------- 불확실성 분기의 타이머 초기화
 # pos_cov_trace > 8.0 이면 리더가 보여도 LOST_HOLD 로 간다. 이때도 착륙 후보 타이머를 끊어야
@@ -1134,22 +1134,44 @@ _ek_noego = ImmEkf(); _ek_noego.init([0.0, 0.0, 3.0])
 check("IMM: 자기 속도를 주지 않으면 leader_velocity() 는 상대 속도 그대로 (기본값 0)",
       np3.allclose(_ek_noego.filters[0].leader_velocity(), _ek_noego.filters[0].x[3:6]))
 
-# ------------------------------------------------- 최소 이격 제약
-_ms = main.MIN_SEPARATION_M
+# ------------------------------------------------- 최소 이격 + 측면 회피
+_ms, _rad = main.MIN_SEPARATION_M, main.EVADE_RADIUS_M
 _far = main.enforce_min_separation([0.3, 0.0, 0.0], [_ms + 1.0, 0.0, 0.0])
 check("이격: 최소 이격 밖에서는 명령을 건드리지 않음", np3.allclose(_far, [0.3, 0.0, 0.0]), f"{_far}")
-_near = main.enforce_min_separation([0.3, 0.0, 0.0], [_ms - 0.5, 0.0, 0.0])
-check("이격: 침범하면 접근 성분이 사라지고 침범량에 비례해 후퇴 (0.5m 침범 → -0.6·0.5)",
-      abs(_near[0] + main.MIN_SEPARATION_KP * 0.5) < 1e-9, f"{_near}")
-_lateral = main.enforce_min_separation([0.3, 0.2, 0.0], [_ms - 0.5, 0.0, 0.0])
+_near = main.enforce_min_separation([0.3, 0.0, 0.0], [_ms - 0.1, 0.0, 0.0])   # 회피 반경 밖, 이격 안
+check("이격: 침범하면 접근 성분이 사라지고 침범량에 비례해 후퇴 (0.1m 침범 → -0.6·0.1)",
+      _ms - 0.1 > _rad and abs(_near[0] + main.MIN_SEPARATION_KP * 0.1) < 1e-9, f"{_near}")
+_lateral = main.enforce_min_separation([0.3, 0.2, 0.0], [_ms - 0.1, 0.0, 0.0])
 check("이격: 시선에 수직인 성분(횡방향)은 그대로 둔다 — 추종을 끊지 않고 파고들기만 막는다",
       abs(_lateral[1] - 0.2) < 1e-9, f"{_lateral}")
-_side = main.enforce_min_separation([0.0, 0.3, 0.0], [0.1, _ms - 0.6, 0.0])
-check("이격: 전후축이 아니라 3차원 거리로 판정 — 선회 중 측면 접근도 막는다 (관측된 최근접 1.59m)",
-      _side[1] < 0.0, f"{_side}")
-_cmd_near = main.compute_velocity_cmd_from_estimate([_ms - 0.5, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0, 3.0)
-check("이격: 제어기 출력에도 적용 — 목표 3m 보다 가까워도 최소 이격 안에서는 전진하지 않음",
-      _cmd_near[0] < 0.0, f"cmd={_cmd_near.round(3)}")
+_side = main.enforce_min_separation([0.0, 0.3, 0.0], [0.1, _ms - 0.2, 0.0])
+check("이격: 전후축이 아니라 3차원 거리로 판정 — 선회 중 측면 접근도 막는다",
+      _side[1] < 0.3, f"{_side}")
+
+# P 항과의 중복 구간 — 이 교차점이 '1단계가 대부분 놀고 있다'는 사실의 근거다 (main.enforce_min_separation 주석)
+_cross = (main.MIN_SEPARATION_KP * _ms - main.KP_FORWARD * main.TARGET_DISTANCE_M) / (main.MIN_SEPARATION_KP - main.KP_FORWARD)
+check("이격: 거리 1.42m 위에서는 P 항이 제약보다 강하다 — 1단계는 이론적 바닥이지 상시 보호가 아님",
+      abs(_cross - 1.42) < 0.02
+      and main.KP_FORWARD * (_ms - main.TARGET_DISTANCE_M) < -main.MIN_SEPARATION_KP * (_ms - _ms),
+      f"교차 {_cross:.3f}m")
+
+# 측면 회피: 후퇴가 포화된 뒤의 마지막 수단
+_ev_r = main.enforce_min_separation([0.0, 0.0, 0.0], [_rad - 0.5, 0.0, 0.0])
+check("회피: 회피 반경 안에서 리더가 정면이면 측면 속도가 붙는다 (부호는 오른쪽으로 통일)",
+      _ev_r[1] > 0.05, f"{_ev_r}")
+_ev_left = main.enforce_min_separation([0.0, 0.0, 0.0], [0.5, 1.0, 0.0])
+check("회피: 리더가 오른쪽에 있으면 왼쪽으로 비킨다", _ev_left[1] < 0.0, f"{_ev_left}")
+_ev_none = main.enforce_min_separation([0.0, 0.0, 0.0], [_rad + 0.3, 0.0, 0.0])
+check("회피: 회피 반경 밖에서는 측면 속도를 넣지 않는다", abs(_ev_none[1]) < 1e-9, f"{_ev_none}")
+_ev_lim = main.enforce_min_separation([0.0, main.MAX_VY, 0.0], [0.2, -1.0, 0.0])
+check("회피: 측면 성분도 MAX_VY 로 포화된다", abs(_ev_lim[1]) <= main.MAX_VY + 1e-9, f"{_ev_lim}")
+
+_cmd_near = main.compute_velocity_cmd_from_estimate([_ms - 0.1, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0, 3.0)
+check("이격: 제어기 출력에도 적용 — 목표 3m 보다 가까우면 전진하지 않는다", _cmd_near[0] < 0.0, f"cmd={_cmd_near.round(3)}")
+
+_h = open("sitl/harness.py", encoding="utf-8").read()
+check("하네스: --all 이 min_separation 까지 포함 (10개)",
+      '"leader_sine", "min_separation"] if ARGS.all' in _h)
 
 # ---------------------------------------------------------------- 
 print()

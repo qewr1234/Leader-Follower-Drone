@@ -37,7 +37,7 @@ _P = argparse.ArgumentParser(description=__doc__,
 _P.add_argument("--scenario", default="boot_no_leader",
                 choices=["boot_no_leader", "pilot_takeover", "hold_heading",
                          "air_landing", "depth_range", "hover_hold", "px4_setmode",
-                         "depth_loss", "handover", "leader_sine"])
+                         "depth_loss", "handover", "leader_sine", "min_separation"])
 _P.add_argument("--all", action="store_true", help="모든 시나리오를 순서대로")
 _P.add_argument("--repo", default=str(__import__("pathlib").Path(__file__).resolve().parent.parent),
                 help="검사할 저장소 경로 (대조군은 수정 전 worktree를 지정)")
@@ -68,6 +68,14 @@ FX = FY = 384.0
 SINE_W, SINE_MEAN, SINE_AMP = 1.15, 0.25, 0.05
 SINE_SETTLE = 20.0                       # FOLLOW 진입 + FF 저역통과 2s + 과도 정착
 SINE_DURATION = SINE_SETTLE + 6 * 2 * 3.14159 / SINE_W   # 정착 뒤 6주기 (≈53s)
+
+# min_separation: 리더가 SEP_STRAIGHT 초 북진해 추종을 정착시킨 뒤, 팔로워 쪽으로 SEP_CHARGE m/s 로 돌진한다.
+# 접근 속도가 MAX_VX(0.35) 보다 크므로 정면 후퇴로는 원리적으로 벗어날 수 없다 — 측면 회피가 유일한 수단이다.
+# 오프라인 모의(실제 main.* 제어 함수) 예측: 회피 없으면 0.01m(접촉), 있으면 0.41m, 측면 속도 0.27 m/s.
+SEP_SPEED, SEP_STRAIGHT = 0.30, 10.0
+SEP_CHARGE, SEP_CHARGE_SEC = 0.70, 8.0
+SEP_HARD_FLOOR_M = 0.15       # 이 아래면 접촉으로 본다
+SEP_MIN_LATERAL = 0.08        # 회피 반경 안에서 관측돼야 하는 시선수직(수평) 속도 [m/s]
 CX, CY = W / 2.0, H / 2.0
 
 
@@ -419,7 +427,7 @@ def run_scenario(name):
         main.get_vehicle_state = _no_local_position
         log("LOCAL_POSITION_NED 차단 → leader_alt_est=None 조건 재현")
 
-    seen_modes, headings, ranges, vels, rows = [], [], [], [], []
+    seen_modes, headings, ranges, vels, rows, seps = [], [], [], [], [], []
     last_heading = [None]
     sine_t0 = [None]
     land_seen_at = [None]
@@ -460,6 +468,19 @@ def run_scenario(name):
                 front, _, _ = World.relative_fru()
                 ranges.append((now, front, -World.f_d, in_fov()))     # fov 는 그 시점 값을 기록 (출력 시점 값이 아니라)
                 vels.append((now, float(msg.vx)))                     # 팔로워 북쪽 속도 (리더는 북진)
+                # 최소 이격 판정: 3차원 거리, 시선방향 속도(+ 접근), 수평면에서 시선에 수직인 속도(측면 회피)
+                _dn, _de, _dd = World.l_n - World.f_n, World.l_e - World.f_e, World.l_d - World.f_d
+                _d3 = float(np.sqrt(_dn * _dn + _de * _de + _dd * _dd))
+                _dh = float(np.hypot(_dn, _de))
+                if _d3 > 1e-6:
+                    _vlos = (float(msg.vx) * _dn + float(msg.vy) * _de + float(msg.vz) * _dd) / _d3
+                    if _dh > 1e-6:
+                        _un, _ue = _dn / _dh, _de / _dh
+                        _al = float(msg.vx) * _un + float(msg.vy) * _ue
+                        _vlat = float(np.hypot(float(msg.vx) - _al * _un, float(msg.vy) - _al * _ue))
+                    else:
+                        _vlat = 0.0
+                    seps.append((now, _d3, _vlos, _vlat))
                 rows.append((now, front, -World.f_d, int(in_fov()), float(msg.vx), World.f_n, World.f_e, World.f_d,
                              World.l_n, World.l_e, World.l_d, seen_modes[-1][1] if seen_modes else "", last_heading[0]))
 
@@ -590,6 +611,23 @@ def run_scenario(name):
                 t_prev = tn
                 time.sleep(0.05)
 
+        elif name == "min_separation":
+            log(f"시나리오: 리더 {SEP_SPEED} m/s 로 {SEP_STRAIGHT:.0f}초 북진(추종 정착) → "
+                f"팔로워 쪽으로 {SEP_CHARGE} m/s 돌진 {SEP_CHARGE_SEC:.0f}초. 접근 속도가 "
+                f"MAX_VX({main.MAX_VX}) 보다 커서 후퇴로는 못 벗어난다 — 측면 회피가 동작하는가")
+            while (not World.stop and World.generation == gen) and not World.have_fix:
+                time.sleep(0.2)
+            t0 = time.time()
+            while (not World.stop and World.generation == gen) and time.time() - t0 < SEP_STRAIGHT:
+                World.l_n += SEP_SPEED * 0.1
+                time.sleep(0.1)
+            log(f"리더 돌진 시작 ({SEP_CHARGE} m/s, 정면)")
+            t0 = time.time()
+            while (not World.stop and World.generation == gen) and time.time() - t0 < SEP_CHARGE_SEC:
+                World.l_n -= SEP_CHARGE * 0.1
+                time.sleep(0.1)
+            log("돌진 종료, 리더 정지 — 팔로워가 목표 거리로 회복하는지 관측")
+
         elif name == "hover_hold":
             log("시나리오: 리더 전진 후 정지 → 팔로워가 정위치를 유지하는가 (H2)")
             while (not World.stop and World.generation == gen) and not World.have_fix:
@@ -696,6 +734,28 @@ def run_scenario(name):
                     fail(f"스트링 불안정: 리더 속도 변동이 팔로워에서 {ratio:.2f}배로 증폭 (ω={SINE_W} rad/s). "
                          f"체인 n 단 뒤에는 {ratio:.2f}^n 배")
 
+    if name == "min_separation":
+        floor, radius = float(main.MIN_SEPARATION_M), float(main.EVADE_RADIUS_M)
+        if len(seps) < 50:
+            fail(f"거리 샘플 부족 ({len(seps)}개) — 판정 불가")
+        else:
+            d_min = min(d for _, d, _, _ in seps)
+            inside = [x for x in seps if x[1] < radius]
+            lat_max = max((x[3] for x in inside), default=0.0)
+            log(f"최소 3차원 거리 {d_min:.2f}m (이격 바닥 {floor:.1f}m, 회피 반경 {radius:.1f}m), "
+                f"회피 반경 안 {len(inside)}샘플, 최대 측면 속도 {lat_max:.2f} m/s")
+            verdict["note"] = f"min_dist {d_min:.2f}m lat_max {lat_max:.2f} inside {len(inside)}"
+            if not inside:
+                fail(f"회피 반경({radius:.1f}m) 안으로 들어가지 못해 회피가 발동하지 않음 "
+                     f"(최소 {d_min:.2f}m) — 시나리오가 조건을 만들지 못했다. 판정 무효")
+            else:
+                if d_min < SEP_HARD_FLOOR_M:
+                    fail(f"최소 이격: 거리가 {d_min:.2f}m 까지 줄어 접촉({SEP_HARD_FLOOR_M:.2f}m)으로 본다 — "
+                         f"측면 회피가 동작하지 않는다")
+                if lat_max < SEP_MIN_LATERAL:
+                    fail(f"최소 이격: 회피 반경 안 측면 속도가 최대 {lat_max:.2f} m/s 뿐 "
+                         f"(기대 ≥ {SEP_MIN_LATERAL:.2f}) — 비켜서지 않고 정면 후퇴만 하고 있다")
+
     if name == "hold_heading":
         late = [h for t, h in headings if t > 10.0]
         if len(late) > 5:
@@ -726,10 +786,10 @@ def run_scenario(name):
 
 
 if __name__ == "__main__":
-    # ArduCopter SITL로 도는 9개 전부. px4_setmode만 PX4 엔드포인트가 필요해 제외한다.
+    # ArduCopter SITL로 도는 10개 전부. px4_setmode만 PX4 엔드포인트가 필요해 제외한다.
     names = ["boot_no_leader", "pilot_takeover", "air_landing",
              "depth_range", "hover_hold", "hold_heading",
-             "depth_loss", "handover", "leader_sine"] if ARGS.all \
+             "depth_loss", "handover", "leader_sine", "min_separation"] if ARGS.all \
         else [ARGS.scenario]
     print(f"저장소: {ARGS.repo}")
     if CSV_RUN_DIR:

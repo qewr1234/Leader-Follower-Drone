@@ -92,6 +92,9 @@ FF_DEADBAND_MPS = float(CONFIG["controller"].get("leader_vel_ff_deadband_mps", 0
 # 최소 이격: 이 거리 아래로는 접근 성분을 0 으로 자르고 침범량에 비례해 물러난다 (compute_velocity_cmd_from_estimate).
 MIN_SEPARATION_M = float(CONFIG["controller"].get("min_separation_m", 2.0))
 MIN_SEPARATION_KP = float(CONFIG["controller"].get("min_separation_kp", 0.6))
+# 측면 회피: 후퇴가 MAX_VX 에 포화된 뒤의 마지막 수단.
+EVADE_RADIUS_M = float(CONFIG["controller"].get("evade_radius_m", 1.5))
+EVADE_SPEED_MPS = float(CONFIG["controller"].get("evade_speed_mps", 0.22))
 
 SETPOINT_PERIOD_SEC = 0.10
 # C2: LAND 가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
@@ -274,12 +277,19 @@ def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
 
 
 def enforce_min_separation(cmd_fru, rel_fru):
-    """리더까지의 거리가 MIN_SEPARATION_M 아래면 명령의 '접근 성분'만 잘라낸다 (횡방향은 그대로 둔다).
+    """근접 시 두 단계로 개입한다. 1) 시선 방향 접근 성분 제거 2) 그래도 좁혀지면 측면 회피.
 
-    전후축만 보면 선회 중 측면으로 파고드는 경우를 못 막는다 — 실제로 선회 시 최근접 1.59m 가 관측됐다.
-    그래서 3차원 시선 방향으로 사영한 성분에 제약을 건다. 침범했을 때는 0 이 아니라 침범량에 비례한
-    후퇴 속도까지 허용해, 바닥에 닿은 채 미끄러지지 않고 되돌아 나오게 한다.
-    목표 거리(3m) 추종은 그대로 P+D 가 하고, 이 함수는 그 아래의 바닥 역할만 한다.
+    **1단계(접근 성분 제거)는 대부분의 구간에서 P 항과 중복이다.** 목표 3m·바닥 2m·KP 0.22 에서
+    P 항이 내는 후퇴가 -KP·(3-d) 이고 이 제약의 허용치가 -KS·(2-d) 이므로, 거리 1.42m 위에서는
+    P 가 항상 더 강하다(`test_fixes.py` 의 `이격:` 검사가 이 교차점을 고정한다). 실제로 무는 경우는
+    피드포워드가 바닥에서 0.275 m/s 를 넘을 때뿐인데, 그러려면 리더가 0.39 m/s 이상으로 움직여야 하고
+    그건 MAX_VX 0.35 로는 추종이 안 되는 속도다. 즉 이 단계는 '이론적 바닥'이지 상시 동작하는 보호가 아니다.
+    그래도 남겨 둔다 — 이득을 올리거나 MAX_VX 를 키우면 바로 의미가 생기는 자리이고, 비용이 0 이다.
+
+    **2단계(측면 회피)가 실제 보호다.** 리더가 MAX_VX 보다 빠르게 다가오면 정면 후퇴로는 원리적으로
+    벗어날 수 없다(0.5 m/s 로 다가오면 최소 0.84m, 0.6 m/s 면 접촉 — 오프라인 모의). 느린 기체가 쓸 수 있는
+    유일한 회피는 비켜서는 것이라, EVADE_RADIUS_M 안에서는 시선에 수직인 방향으로 측면 속도를 얹는다.
+    방향은 리더가 치우친 반대쪽 — 이미 오른쪽에 있으면 왼쪽으로 빠진다. 수직 성분은 쓰지 않는다(MAX_VZ 0.12 로 너무 느리다).
     """
     cmd = np.asarray(cmd_fru, dtype=float)[:3].copy()
     rel = np.asarray(rel_fru, dtype=float)[:3]
@@ -290,9 +300,15 @@ def enforce_min_separation(cmd_fru, rel_fru):
     u = rel / dist                                  # 리더 쪽 단위 벡터 (FRU)
     v_along = float(cmd @ u)                        # + 면 접근 중
     v_allowed = -MIN_SEPARATION_KP * (MIN_SEPARATION_M - dist)   # 음수 = 물러나는 속도
-    if v_along <= v_allowed:
-        return cmd
-    cmd = cmd + (v_allowed - v_along) * u
+    if v_along > v_allowed:
+        cmd = cmd + (v_allowed - v_along) * u
+
+    if dist < EVADE_RADIUS_M:
+        # 수평면에서 시선에 수직인 방향. 리더가 정면(right≈0)이면 부호가 정해지지 않으므로 오른쪽으로 통일한다.
+        lat = -1.0 if rel[1] > 0.0 else 1.0         # 리더가 오른쪽이면 왼쪽(-)으로 비킨다
+        frac = clamp((EVADE_RADIUS_M - dist) / max(EVADE_RADIUS_M, 1e-6), 0.0, 1.0)
+        cmd[1] += lat * EVADE_SPEED_MPS * frac
+
     lim = (MAX_VX, MAX_VY, MAX_VZ)
     for i in range(3):
         cmd[i] = clamp(cmd[i], -lim[i], lim[i])

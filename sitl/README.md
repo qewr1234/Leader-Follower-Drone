@@ -58,7 +58,7 @@ chmod +x arducopter
 ## 3. 회귀 실행
 
 ```bash
-python3 sitl/harness.py --all      # ArduCopter 시나리오 9개. px4_setmode는 PX4 엔드포인트 필요
+python3 sitl/harness.py --all      # ArduCopter 시나리오 10개. px4_setmode는 PX4 엔드포인트 필요
 ```
 
 하네스가 GUIDED 진입 → ARM → 이륙까지 알아서 하고, 시나리오마다 다시 이륙시킵니다. 직전 시나리오가
@@ -80,6 +80,7 @@ GUIDED 이륙 명령을 거부합니다.
 | `depth_loss` | 거리 게이트 | 깊이만 죽었을 때(검출은 유지) 10초 뒤 착륙하지 않음 |
 | `handover` | GUIDED 인계 | 수동 상승 후 GUIDED로 넘기는 순간 LAND가 나감 |
 | `leader_sine` | 스트링 안정성 | 리더 0.25 ± 0.05 m/s 정현파(1.15 rad/s)에 대한 팔로워 속도 진폭비 > 1 (증폭) |
+| `min_separation` | 근접 회피 | 리더가 0.7 m/s 로 정면 돌진할 때 접촉(0.15 m 이하)하거나 측면 회피가 없음 |
 
 월드는 **폐루프**입니다 — 팔로워가 실제로 움직이면 리더까지의 거리가 변합니다. 팔로워 위치와
 기수는 SITL의 `LOCAL_POSITION_NED` / `ATTITUDE`로 갱신되며, 그래야 정위치 유지(H2)나 거리
@@ -343,3 +344,38 @@ SITL 에서 LOITER 는 스로틀 채널을 최소로 읽어 기체가 지면까�
 고치려면 조종사 링크가 LOITER 중 RC override 로 스로틀을 중립 이상으로 보내야 합니다
 (`pilot.mav.rc_channels_override_send`). 고친 뒤에는 `handover` 의 인계 고도가 15 m 근처로 유지되는지 CSV 의
 `agl_m` 으로 확인하면 됩니다.
+
+## 7. min_separation — 근접 회피 (2026-09-20 추가, 미실행)
+
+최소 이격 제약을 넣고 나서 회귀를 돌렸더니 최근접이 3.02 m 라 제약이 한 번도 발동하지 않았습니다. 왜 발동하지
+않는지 따져 보니 **거리 1.42 m 위에서는 P 항의 후퇴 명령이 제약의 허용치보다 항상 강했습니다**
+(`-KP·(3−d)` 대 `-KS·(2−d)`, 교차 1.42 m). 즉 제약은 P 항과 중복이었습니다.
+
+진짜 빈 구간은 다른 곳이었습니다. **리더가 MAX_VX(0.35 m/s)보다 빠르게 다가오면 정면 후퇴로는 원리적으로
+벗어날 수 없습니다.** 느린 기체가 쓸 수 있는 유일한 회피는 비켜서는 것이라, 회피 반경 1.5 m 안에서 시선에
+수직인 측면 속도를 얹도록 했습니다(`main.enforce_min_separation` 2단계).
+
+시나리오는 리더가 10초 북진해 추종을 정착시킨 뒤 0.7 m/s 로 8초간 정면 돌진합니다. 실제 `main.*` 제어 함수로
+돌린 오프라인 모의 예측은 이렇습니다.
+
+| 리더 접근 속도 | 회피 없음 | 회피 있음 |
+|---|---|---|
+| 0.50 m/s | 0.84 m | 0.85 m |
+| 0.60 m/s | 접촉 (0.00 m) | 0.54 m |
+| 0.70 m/s | 접촉 (0.01 m) | 0.41 m |
+| 1.00 m/s | 접촉 (0.01 m) | 0.19 m |
+
+```bash
+python3 sitl/harness.py --scenario min_separation                      # 현재 (예측 0.41m, 측면 0.27 m/s)
+git worktree add --detach /tmp/mars_noevade da515dd                    # 회피 추가 전
+python3 sitl/harness.py --scenario min_separation --repo /tmp/mars_noevade   # 대조군 (접촉 → FAIL 이어야 함)
+git worktree remove --force /tmp/mars_noevade
+```
+
+**한계를 분명히 해 둡니다.** 0.19~0.54 m 는 여유가 아닙니다. 리더가 빠르게 다가오는 상황에서 이 기체가 할 수
+있는 최선일 뿐이고, 근본 해결은 `MAX_VX`·`MAX_VY` 를 올리거나 리더 운용 절차로 막는 것입니다.
+
+| 저장소 | 최소 거리 | 측면 속도 | 판정 |
+|---|---|---|---|
+| 현재 | (미실행) | | |
+| 회피 전 da515dd | (미실행) | | |
