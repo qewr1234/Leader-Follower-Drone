@@ -249,7 +249,7 @@ class FakeCam:
         CLOCK.tick()
         FC.step(CLOCK.DT)
         scenario(CLOCK.sim)
-        World.dist.append((CLOCK.sim, World.relative_fru()[0]))
+        World.dist.append((CLOCK.sim, World.relative_fru()[0], World.visible))
         color = np.zeros((H, W, 3), dtype=np.uint8)
         depth = np.full((H, W), 15000, dtype=np.uint16)
         if World.visible:
@@ -359,7 +359,7 @@ def front_at(t):
 
 
 _e105 = front_at(10.5) - main.TARGET_DISTANCE_M
-_dmin = min(d for t, d in World.dist if 11.0 <= t <= 16.0)
+_dmin = min(d for t, d, _ in World.dist if 11.0 <= t <= 16.0)
 # 리더는 3.0s 에 출발, FOLLOW 확정은 ~5.1s 라 그 사이 0.6m 가 벌어진 채 시작한다. 같은 조건에서 P 만이면 +1.15m.
 check("FOLLOW 중(리더 0.3m/s, t=10.5s) 거리 오차 < 0.7m — 피드포워드 (KFF=0 이면 +1.15m, 정상상태 v/Kp=1.36m. FF 저역통과 2s·데드존 0.05 뒤 정상상태 0.45m)",
       abs(_e105) < 0.7, f"front-target={_e105:+.2f}m")
@@ -386,6 +386,8 @@ stream = {
     "mode_calls": [list(c) for c in FC.mode_calls],
     "states": [list(s) for s in STATES],
     "final_pose": [round(World.f_n, 6), round(World.f_e, 6), round(World.f_d, 6), round(World.f_yaw, 6)],
+    # 그림용 (analysis/readme_figures.py): 프레임별 (sim_t, 리더 거리, 리더 가시)
+    "dist": [[round(t, 4), round(d, 4), int(v)] for t, d, v in World.dist],
 }
 
 if ARGS.dump:

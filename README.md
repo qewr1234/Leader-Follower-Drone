@@ -96,6 +96,23 @@ EKF 상대 속도의 합입니다.
 기울기가 3 이던 램프 대신 기울기 1 인 소프트 데드존(0.05 m/s)입니다. 실제 코드로 돌린 4단 체인 시뮬레이션이
 선형 예측과 4 % 안에서 맞고, SITL `leader_sine` 시나리오(ArduCopter 실측 0.72배, 수정 전 코드 1.95배)가 이를 확인했습니다.
 
+<p align="center">
+  <img src="docs/images/readme_string_stability.png" alt="리더→팔로워 속도 이득: 선형 모델 곡선(P+D 단독 / 수정 전 / 현재)과 ArduCopter SITL 실측점" width="100%">
+</p>
+
+리더 속도 변동이 팔로워에서 몇 배가 되는가(`|Γ(jω)|`). 회색이 P+D 단독, 주황이 수정 전 피드포워드(1.15 rad/s 에서
+1.80배), 파랑이 현재(최대 1.13배). 점은 같은 주파수에서 ArduCopter SITL 로 실측한 값으로, 수정 전 코드 1.95배(FAIL),
+현재 코드 0.72 / 0.43배(PASS). 곡선은 `analysis/stability_margins.py`, 그림은 `analysis/readme_figures.py` 가 만듭니다.
+
+<p align="center">
+  <img src="docs/images/sitl_leader_sine.png" alt="ArduCopter SITL 의 leader_sine 시나리오: 수정 전 코드와 현재 코드의 리더·팔로워 속도" width="100%">
+</p>
+
+같은 시나리오를 ArduCopter SITL 에서 실제로 비행시킨 기록입니다(`sitl/results/`, 그림은 `analysis/sitl_figures.py`).
+리더가 0.25 ± 0.05 m/s 로 5.5 초 주기로 가감속할 때, **수정 전 코드(위)는 팔로워 속도 진폭이 2.15배로 커지고 위상도
+반대로 돌아갑니다.** 현재 코드(아래)는 0.70배로 리더보다 완만하게 따라갑니다. 차등 검증이라 수정 전 코드에서 결함이
+실제로 재현되는 것까지 확인했습니다.
+
 ## 안전 설계
 
 비행 안전과 관련된 동작은 전부 SITL에서 실제 비행으로 검증했습니다.
@@ -137,6 +154,15 @@ python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 python3 analysis/stability_margins.py --plots   # 분석 층: 바깥 루프 선형 모델의 여유·스트링 안정성 (matplotlib)
 python3 analysis/trace_check.py                 # 요구도 ↔ 검사 추적성
 ```
+
+<p align="center">
+  <img src="docs/images/readme_closed_loop.png" alt="폐루프 시뮬레이션 40초: 리더 거리, 전진 속도 명령, 미션 상태 타임라인" width="100%">
+</p>
+
+2층 폐루프의 한 실행(`test_closed_loop.py`, 가짜 카메라·가짜 FC 로 실제 `main.main()` 을 30 fps 40 초). 리더가 0.3 m/s 로
+움직이면 FOLLOW 로 따라붙고(최대 뒤처짐 3.8 m, 명령은 `MAX_VX` 포화), 리더가 멈추면 LEADER_HOVER 로 3.0 m 에 정착합니다.
+4 초 가림은 LOST_HOLD 로 버티다 재검출 즉시 복귀하고, 영구 소실은 10 초 뒤 LAND 를 한 번 보냅니다. 이 스트림이 회귀의
+골든 파일입니다.
 
 시험 위에 **분석 층**이 있습니다. IMM-EKF 의 주파수응답을 실측해 바깥 루프의 개루프 전달함수를 세우고 위상·이득
 여유, 감도 피크, 리더→팔로워 속도 전달(스트링 안정성)을 계산한 뒤 실제 코드로 돌린 비선형 체인 시뮬레이션과

@@ -63,7 +63,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | SAF-02 | 리더를 한 번도 획득하지 않은 상태에서는 LAND 하지 않는다 | VERIFICATION C1 | T | UT[C1:]; SITL[boot_no_leader] | 검증됨 |
 | SAF-03 | 리더 소실 시 호버(LOST_HOLD) 로 버티다 총 10 s(코스트 2 + 홀드 8)에 LAND 하며, 깊이만 죽고 검출이 살아 있는 경우도 같다 | README 안전 설계 | T, I | UT[소실 후 착륙까지]; CL[4초 소실]; CL[영구 소실]; SITL[depth_loss]; INSPECT[mission_manager.py:lost_hold_sec=8.0] | 검증됨 |
 | SAF-04 | 절대 고도 없이 공중에서 착륙 판정을 내지 않고, 착륙 판정은 리더 절대 하강 속도로 한다 | VERIFICATION C3 | T | UT[C3:]; UT[미션: 착륙 판정도]; SITL[air_landing] | 검증됨 |
-| SAF-05 | GUIDED 진입 순간 미션·명령·피드포워드 상태를 리셋하고 출발 확인을 다시 요구한다 | README 안전 설계 | T | UT[재개: reset()]; CL[GUIDED 진입 후]; SITL[handover] | 검증됨 |
+| SAF-05 | GUIDED 진입 순간 미션·명령·피드포워드 상태를 리셋하고 출발 확인을 다시 요구한다 | README 안전 설계 | T | UT[재개: reset()]; CL[GUIDED 진입 후]; SITL[handover] | 부분 (인계 직후 LAND 없음은 확인. SITL 의 조종사 LOITER 가 RC 스로틀 없이 하강해 인계가 지상에서 일어났음 — 공중 인계는 미검증, sitl/README 6절) |
 | SAF-06 | AGL 1.5 m 아래에서는 하강 명령을 차단한다 | main.py `MIN_AGL_M` | I | UT[AGL 바닥]; INSPECT[main.py:MIN_AGL_M = 1.5] | 부분 (상수·분기 존재만, SITL 시나리오 없음) |
 | SAF-07 | 기본값은 dry-run(명령 미송신) 이다 | main.py | I | INSPECT[main.py:SEND_MAVLINK_COMMANDS = False] | 검증됨 |
 | SAF-08 | PX4 의 3-튜플 mode_mapping 에서도 set_mode 가 예외 없이 동작하고 실패해도 루프가 죽지 않는다 | VERIFICATION C6 | T | UT[C6:]; SITL[px4_setmode] | 검증됨 |
@@ -128,6 +128,8 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | SAF-06 | 부분 | AGL 바닥 차단 SITL 시나리오(저고도에서 하강 명령) |
 | SAF-10 | 부분 | 카메라 스톨 30 회 → HOLD → 종료 폐루프 시나리오 |
 | SAF-15 | 미검증 | 폐루프 실비행(안전줄·저고도부터) |
+| SAF-05 | 부분 | 하네스 조종사 링크에 RC override 를 넣어 LOITER 중 고도를 유지하게 고치고 `handover` 재실행 (sitl/README 6절) |
+| FCR-02 | 확인 필요 | `depth_range` 를 `--duration 60` 이상으로 재실행해 평형 거리 3.45 m 수렴 확인 |
 | IF-11 | 미검증 | ESP32 펌웨어 작성, 패킷 포맷 고정 |
 
 ## 4. 검사 방법
