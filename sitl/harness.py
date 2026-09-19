@@ -432,13 +432,20 @@ def run_scenario(name):
     # 로직을 건드리는 게 아니라 "메시지가 없는 환경"을 만드는 것이다.
     _real_state = main.get_vehicle_state       # 시나리오 끝에 반드시 원복 (아래 pilot.close() 앞)
     _real_send = main.send_body_velocity
+    _real_ctrl = main.compute_velocity_cmd_from_estimate
     cmds = []                                  # (t, vx, vy, vz) — BODY_NED 로 실제 송신한 명령
+    ctrl = []                                  # (t, 추정 3D 거리) — 제어기가 '불렸는가' 와 '무엇을 봤는가'
     if name == "min_separation":
         def _record_send(master, vx, vy, vz, yaw_rate=0.0):
             cmds.append((time.time() - T0, float(vx), float(vy), float(vz)))
             return _real_send(master, vx, vy, vz, yaw_rate)
 
+        def _record_ctrl(rel_fru, *a, **k):
+            ctrl.append((time.time() - T0, float(np.linalg.norm(np.asarray(rel_fru, dtype=float)[:3]))))
+            return _real_ctrl(rel_fru, *a, **k)
+
         main.send_body_velocity = _record_send
+        main.compute_velocity_cmd_from_estimate = _record_ctrl
     if name == "air_landing":
         def _no_local_position():
             st = dict(_real_state())
@@ -780,6 +787,17 @@ def run_scenario(name):
             log(f"최소 3차원 거리 {d_min:.2f}m (이격 바닥 {floor:.1f}m, 회피 반경 {radius:.1f}m), "
                 f"회피 반경 안 {len(inside)}샘플 / setpoint {len(cmds)}개")
             log(f"  명령된 측면 속도 최대 {cmd_lat:.2f} m/s → 기체 실측 측면 속도 최대 {lat_max:.2f} m/s")
+            # 제어기가 그 구간에 실제로 불렸는가, 그때 추정 거리는 얼마였는가 (미션이 FOLLOW 를 막으면 아예 안 불린다)
+            ctrl_in = [c for c in ctrl if t_lo is not None and t_lo <= c[0] <= t_hi]
+            est_min = min((c[1] for c in ctrl_in), default=None)
+            log(f"  제어기 호출 {len(ctrl_in)}회 (전체 {len(ctrl)}회), 그 구간 최소 '추정' 거리 "
+                f"{('%.2fm' % est_min) if est_min is not None else '없음'} (실제 {d_min:.2f}m)")
+            verdict["note"] = (verdict.get("note", "") + f" ctrl {len(ctrl_in)}/{len(ctrl)}"
+                               + (f" est_min {est_min:.2f}" if est_min is not None else " est_min none"))
+            if not ctrl_in:
+                log("!! 제어기가 한 번도 불리지 않았다 — 미션이 추종을 막았다(LOST_HOLD 등). 회피 이전의 문제다")
+            elif est_min is not None and est_min > radius:
+                log(f"!! 추정 거리가 회피 반경({radius:.1f}m) 밖이었다 — 제어기 관점에서는 회피 조건이 아니었다")
             verdict["note"] = f"min_dist {d_min:.2f}m cmd_lat {cmd_lat:.2f} body_lat {lat_max:.2f} inside {len(inside)}"
             if not inside:
                 fail(f"회피 반경({radius:.1f}m) 안으로 들어가지 못해 회피가 발동하지 않음 "
@@ -810,6 +828,7 @@ def run_scenario(name):
     # 돌아 피드포워드가 꺼지고(vL=nan, fresh=LP0) 미션이 상대 속도 폴백으로 간다 — 2026-09-18 WSL1 실측.
     main.get_vehicle_state = _real_state
     main.send_body_velocity = _real_send
+    main.compute_velocity_cmd_from_estimate = _real_ctrl
     ARGS.duration = _duration_saved
     pilot.close()
     meta = {"modes": ";".join(f"{t:.1f}:{m}" for t, m in seen_modes)}
