@@ -50,6 +50,10 @@ _P.add_argument("--force-target", type=float, default=None,
                 help="TARGET_DISTANCE_M 강제. 두 arm의 이동량을 통제할 때 사용 (C5 격리)")
 _P.add_argument("--wp-yaw-behavior", type=int, default=0,
                 help="기체 파라미터. C5 재현 시도는 2(공장 기본값)")
+_P.add_argument("--csv-dir", default=str(__import__("pathlib").Path(__file__).resolve().parent / "results"),
+                help="시나리오별 10Hz 시계열 CSV 를 남길 곳 (기본 sitl/results/<실행시각>_<태그>/). analysis/sitl_figures.py 가 읽는다")
+_P.add_argument("--csv-tag", default=None, help="실행 폴더 이름 태그. 기본: 이 저장소면 current, --repo 면 그 폴더 이름")
+_P.add_argument("--no-csv", action="store_true", help="CSV 를 남기지 않는다")
 ARGS = _P.parse_args()
 
 sys.path.insert(0, ARGS.repo)
@@ -216,6 +220,40 @@ if ARGS.force_target is not None:
 
 # ----------------------------------------------------------------- 유틸
 T0 = time.time()
+RUN_ID = time.strftime("%Y%m%d-%H%M%S")
+_HERE = __import__("pathlib").Path(__file__).resolve().parent.parent
+CSV_TAG = ARGS.csv_tag or ("current" if __import__("pathlib").Path(ARGS.repo).resolve() == _HERE
+                           else __import__("pathlib").Path(ARGS.repo).resolve().name)
+CSV_RUN_DIR = None if ARGS.no_csv else os.path.join(ARGS.csv_dir, f"{RUN_ID}_{CSV_TAG}")
+CSV_COLUMNS = ("t_s", "front_m", "agl_m", "in_fov", "fol_vn_mps", "fol_n", "fol_e", "fol_d", "leader_n", "leader_e", "leader_d",
+               "fc_mode", "heading_deg")
+
+
+def write_csv(name, rows, extra_meta=None):
+    """시나리오 시계열을 CSV 로. 첫 줄들은 '#' 메타(저장소, 태그, 시나리오 상수) — analysis/sitl_figures.py 가 읽는다."""
+    if CSV_RUN_DIR is None:
+        return None
+    os.makedirs(CSV_RUN_DIR, exist_ok=True)
+    path = os.path.join(CSV_RUN_DIR, f"{name}.csv")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# scenario={name} repo={ARGS.repo} tag={CSV_TAG} run={RUN_ID} duration={ARGS.duration} alt={ARGS.alt} "
+                f"leader_front={ARGS.leader_front} target={main.TARGET_DISTANCE_M}\n")
+        for k, v in (extra_meta or {}).items():
+            f.write(f"# {k}={v}\n")
+        f.write(",".join(CSV_COLUMNS) + "\n")
+        for r in rows:
+            f.write(",".join("" if v is None else (f"{v:.4f}" if isinstance(v, float) else str(v)) for v in r) + "\n")
+    return path
+
+
+def append_summary(name, passed, why, frames, note=""):
+    if CSV_RUN_DIR is None:
+        return
+    os.makedirs(CSV_RUN_DIR, exist_ok=True)
+    with open(os.path.join(CSV_RUN_DIR, "summary.csv"), "a", encoding="utf-8") as f:
+        if f.tell() == 0:
+            f.write("scenario,result,frames,note,why\n")
+        f.write(f"{name},{'PASS' if passed else 'FAIL'},{frames},\"{note}\",\"{' / '.join(why)}\"\n")
 
 
 def log(msg):
@@ -381,7 +419,8 @@ def run_scenario(name):
         main.get_vehicle_state = _no_local_position
         log("LOCAL_POSITION_NED 차단 → leader_alt_est=None 조건 재현")
 
-    seen_modes, headings, ranges, vels = [], [], [], []
+    seen_modes, headings, ranges, vels, rows = [], [], [], [], []
+    last_heading = [None]
     sine_t0 = [None]
     land_seen_at = [None]
     took_over_at = [None]
@@ -412,13 +451,17 @@ def run_scenario(name):
             elif t == "ATTITUDE":
                 World.f_yaw = float(msg.yaw)
 
-            if t == "VFR_HUD" and name == "hold_heading":
-                headings.append((now, float(msg.heading)))
+            if t == "VFR_HUD":
+                last_heading[0] = float(msg.heading)
+                if name == "hold_heading":
+                    headings.append((now, float(msg.heading)))
 
             if t == "LOCAL_POSITION_NED":
                 front, _, _ = World.relative_fru()
                 ranges.append((now, front, -World.f_d, in_fov()))     # fov 는 그 시점 값을 기록 (출력 시점 값이 아니라)
                 vels.append((now, float(msg.vx)))                     # 팔로워 북쪽 속도 (리더는 북진)
+                rows.append((now, front, -World.f_d, int(in_fov()), float(msg.vx), World.f_n, World.f_e, World.f_d,
+                             World.l_n, World.l_e, World.l_d, seen_modes[-1][1] if seen_modes else "", last_heading[0]))
 
             if t != "HEARTBEAT":
                 continue
@@ -603,6 +646,7 @@ def run_scenario(name):
         else:
             delay = land_seen_at[0] - depth_lost_at[0]
             log(f"깊이 소실 → LAND 까지 {delay:.1f}초")
+            verdict["note"] = f"land delay {delay:.1f}s"
             if not (6.0 <= delay <= 16.0):
                 fail(f"거리 게이트: 착륙까지 {delay:.1f}초 — 기대 10초 부근이 아님")
 
@@ -613,6 +657,7 @@ def run_scenario(name):
         peak = max(r for _, r, _, _ in ranges)
         log(f"리더까지 거리: 최대 {peak:.1f}m → 후반 평균 {final:.1f}m "
             f"(목표 {target:.1f}m)")
+        verdict["note"] = f"final {final:.2f}m peak {peak:.2f}m target {target:.1f}m"
         if name == "depth_range":
             # 평형 거리 = TARGET + v/KP_FORWARD. v=0.3, KP=0.22 → +1.4m.
             # 여유를 둬서 target+3.0을 넘으면 따라붙지 못한 것으로 본다.
@@ -641,6 +686,7 @@ def run_scenario(name):
                 rt = np.array([t for t, _ in rsel]); rs = np.array([r for _, r in rsel])
                 Mr = np.column_stack([np.cos(SINE_W * rt), np.sin(SINE_W * rt), np.ones_like(rt)])
                 (ra, rb, rc), *_ = np.linalg.lstsq(Mr, rs, rcond=None)
+                verdict["note"] = f"ratio {ratio:.2f} mean {c:.2f}m/s dist {rc:.2f}m"
                 log(f"정현파 정착 후 {ts[-1] - ts[0]:.0f}s ({len(sel)}샘플): 팔로워 평균 속도 {c:.2f} m/s, "
                     f"속도 진폭 {amp_f:.3f} m/s / 리더 {SINE_AMP} → 진폭비 {ratio:.2f} "
                     f"(선형 예측: 수정 전 1.8, 현재 0.67) · 거리 평균 {rc:.2f}m, 거리 진폭 {np.hypot(ra, rb):.2f}m")
@@ -655,6 +701,7 @@ def run_scenario(name):
         if len(late) > 5:
             drift = max(abs((h - late[0] + 180) % 360 - 180) for h in late)
             log(f"기수 최대 편차 {drift:.1f}° ({len(late)}샘플)")
+            verdict["note"] = f"heading drift {drift:.1f}deg"
             if drift > 25.0:
                 fail(f"C5: 명령 yaw_rate=0인데 기수가 {drift:.1f}° 자체 회전")
         else:
@@ -665,6 +712,13 @@ def run_scenario(name):
     main.get_vehicle_state = _real_state
     ARGS.duration = _duration_saved
     pilot.close()
+    meta = {"modes": ";".join(f"{t:.1f}:{m}" for t, m in seen_modes)}
+    if name == "leader_sine":
+        meta.update(sine_w=SINE_W, sine_mean=SINE_MEAN, sine_amp=SINE_AMP, sine_t0=sine_t0[0], sine_settle=SINE_SETTLE)
+    csv_path = write_csv(name, rows, meta)
+    append_summary(name, verdict["pass"], verdict["why"], World.frames, note=verdict.get("note", ""))
+    if csv_path:
+        log(f"CSV: {csv_path} ({len(rows)}행)")
     print(f"프레임 {World.frames}개 · {'PASS' if verdict['pass'] else 'FAIL'} ({name})")
     if verdict["why"]:
         print("  " + " / ".join(verdict["why"]))
@@ -678,6 +732,8 @@ if __name__ == "__main__":
              "depth_loss", "handover", "leader_sine"] if ARGS.all \
         else [ARGS.scenario]
     print(f"저장소: {ARGS.repo}")
+    if CSV_RUN_DIR:
+        print(f"CSV 출력: {CSV_RUN_DIR}/  (완료 후 git add sitl/results 로 커밋하면 analysis/sitl_figures.py 로 그림을 만든다)")
     results = {}
     for n in names:
         print(f"\n{'=' * 70}\n=== {n} ===")

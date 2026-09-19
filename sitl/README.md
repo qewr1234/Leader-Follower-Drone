@@ -281,3 +281,27 @@ git worktree remove --force /tmp/mars_before
 들어옵니다. 현재 코드의 두 값 차이(0.43 / 0.72)는 단독 실행 중 콘솔 정지(FPS=0.1 한 번)가 정착 구간에 걸린 영향으로 보이며
 둘 다 기준(1.0) 아래입니다. 수정 전 대조군에서는 증폭 자체보다 **미션 상태가 진동한 것**이 더 위험한 관측입니다 —
 LEADER_HOVER 도 allow_follow 라 제어는 끊기지 않았지만, 실기에서는 착륙 후보 판정까지 흔들 수 있습니다.
+
+## 5. 결과 CSV 와 실측 그림 (2026-09-19 추가)
+
+하네스는 시나리오마다 `LOCAL_POSITION_NED` 10 Hz 로 시계열을 CSV 로 남깁니다 (`--no-csv` 로 끌 수 있음).
+
+```
+sitl/results/<실행시각>_<태그>/
+  boot_no_leader.csv … leader_sine.csv   # t_s, front_m, agl_m, in_fov, fol_vn_mps, fol_n/e/d, leader_n/e/d, fc_mode, heading_deg
+  summary.csv                            # scenario, PASS/FAIL, 프레임 수, 핵심 수치, 실패 사유
+```
+
+태그는 이 저장소면 `current`, `--repo` 로 다른 체크아웃을 돌리면 그 폴더 이름(예: `mars_before`)입니다. 첫 줄의 `#` 메타에
+저장소 경로·시나리오 상수(정현파 ω·진폭·시작 시각)가 있어 그림 스크립트가 같은 최소제곱을 다시 계산합니다.
+
+```bash
+python3 sitl/harness.py --all                                             # → sitl/results/<시각>_current/
+git worktree add --detach /tmp/mars_before e4b4cd7
+python3 sitl/harness.py --scenario leader_sine --repo /tmp/mars_before   # → sitl/results/<시각>_mars_before/
+git worktree remove --force /tmp/mars_before
+git add sitl/results && git commit -m "SITL 결과 CSV" && git push         # 그림은 아래로
+
+python3 analysis/sitl_figures.py sitl/results/<시각>_current --before sitl/results/<시각>_mars_before
+#  → docs/images/sitl_regression.png (8개 시나리오 실측), docs/images/sitl_leader_sine.png (리더 vs 팔로워 속도, 진폭비)
+```

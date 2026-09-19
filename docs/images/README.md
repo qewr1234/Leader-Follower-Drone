@@ -38,3 +38,8 @@ python3 analysis/readme_figures.py --closed-loop /tmp/cl.json
 ```
 `readme_string_stability.png`(선형 모델 곡선 + SITL 실측점), `readme_closed_loop.png`(폐루프 40초 타임라인). SITL 실측값은
 스크립트 상단 `SITL` 상수에 있으니 재실측하면 거기를 고칩니다. 그림 안 글자는 영어(컨테이너에 한글 폰트 없음).
+
+## SITL 실측 그림 (`sitl_*.png`)
+
+`analysis/sitl_figures.py <sitl/results/…_current> [--before <…_mars_before>]` 가 하네스 CSV 로 만듭니다
+(`sitl/README.md` 5절). 데이터가 저장소에 들어온 뒤에만 생성·커밋합니다 — 가짜 데이터로 만든 그림은 넣지 않습니다.
