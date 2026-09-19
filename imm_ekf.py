@@ -17,6 +17,8 @@ SIGMA_Z = CONFIG["imm"]["sigma_z"]
 MAX_COAST_SEC = CONFIG["imm"]["max_coast_sec"]
 # 거리 정보를 담은 측정이 끊긴 뒤 "아직 위치를 안다"고 볼 수 있는 시간.
 RANGE_COAST_MAX_SEC = CONFIG["imm"].get("range_coast_max_sec", 2.0)
+# omega 를 추정할 최소 리더 속도 [m/s]. 이 아래면 진행 방향각이 잡음이라 기존 omega 를 감쇠시킨다.
+OMEGA_MIN_SPEED = CONFIG["imm"].get("omega_min_speed_mps", 0.15)
 
 TRANS_PROB = np.array([[0.95, 0.05], [0.10, 0.90]], dtype=float)
 MU0 = np.array([0.7, 0.3], dtype=float)
@@ -25,6 +27,7 @@ P0_POS = 1.0
 P0_VEL = 2.0
 
 H_POS = np.hstack([np.eye(3), np.zeros((3, 3))])
+H_VEL = np.hstack([np.zeros((3, 3)), np.eye(3)])
 R_DEFAULT = np.diag([SIGMA_XY**2, SIGMA_XY**2, SIGMA_Z**2])
 
 
@@ -98,6 +101,9 @@ class _SingleEKF:
         self._omega = 0.0
         self._prev_heading = None
         self._dt_since_update = 0.0
+        # 팔로워 자신의 속도(카메라 프레임). 상태는 '상대' 속도라 추종이 잘 될수록 0 에 가까워져
+        # 진행 방향각을 뽑을 수 없다 — 리더의 '절대' 속도 = 상대 + 자기 속도로 omega 를 추정한다.
+        self.ego_vel = np.zeros(3)
 
     def reset(self, x, P):
         self.x = x.copy()
@@ -115,6 +121,9 @@ class _SingleEKF:
     def update_position3d(self, z, R=None):
         R = R_DEFAULT if R is None else R
         return self._update(z, H_POS @ self.x, H_POS, R, dim=3)
+
+    def update_velocity3d(self, z, R):
+        return self._update(z, H_VEL @ self.x, H_VEL, R, dim=3)
 
     def update_bearing2d(self, z, R):
         h, H = _bearing_hH(self.x)
@@ -140,10 +149,20 @@ class _SingleEKF:
 
         return self._gaussian_likelihood(y, S, inv_S, dim)
 
+    def leader_velocity(self):
+        """리더의 절대 속도(카메라 프레임) = 상대 속도 + 팔로워 자기 속도."""
+        return self.x[3:6] + self.ego_vel
+
     def _estimate_omega(self):
-        """회전율 omega = 진행 방향각의 시간 변화율. 저속에서는 heading이 노이즈라 추정하지 않는다."""
-        vx, vz = self.x[3], self.x[5]
-        if np.hypot(vx, vz) > 0.3:
+        """회전율 omega = 리더 진행 방향각의 시간 변화율. 저속에서는 heading 이 잡음이라 추정하지 않는다.
+
+        상태의 '상대' 속도가 아니라 절대 속도를 쓴다. 추종이 정착하면 상대 속도가 0 으로 수렴해
+        방향각이 잡음이 되고, 그러면 omega 가 영원히 0 이라 CT 모델이 CV 와 같아진다. 그 상태에서는
+        두 모델의 우도가 구분되지 않아 모드 확률이 전이행렬의 정상분포(CV 2/3, CT 1/3)에 갇힌다.
+        """
+        v = self.leader_velocity()
+        vx, vz = v[0], v[2]
+        if np.hypot(vx, vz) > OMEGA_MIN_SPEED:
             heading = np.arctan2(vz, vx)
             if self._prev_heading is not None and self._dt_since_update > 1e-3:
                 d_heading = _wrap(heading - self._prev_heading)
@@ -240,6 +259,25 @@ class ImmEkf:
             self.vision_range_coast_time = 0.0
         self._update_mode_probs([f.update_position3d(z, R) for f in self.filters])
 
+    def update_velocity3d(self, z, R):
+        """상대 속도 측정(ESP32 등)을 정규 칼만 업데이트로 반영.
+
+        coast 타이머는 건드리지 않는다 — 속도 측정은 '거리를 안다'도 '지금 보인다'도 보장하지 않는다.
+        소실 판정은 위치를 담은 측정(RGB-D / GPS 상대위치)만 되돌린다.
+        """
+        if not self.initialized:
+            return
+        z = np.asarray(z, dtype=float)
+        self._update_mode_probs([f.update_velocity3d(z, R) for f in self.filters])
+
+    def set_ego_velocity_cam(self, v_cam):
+        """팔로워 자기 속도(카메라 프레임)를 주입. CT 모델의 omega 를 리더 절대 속도로 추정하기 위한 것."""
+        v = np.zeros(3) if v_cam is None else np.asarray(v_cam, dtype=float)[:3]
+        if not np.all(np.isfinite(v)):
+            v = np.zeros(3)
+        for f in self.filters:
+            f.ego_vel = v.copy()
+
     def update_bearing2d(self, z, R):
         if not self.initialized:
             return
@@ -262,6 +300,12 @@ class ImmEkf:
         x, P = self.get_state()
         R = R_DEFAULT if R is None else R
         return z - H_POS @ x, H_POS @ P @ H_POS.T + R
+
+    def innovation_velocity3d(self, z, R):
+        if not self.initialized:
+            return np.zeros(3), np.eye(3) * 999
+        x, P = self.get_state()
+        return np.asarray(z, dtype=float) - H_VEL @ x, H_VEL @ P @ H_VEL.T + R
 
     def innovation_bearing2d(self, z, R):
         if not self.initialized:
@@ -291,14 +335,18 @@ class ImmEkf:
         G[:3, :3] = T
         G[3:, 3:] = T
         for f in self.filters:
-            h0 = np.arctan2(f.x[5], f.x[3]) if f._prev_heading is not None else None
+            # 방향각은 리더 절대 속도 기준이므로(_estimate_omega) 자기 속도도 같은 회전을 받아야 한다.
+            v0 = f.leader_velocity()
+            h0 = np.arctan2(v0[2], v0[0]) if f._prev_heading is not None else None
             f.x = G @ f.x
             f.P = G @ f.P @ G.T
+            f.ego_vel = T @ f.ego_vel
             if h0 is not None:
                 # 진행 방향각(x-z 평면 투영)이 이 회전으로 얼마나 변했는지를 직전 방향각에도 더한다.
                 # 순수 yaw 면 정확히 dpsi. roll/pitch 로 y 성분이 섞이면 투영각 변화가 dpsi 와 달라
                 # 단위벡터를 돌리는 방식으로는 omega 가 샌다.
-                f._prev_heading = _wrap(f._prev_heading + _wrap(np.arctan2(f.x[5], f.x[3]) - h0))
+                v1 = f.leader_velocity()
+                f._prev_heading = _wrap(f._prev_heading + _wrap(np.arctan2(v1[2], v1[0]) - h0))
         self._fused = None
 
     def compensate_ego_yaw(self, dpsi):

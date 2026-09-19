@@ -22,7 +22,7 @@ from camera import D435i
 from config import CONFIG
 from detector import YoloDetector
 from imm_ekf import ImmEkf
-from leader_telemetry import (LeaderTelemetryReceiver, apply_leader_velocity_hint_to_imm,
+from leader_telemetry import (LeaderTelemetryReceiver, apply_leader_velocity_update_to_imm,
                               build_leader_measurement_from_packet)
 from logger import ExperimentLogger
 from mavlink_io import battery_text, connect_fc, drain_messages, get_vehicle_state, stream_rates_text
@@ -89,6 +89,10 @@ FF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_tau_sec", 2.0))
 FF_SELF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_self_tau_sec", 0.3))
 FF_DEADBAND_MPS = float(CONFIG["controller"].get("leader_vel_ff_deadband_mps", 0.05))
 
+# 최소 이격: 이 거리 아래로는 접근 성분을 0 으로 자르고 침범량에 비례해 물러난다 (compute_velocity_cmd_from_estimate).
+MIN_SEPARATION_M = float(CONFIG["controller"].get("min_separation_m", 2.0))
+MIN_SEPARATION_KP = float(CONFIG["controller"].get("min_separation_kp", 0.6))
+
 SETPOINT_PERIOD_SEC = 0.10
 # C2: LAND 가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
 LAND_RETRY_SEC = 2.0
@@ -134,6 +138,12 @@ def ego_rotation_cam(prev_rpy, cur_rpy):
     """
     d_rb = rot_body_to_ned(*cur_rpy).T @ rot_body_to_ned(*prev_rpy)
     return _CAM_FROM_BODY @ d_rb @ _CAM_FROM_BODY.T
+
+
+def fru_to_camera_xyz(v_fru):
+    """FRU [front, right, up] → 카메라 [right, down, forward]. camera_xyz_to_fru 의 역변환."""
+    v = np.asarray(v_fru, dtype=float)
+    return np.array([v[1], -v[2], v[0]], dtype=float)
 
 
 def fru_to_body_ned_velocity(v_fru):
@@ -263,6 +273,32 @@ def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
     return prev + a * (target - prev)
 
 
+def enforce_min_separation(cmd_fru, rel_fru):
+    """리더까지의 거리가 MIN_SEPARATION_M 아래면 명령의 '접근 성분'만 잘라낸다 (횡방향은 그대로 둔다).
+
+    전후축만 보면 선회 중 측면으로 파고드는 경우를 못 막는다 — 실제로 선회 시 최근접 1.59m 가 관측됐다.
+    그래서 3차원 시선 방향으로 사영한 성분에 제약을 건다. 침범했을 때는 0 이 아니라 침범량에 비례한
+    후퇴 속도까지 허용해, 바닥에 닿은 채 미끄러지지 않고 되돌아 나오게 한다.
+    목표 거리(3m) 추종은 그대로 P+D 가 하고, 이 함수는 그 아래의 바닥 역할만 한다.
+    """
+    cmd = np.asarray(cmd_fru, dtype=float)[:3].copy()
+    rel = np.asarray(rel_fru, dtype=float)[:3]
+    dist = float(np.linalg.norm(rel))
+    if dist >= MIN_SEPARATION_M or dist < 1e-6:
+        return cmd
+
+    u = rel / dist                                  # 리더 쪽 단위 벡터 (FRU)
+    v_along = float(cmd @ u)                        # + 면 접근 중
+    v_allowed = -MIN_SEPARATION_KP * (MIN_SEPARATION_M - dist)   # 음수 = 물러나는 속도
+    if v_along <= v_allowed:
+        return cmd
+    cmd = cmd + (v_allowed - v_along) * u
+    lim = (MAX_VX, MAX_VY, MAX_VZ)
+    for i in range(3):
+        cmd[i] = clamp(cmd[i], -lim[i], lim[i])
+    return cmd
+
+
 def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance=None, leader_vel_ff=None):
     """IMM 추정(FRU 상대 위치·속도) → BODY_NED [vx, vy, vz, yaw_rate]. 네 축 모두 P+D + 리더 속도 피드포워드, 불확실하면 감속."""
     if target_distance is None:
@@ -284,7 +320,8 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, targ
     # yaw: 선두 방위각을 0 으로 (시야 이탈 방지). BODY_NED yaw_rate 우회전 +, 타겟이 오른쪽이면 bearing + → 부호 일치.
     cmd_yaw_rate = clamp(KP_YAW * math.atan2(right, max(front, 0.5)) * scale, -MAX_YAW_RATE, MAX_YAW_RATE)
 
-    return np.append(fru_to_body_ned_velocity([cmd_forward, cmd_right, cmd_up]), cmd_yaw_rate)
+    cmd_fru = enforce_min_separation(np.array([cmd_forward, cmd_right, cmd_up]), rel_fru)
+    return np.append(fru_to_body_ned_velocity(cmd_fru), cmd_yaw_rate)
 
 
 def smooth_velocity_cmd(prev_cmd, new_cmd, alpha=0.28, dt=None):
@@ -332,7 +369,7 @@ def fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm)
 
 
 ESP_IDLE = {"esp_update_used": "none", "esp_vel_hint_used": False, "esp_gate_d2": None,
-            "r_esp_gps": 0.0, "r_esp_time": 0.0}
+            "esp_vel_gate_d2": None, "r_esp_gps": 0.0, "r_esp_time": 0.0}
 
 
 def fuse_esp32(ekf, rel, leader_meas):
@@ -355,9 +392,10 @@ def fuse_esp32(ekf, rel, leader_meas):
             ekf.update_position3d(z_esp, R_esp, source="gps")
         used = "esp_gps" if gate_ok else "gate_reject_esp_gps"
 
-    hinted = apply_leader_velocity_hint_to_imm(ekf, leader_meas["rel_vel_cam"], alpha=0.10, shrink_vel_cov=0.98)
-    return {"esp_update_used": used, "esp_vel_hint_used": hinted, "esp_gate_d2": d2,
-            "r_esp_gps": r_esp_gps, "r_esp_time": r_esp_time}
+    # 상대 속도도 정규 측정으로 — 게이트를 통과한 것만 반영한다 (예전 weak hint 는 게이트를 우회했다).
+    vel_ok, vel_d2 = apply_leader_velocity_update_to_imm(ekf, leader_meas["rel_vel_cam"], rel, r_esp_time)
+    return {"esp_update_used": used, "esp_vel_hint_used": vel_ok, "esp_gate_d2": d2,
+            "esp_vel_gate_d2": vel_d2, "r_esp_gps": r_esp_gps, "r_esp_time": r_esp_time}
 
 
 def open_leader_receiver():
@@ -587,7 +625,11 @@ def main():
                 prev_rpy_for_comp = cur_rpy
             else:
                 prev_rpy_for_comp = None
+            # CT 모델의 회전율은 리더 '절대' 속도로 추정한다 — 자기 속도를 카메라 프레임으로 넣어 준다.
+            # 보상(위에서 ego_vel 도 함께 회전) 뒤, predict 앞에 넣어야 프레임이 맞는다.
             if ekf.initialized:
+                v_self_fru = follower_velocity_fru(vehicle_state) if (local_pos_fresh and attitude_fresh) else None
+                ekf.set_ego_velocity_cam(fru_to_camera_xyz(v_self_fru) if v_self_fru is not None else None)
                 ekf.predict(dt)
 
             # ---------------- 스케줄러 → 검출/추적 ----------------

@@ -13,6 +13,7 @@ class ReliabilityEstimator:
         self.R_rgbd0 = np.diag(CONFIG["reliability"]["base_R_rgbd_diag"])
         self.R_bearing0 = np.diag(CONFIG["reliability"]["base_R_bearing_diag"])
         self.R_gps0 = np.diag(CONFIG["reliability"]["base_R_gps_diag"])
+        self.R_vel0 = np.diag(CONFIG["reliability"]["base_R_vel_diag"])
 
     def vision_reliability(self, track_or_meas):
         if track_or_meas is None:
@@ -71,6 +72,10 @@ class ReliabilityEstimator:
         r = max(float(r_gps), self.min_r)
         return self.R_gps0 / r
 
+    def make_R_velocity(self, r_vel):
+        r = max(float(r_vel), self.min_r)
+        return self.R_vel0 / r
+
     @staticmethod
     def mahalanobis_distance(innovation, S):
         try:
@@ -87,3 +92,8 @@ class ReliabilityEstimator:
         y, S = ekf.innovation_bearing2d(z, R)
         d2 = self.mahalanobis_distance(y, S)
         return d2 <= CONFIG["reliability"]["mahalanobis_threshold_2d"], d2
+
+    def gate_velocity3d(self, ekf, z, R):
+        y, S = ekf.innovation_velocity3d(z, R)
+        d2 = self.mahalanobis_distance(y, S)
+        return d2 <= CONFIG["reliability"]["mahalanobis_threshold_3d"], d2

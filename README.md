@@ -28,7 +28,7 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 **4.3m — 이론값 4.36m와 소수 둘째 자리 일치** |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
-| **회귀 스위트** | 단위 검사 129개 + SITL 시나리오 9개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
+| **회귀 스위트** | 단위 검사 143개 + SITL 시나리오 9개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 추종 동작과 Fail-safe
@@ -125,6 +125,9 @@ EKF 상대 속도의 합입니다.
 - **이륙 인계가 안전합니다.** 수동 상승 후 GUIDED로 넘기는 순간 미션·명령 버퍼를 리셋해
   깨끗한 상태로 추종을 시작합니다 (SITL 검증).
 - **고도 바닥.** `MIN_AGL_M`(1.5m) 아래에서는 하강 명령을 차단합니다.
+- **최소 이격 바닥.** 리더까지 3차원 거리가 2m 안으로 들어오면 명령의 접근 성분을 제거하고 침범량에 비례해
+  물러납니다(`enforce_min_separation`). 시선에 수직인 성분은 남겨 추종을 끊지 않습니다 — 전후축만 보면
+  선회 중 측면으로 파고드는 경우를 막지 못합니다(실측 최근접 1.59m).
 - **GPS만으로는 붙지 않습니다.** 카메라 깊이가 끊기고 ESP32 GPS 상대위치만 남으면 이격을
   3m에서 8m(`TARGET_DISTANCE_GPS_ONLY_M`)로 넓힙니다 — GPS 상대오차는 m 단위라 3m는
   오차보다 작고, 8m는 깊이창(10m) 안이라 리더가 다시 보이면 비전이 이어받습니다.
@@ -148,7 +151,7 @@ EKF 상대 속도의 합입니다.
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 129개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 143개 — numpy만 있으면 됨
 python3 test_closed_loop.py    # 폐루프 특성화 — 가짜 FC·가짜 시계로 실제 main.main() 결정론 실행 (--dump/--compare)
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 python3 analysis/stability_margins.py --plots   # 분석 층: 바깥 루프 선형 모델의 여유·스트링 안정성 (matplotlib)
@@ -171,7 +174,7 @@ python3 analysis/trace_check.py                 # 요구도 ↔ 검사 추적성
 주파수를 자극하지 않아 SITL 8개가 전부 통과했던 것입니다. 원인(자기 속도와 EKF 상대속도의 지연 불일치)과 수정
 (피드포워드 저역통과 2 s + 자기 속도 정합 필터 0.3 s + 소프트 데드존 → 14.4 dB, 1.13배)은
 [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) 에 있고, 정현파 리더 SITL 시나리오 `leader_sine` 이 이를
-ArduCopter 에서 검사합니다(실측: 현재 코드 0.72배, 수정 전 코드 1.95배로 FAIL). 요구도 57개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
+ArduCopter 에서 검사합니다(실측: 현재 코드 0.72배, 수정 전 코드 1.95배로 FAIL). 요구도 61개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 의 추적성 표에 있습니다.
 
 그리고 모든 시나리오는 **차등 검증**입니다 — 수정 전 코드에도 같은 시나리오를 돌려 대조군에서
@@ -274,7 +277,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회, 실외 노출 옵션·AE 측광 ROI) |
 | `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | 단위 회귀 129개 (하드웨어·FC 불필요) |
+| `test_fixes.py` | 단위 회귀 143개 (하드웨어·FC 불필요) |
 | `test_closed_loop.py` | 폐루프 특성화 테스트 — 가짜 FC·가짜 시계로 실제 `main.main()` 결정론 실행, `--dump`/`--compare`로 리팩토링 전후 스트림 비교 |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 | `docs/images/` | README 다이어그램(SVG) |
@@ -283,6 +286,6 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 
 - [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
 - [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) — 바깥 루프 선형 모델, 위상·이득 여유, 스트링 안정성, 체인 시뮬레이션, 개선안
-- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 57개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
+- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 61개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
 - [docs/images/README.md](docs/images/README.md) — README 그림 파일과 수정 방법

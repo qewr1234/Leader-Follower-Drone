@@ -36,6 +36,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | FCR-12 | 비전 거리가 없고 GPS 상대위치만 있으면 이격을 8 m 로 넓힌다 | README 안전 설계 | T | UT[gps-only:] | 검증됨 |
 | FCR-13 | 출발·정지·착륙 판단은 리더 절대 속도(ESP32 > 자기+상대 > 상대 폴백) 로 한다 | README 안전 설계 | T | UT[미션:]; CL[리더 출발 후]; CL[추종 중(t=8s)]; SITL[depth_range] | 검증됨 |
 | FCR-14 | 피드포워드를 뺀 P+D 기준선은 PM ≥ 45°, GM ≥ 6 dB, Ms ≤ 1.5, 스트링 안정을 만족한다 | STABILITY_MARGINS 1절 | A | AN[kff_sweep.kff0.gm_db]; UT[분석: P+D] | 검증됨 (분석) |
+| FCR-16 | 리더까지의 3차원 거리가 최소 이격(2.0 m) 아래로 들어가면 명령의 접근 성분을 제거하고 침범량에 비례해 물러난다. 시선에 수직인 성분은 유지해 추종을 끊지 않는다 | VERIFICATION 남은 결함(선회 시 최근접 1.59 m) | T, I | UT[이격:]; INSPECT[config.py:"min_separation_m": 2.0] | 검증됨 (단위. SITL·실비행 미검증) |
 | FCR-15 | 리더 속도가 0.25 ± 0.05 m/s, 1.15 rad/s 정현파일 때 팔로워 속도 진폭비가 1 이하다 (실제 FC 에서의 스트링 안정성) | STABILITY_MARGINS 6절, sitl/README | T | SITL[leader_sine]; AN[sitl_like.current] | 검증됨 (SITL 실측 0.43 / 0.72, 예측 0.70. 수정 전 코드 대조군 1.95 FAIL — 차등 검증) |
 
 ### EST — 인지 / 추정
@@ -43,7 +44,10 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | ID | 요구도 | 출처 | 방법 | 검증 근거 | 상태 |
 |---|---|---|---|---|---|
 | EST-01 | IMM-EKF(CV+CT) 가 상대 위치·속도를 추정하고 속도 추정의 63 % 응답이 0.5 s 이내이며 램프에 위치 지연이 없다 | imm_ekf.py | A, T | AN[ekf_step.t63_velocity_s]; UT[분석: IMM-EKF] | 검증됨 (0.30 s) |
-| EST-02 | 측정은 신뢰도로 R 을 적응하고 카이제곱 게이트(3D 11.34, 2D 9.21)로 거른다 | config `reliability` | T | UT[C4: MAD]; UT[C4: 정상] | 부분 (게이트 임계 자체의 단위 검사 없음) |
+| EST-15 | 모드 확률이 리더 기동에 따라 움직여 "mode-aware" 추정이 실제로 동작한다 | 프로젝트 이름(MARS-IMM) | T | UT[IMM: 추종 중에는] | **미충족** (구조적. 상대상태를 필터링하므로 추종이 잘 될수록 리더 기동이 상대상태에서 사라져 두 모델이 구분되지 않는다. p_ct 는 전이행렬 정상분포 1/3 에 머문다 — VERIFICATION 참조) |
+| EST-02 | 측정은 신뢰도로 R 을 적응하고 카이제곱 게이트(3D 11.34, 2D 9.21)로 거른다. RGB-D, bearing, ESP32 위치, ESP32 속도 네 경로 모두 같은 게이트를 지난다 | config `reliability` | T | UT[C4: MAD]; UT[C4: 정상]; UT[ESP32 속도:] | 검증됨 |
+| EST-13 | ESP32 상대 속도는 필터 상태 직접 대입이 아니라 정규 칼만 속도 측정 갱신으로 반영한다. 게이트를 통과한 것만 쓰고, 공분산은 임의 축소가 아니라 갱신 결과로 줄어든다 | VERIFICATION 남은 결함 | T | UT[ESP32 속도:] | 검증됨 |
+| EST-14 | CT 모델의 회전율은 리더 절대 속도(상대 + 자기 속도)로 추정한다. 상대 속도만 쓰면 추종이 정착할수록 방향각이 정의되지 않아 회전율이 실제와 무관해진다 | VERIFICATION 남은 결함 | T | UT[IMM:] | 검증됨 |
 | EST-03 | 거리 측정이 끊기면 2 s 코스트 후 소실로 판정하고, bearing-only 는 거리 확보로 치지 않는다 | config `imm.range_coast_max_sec` | T, I | UT[rcoast:]; INSPECT[config.py:"range_coast_max_sec": 2.0] | 검증됨 |
 | EST-04 | 트래커는 1프레임 소실 뒤 화면 반대편 검출을 거부하고 max_lost 뒤 새 track_id 로 재초기화한다 | VERIFICATION 트래커 신원 게이트 | T | UT[tracker:] | 검증됨 |
 | EST-05 | 깊이 측정은 유효 화소 수·비율·MAD 한계로 걸러 깊이 절벽을 신뢰도 0 으로 만들고, 큰 ROI 서브샘플 오차는 1 cm 미만이다 | VERIFICATION C4 | T | UT[C4:]; UT[measurement:] | 검증됨 |
@@ -121,6 +125,8 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 |---|---|---|
 | FCR-10 | 부분 | 남은 피크 1.13 은 피드포워드+P 겹침. 3대 이상 체인이면 KFF 0.6(1.02) 또는 ESP32 선두 절대 속도 방송으로 자기 속도 경로 제거 |
 | EST-12 | 미충족 | 리더 드론 데이터셋 확장, 재학습 |
+| EST-15 | 미충족 | 셋 중 택일: (1) CT 모델 제거하고 단일 CV 로 단순화, (2) 리더 절대상태를 필터링하도록 구조 변경(팔로워 위치·속도를 더해 월드 기준 상태로), (3) 현 상태 유지하고 한계를 명시. 측정상 융합 출력은 세 경우가 같다 |
+| FCR-16 | 부분 | 최소 이격 제약의 SITL 시나리오(선회 중 측면 접근) 추가 |
 | FCR-07 | 부분 | 감속 배율 0.75 / 0.55 의 단위 검사 추가 |
 | EST-02 | 부분 | 카이제곱 임계 경계값 단위 검사 추가 |
 | EST-10 | 부분 | 실외 역광·강한 빛 조건에서 노출 옵션 실기 확인 |

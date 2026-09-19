@@ -569,29 +569,31 @@ def build_leader_measurement_from_packet(
 # IMM-EKF velocity hint
 # ============================================================
 
-def apply_leader_velocity_hint_to_imm(ekf, rel_vel_cam, alpha=0.12, shrink_vel_cov=0.96):
-    """
-    ESP32 leader velocity를 IMM-EKF의 velocity state에 약하게 반영.
+def apply_leader_velocity_update_to_imm(ekf, rel_vel_cam, rel, r_vel):
+    """ESP32 상대 속도를 IMM-EKF 의 정규 속도 측정 갱신으로 반영한다. (gate_ok, d2) 반환.
 
-    깔끔한 방법은 IMM-EKF에 velocity measurement update를 추가하는 것이지만,
-    현재 구조를 크게 깨지 않기 위해 weak hint 방식으로 적용한다.
+    예전 구현(apply_leader_velocity_hint_to_imm)은 필터 상태에 직접 대입하고 공분산을 무조건 줄였다.
+    혁신도 마할라노비스 게이트도 우도도 없어서, 잘못된 패킷 하나가 추정을 오염시키면서 동시에
+    "더 확신한다"고 공분산까지 줄이는 구조였다. 지금은 다른 측정과 같은 경로를 탄다 —
+    R 은 신뢰도로 적응하고, 게이트를 통과한 것만 반영하며, 우도가 모드 확률에 들어간다.
 
-    rel_vel_cam:
-        camera state velocity [VX_right, VY_down, VZ_forward]
+    rel_vel_cam: 카메라 프레임 상대 속도 [VX_right, VY_down, VZ_forward]
+    rel:         ReliabilityEstimator
+    r_vel:       이 측정의 신뢰도 (0~1). 패킷 신선도 기반.
     """
     if ekf is None or not getattr(ekf, "initialized", False):
-        return False
+        return False, None
 
-    rel_vel_cam = np.asarray(rel_vel_cam, dtype=float)
-    if rel_vel_cam.size < 3 or not np.all(np.isfinite(rel_vel_cam[:3])):
-        return False
+    z = np.asarray(rel_vel_cam, dtype=float)
+    if z.size < 3 or not np.all(np.isfinite(z[:3])):
+        return False, None
+    z = z[:3]
 
     try:
-        for f in ekf.filters:
-            f.x[3:6] = (1.0 - alpha) * f.x[3:6] + alpha * rel_vel_cam[:3]
-            f.P[3:6, 3:6] *= float(shrink_vel_cov)
-        ekf.mark_dirty()        # get_state() 캐시 무효화 — 상태를 직접 고쳤다
-        return True
-
+        R = rel.make_R_velocity(r_vel)
+        gate_ok, d2 = rel.gate_velocity3d(ekf, z, R)
+        if gate_ok:
+            ekf.update_velocity3d(z, R)
+        return bool(gate_ok), d2
     except Exception:
-        return False
+        return False, None

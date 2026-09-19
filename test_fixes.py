@@ -819,15 +819,16 @@ check("scheduler: 안정 상태 검출 주기 = normal_detect_every (hover 계�
       _de == CONFIG["scheduler"]["normal_detect_every"] and "hover_detect_every" not in CONFIG["scheduler"], f"detect_every={_de}")
 
 # imm_ekf: get_state() 캐시가 상태 변경(predict/update/compensate/속도 힌트) 뒤 갱신되는가
-from leader_telemetry import apply_leader_velocity_hint_to_imm  # noqa: E402
+from leader_telemetry import apply_leader_velocity_update_to_imm  # noqa: E402
+_rel0 = ReliabilityEstimator()
 ek3 = ImmEkf(); ek3.init([0.0, 0.0, 5.0])
 x0 = ek3.get_state()[0].copy()
 ek3.predict(0.1); x1 = ek3.get_state()[0].copy()
 ek3.update_position3d([0.2, 0.0, 5.0]); x2 = ek3.get_state()[0].copy()
 ek3.compensate_ego_yaw(0.1); x3 = ek3.get_state()[0].copy()
-apply_leader_velocity_hint_to_imm(ek3, [1.0, 0.0, 0.0], alpha=0.5); x4 = ek3.get_state()[0].copy()
-check("ekf: 캐시가 update/compensate/속도 힌트 뒤 갱신됨",
-      not np3.allclose(x1, x2) and not np3.allclose(x2, x3) and not np3.allclose(x3, x4) and abs(x4[3] - 0.5 * x3[3] - 0.5) < 1e-9,
+apply_leader_velocity_update_to_imm(ek3, [1.0, 0.0, 0.0], _rel0, 1.0); x4 = ek3.get_state()[0].copy()
+check("ekf: 캐시가 update/compensate/속도 갱신 뒤 갱신됨",
+      not np3.allclose(x1, x2) and not np3.allclose(x2, x3) and not np3.allclose(x3, x4) and x4[3] > x3[3],
       f"vx: {x3[3]:.3f} → {x4[3]:.3f}")
 check("ekf: 같은 상태에서 두 번 부르면 같은 객체 (캐시 적중)", ek3.get_state()[0] is ek3.get_state()[0])
 
@@ -1068,6 +1069,87 @@ _ts = _tc.run(verbose=False)
 check("추적성: REQUIREMENTS.md 의 검증 근거(UT/CL/SITL/AN/INSPECT)가 전부 실제로 존재, 요구도 ≥ 50개, 폐루프 검사 전부 요구도에 연결",
       not _ts["errors"] and _ts["requirements"] >= 50 and not _ts["cl_orphans"],
       "; ".join(_ts["errors"][:3]) or f"{_ts['requirements']}개, UT {_ts['ut_traced']}/{_ts['ut_total']}, CL {_ts['cl_traced']}/{_ts['cl_total']}")
+
+# ------------------------------------------------- ESP32 속도: 힌트 → 게이트 있는 정규 측정 갱신
+from leader_telemetry import apply_leader_velocity_update_to_imm as _vel_up  # noqa: E402
+import leader_telemetry as _lt  # noqa: E402
+check("ESP32 속도: 게이트를 우회하던 weak hint 함수가 제거됨",
+      not hasattr(_lt, "apply_leader_velocity_hint_to_imm") and hasattr(_lt, "apply_leader_velocity_update_to_imm"))
+_relv = ReliabilityEstimator()
+_ekv = ImmEkf(); _ekv.init([0.0, 0.0, 5.0])
+for _ in range(20):                                   # 상대 속도 0 근처로 수렴시킨다
+    _ekv.predict(0.1); _ekv.update_position3d([0.0, 0.0, 5.0])
+_P_before = _ekv.get_state()[1][3:6, 3:6].trace()
+_ok_out, _d2_out = _vel_up(_ekv, [0.0, 0.0, 60.0], _relv, 1.0)     # 터무니없는 속도 → 게이트가 막아야
+_x_after = _ekv.get_state()[0]
+check("ESP32 속도: 이상치(60 m/s)는 마할라노비스 게이트에서 거부되고 상태·공분산이 변하지 않음",
+      _ok_out is False and _d2_out is not None and _d2_out > CONFIG["reliability"]["mahalanobis_threshold_3d"]
+      and abs(float(_x_after[5])) < 1e-6, f"gate={_ok_out} d2={_d2_out}")
+_ok_in, _d2_in = _vel_up(_ekv, [0.0, 0.0, 0.25], _relv, 1.0)       # 그럴듯한 속도 → 통과
+_P_after = _ekv.get_state()[1][3:6, 3:6].trace()
+check("ESP32 속도: 정상 측정은 통과해 속도 상태를 갱신하고, 공분산은 임의 축소가 아니라 칼만 갱신으로 줄어듦",
+      _ok_in is True and _d2_in <= CONFIG["reliability"]["mahalanobis_threshold_3d"]
+      and 0.0 < float(_ekv.get_state()[0][5]) < 0.25 and _P_after < _P_before,
+      f"vz={_ekv.get_state()[0][5]:.3f} P {_P_before:.3f}→{_P_after:.3f}")
+check("ESP32 속도: 신뢰도가 낮으면 R 이 커져 같은 측정의 반영량이 작아짐",
+      np3.all(np3.diag(_relv.make_R_velocity(0.2)) > np3.diag(_relv.make_R_velocity(1.0))))
+_ek_nov = ImmEkf()
+check("ESP32 속도: 미초기화 EKF 에는 아무것도 하지 않음", _vel_up(_ek_nov, [0, 0, 1.0], _relv, 1.0) == (False, None))
+
+# ------------------------------------------------- IMM: CT 회전율 추정 + 모드 확률의 실제 거동
+def _imm_follow(turn, speed=1.0, ego_on=True, T=12.0, dt=0.05):
+    """선회하는 리더를 팔로워가 같은 속도로 추종 — 실제 운용 상황이라 상대 속도가 0 근처로 남는다.
+    카메라 프레임(x=우, z=전)에서 heading=atan2(vz,vx) 라, 우선회(+)는 omega 부호가 반대로 나온다."""
+    ek = ImmEkf(); ek.init([0.0, 0.0, 3.0])
+    th = 0.0; px, pz = 0.0, 3.0
+    for _ in range(int(T / dt)):
+        th += turn * dt
+        vx, vz = speed * _math.sin(th), speed * _math.cos(th)
+        px += 0.0; pz += 0.0                      # 완벽 추종: 상대 위치 고정
+        if ego_on:
+            ek.set_ego_velocity_cam([vx, 0.0, vz])
+        ek.predict(dt)
+        ek.update_position3d([px, 0.0, pz])
+    return ek
+
+
+_w_on_slow = _imm_follow(0.5)._omega if False else _imm_follow(0.5).filters[1]._omega
+_w_on_fast = _imm_follow(1.0).filters[1]._omega
+_w_off_slow = _imm_follow(0.5, ego_on=False).filters[1]._omega
+_w_off_fast = _imm_follow(1.0, ego_on=False).filters[1]._omega
+check("IMM: 자기 속도 없이는 CT 회전율이 실제 선회율과 무관 — 상대 속도가 0 이라 방향각이 정의되지 않는다 (결함)",
+      abs(_w_off_slow) < 1e-6 and abs(_w_off_fast) < 1e-6, f"off: {_w_off_slow:.3f} / {_w_off_fast:.3f}")
+check("IMM: 자기 속도를 넣으면 절대 속도로 회전율을 추정해 실제 선회율을 따라간다 (카메라 관례상 부호 반전)",
+      -0.62 < _w_on_slow < -0.38 and -1.2 < _w_on_fast < -0.8, f"on: {_w_on_slow:.3f}(참값 -0.50) / {_w_on_fast:.3f}(참값 -1.00)")
+
+# 모드 확률은 이 구조에서 움직이지 않는다 — 결함이 아니라 상대상태 필터의 성질이다. 회귀로 고정한다.
+_p_ct_slow = float(_imm_follow(0.5).get_model_probs()[1])
+_p_ct_fast = float(_imm_follow(1.0).get_model_probs()[1])
+_p_stat = 0.05 / (0.05 + 0.10)      # 전이행렬 [[0.95,0.05],[0.10,0.90]] 의 정상분포: p_ct = 1/3
+check("IMM: 추종 중에는 CT 모드 확률이 전이행렬 정상분포(1/3) 근처에 머문다 — 상대상태를 필터링하므로 "
+      "팔로워가 잘 따라갈수록 리더 기동이 상대상태에서 사라져 두 모델의 우도가 구분되지 않는다 (VERIFICATION 참조)",
+      abs(_p_ct_slow - _p_stat) < 0.06 and abs(_p_ct_fast - _p_stat) < 0.06 and abs(_p_stat - 1/3) < 1e-9,
+      f"p_ct {_p_ct_slow:.3f} / {_p_ct_fast:.3f} (정상분포 {_p_stat:.3f})")
+_ek_noego = ImmEkf(); _ek_noego.init([0.0, 0.0, 3.0])
+check("IMM: 자기 속도를 주지 않으면 leader_velocity() 는 상대 속도 그대로 (기본값 0)",
+      np3.allclose(_ek_noego.filters[0].leader_velocity(), _ek_noego.filters[0].x[3:6]))
+
+# ------------------------------------------------- 최소 이격 제약
+_ms = main.MIN_SEPARATION_M
+_far = main.enforce_min_separation([0.3, 0.0, 0.0], [_ms + 1.0, 0.0, 0.0])
+check("이격: 최소 이격 밖에서는 명령을 건드리지 않음", np3.allclose(_far, [0.3, 0.0, 0.0]), f"{_far}")
+_near = main.enforce_min_separation([0.3, 0.0, 0.0], [_ms - 0.5, 0.0, 0.0])
+check("이격: 침범하면 접근 성분이 사라지고 침범량에 비례해 후퇴 (0.5m 침범 → -0.6·0.5)",
+      abs(_near[0] + main.MIN_SEPARATION_KP * 0.5) < 1e-9, f"{_near}")
+_lateral = main.enforce_min_separation([0.3, 0.2, 0.0], [_ms - 0.5, 0.0, 0.0])
+check("이격: 시선에 수직인 성분(횡방향)은 그대로 둔다 — 추종을 끊지 않고 파고들기만 막는다",
+      abs(_lateral[1] - 0.2) < 1e-9, f"{_lateral}")
+_side = main.enforce_min_separation([0.0, 0.3, 0.0], [0.1, _ms - 0.6, 0.0])
+check("이격: 전후축이 아니라 3차원 거리로 판정 — 선회 중 측면 접근도 막는다 (관측된 최근접 1.59m)",
+      _side[1] < 0.0, f"{_side}")
+_cmd_near = main.compute_velocity_cmd_from_estimate([_ms - 0.5, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0, 3.0)
+check("이격: 제어기 출력에도 적용 — 목표 3m 보다 가까워도 최소 이격 안에서는 전진하지 않음",
+      _cmd_near[0] < 0.0, f"cmd={_cmd_near.round(3)}")
 
 # ---------------------------------------------------------------- 
 print()

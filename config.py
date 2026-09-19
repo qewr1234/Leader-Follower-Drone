@@ -52,6 +52,8 @@ CONFIG = {
         "range_coast_max_sec": 2.0,
         "sigma_xy": 0.15,
         "sigma_z": 0.25,
+        # CT 모델의 회전율을 추정할 최소 리더 속도. 상대가 아니라 절대 속도 기준이라 추종 중에도 유효하다.
+        "omega_min_speed_mps": 0.15,
     },
     "reliability": {
         "min_reliability": 0.05,
@@ -60,6 +62,8 @@ CONFIG = {
         "base_R_rgbd_diag": [0.15**2, 0.15**2, 0.25**2],
         "base_R_bearing_diag": [0.03**2, 0.03**2],
         "base_R_gps_diag": [2.0**2, 2.0**2, 3.0**2],
+        # ESP32 가 주는 상대 속도의 기본 측정 잡음. GPS 속도해는 위치해보다 정확하지만 m/s 단위 오차가 남는다.
+        "base_R_vel_diag": [0.30**2, 0.30**2, 0.40**2],
     },
     "scheduler": {
         "enable_roi": True,
@@ -73,6 +77,10 @@ CONFIG = {
     },
     "controller": {
         "uncertainty_slowdown_trace": 4.0,
+        # 최소 이격: 리더까지의 거리가 이 값 아래로 들어가면 접근 성분을 잘라내고 침범량에 비례해 물러난다.
+        # 선회 중 최근접 1.59m 가 관측돼(VERIFICATION 남은 결함) 목표 3.0m 와 충돌 사이에 바닥을 둔다.
+        "min_separation_m": 2.0,
+        "min_separation_kp": 0.6,   # 침범 1m 당 후퇴 속도 [m/s]
         # 리더 속도 피드포워드: cmd = KFF·v_leader + Kp·e + Kd·v_rel.
         # 없으면 정상상태 거리 오차 = v_leader/Kp (0.3m/s→1.4m, 1m/s→4.5m 로 깊이창 10m 밖으로 밀려 소실).
         # KFF<1 로 두는 이유는 EKF 속도 지연을 통한 자기 속도 양성 되먹임의 이득 여유 (main.leader_velocity_ff 주석).
