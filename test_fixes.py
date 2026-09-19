@@ -1220,6 +1220,40 @@ check("하네스: 판정 기준값이 getattr 폴백이라 --repo 로 옛 코드
       _hmod is not None and 'getattr(main, "EVADE_RADIUS_M"' in _h and abs(_hmod.SEP_RADIUS_M - main.EVADE_RADIUS_M) < 1e-9,
       f"radius={getattr(_hmod, 'SEP_RADIUS_M', None)}")
 
+# 리더 배치가 '정북 고정' 이면 직전 시나리오의 기수가 이월될 때 리더가 기체 뒤에 놓인다 — 그 시나리오는 리더를
+# 한 번도 못 본 채(mission=WAIT_LEADER, CV/CT 0.00) 끝나고 판정은 무의미해진다. 2026-09-20 min_separation 실측.
+if _hmod is not None:
+    import math as _math  # noqa: E402
+    _W = _hmod.World
+    _W.reset()
+    _W.f_n = _W.f_e = 0.0
+    _W.f_d = -15.0
+    _W.f_yaw = _math.radians(90.0)              # 동쪽을 보고 있는 기체
+    _W.have_att = True
+    # 기준점 잡기(watcher 와 같은 계산)
+    _W.a_n, _W.a_e = _math.cos(_W.f_yaw), _math.sin(_W.f_yaw)
+    _W.l_n = _W.f_n + 4.5 * _W.a_n
+    _W.l_e = _W.f_e + 4.5 * _W.a_e
+    _W.l_d = _W.f_d
+    _front, _right, _up = _W.relative_fru()
+    check("하네스: 리더를 '정북' 이 아니라 '기수 방향' 앞에 놓는다 (기수 이월 시 리더가 뒤에 놓이는 결함)",
+          _front > 4.4 and abs(_right) < 0.05, f"front={_front:.2f} right={_right:.2f}")
+    _W.advance_leader(1.0)
+    _f2, _r2, _ = _W.relative_fru()
+    check("하네스: 리더 전진이 진행 축(기수)을 따른다 — 정북 가산이면 옆으로 흐른다",
+          _f2 > _front + 0.9 and abs(_r2) < 0.05, f"front={_f2:.2f} right={_r2:.2f}")
+    _W.charge_leader(2.0)
+    _f3, _r3, _ = _W.relative_fru()
+    check("하네스: 돌진이 시선 방향(팔로워 쪽)이다 — 기수와 무관하게 정면 접근이 성립",
+          abs(_f3 - (_f2 - 2.0)) < 0.05 and abs(_r3) < 0.05, f"front={_f3:.2f} right={_r3:.2f}")
+    check("하네스: 기수를 받기 전에는 기준점을 잡지 않는다 (ATTITUDE 선행 조건)",
+          "if not World.have_fix and World.have_att:" in _h)
+    check("하네스: 드라이버의 대기가 시나리오 종료를 확인한다 (이전 시나리오가 다음 World 를 건드리지 않게)",
+          "def nap(sec):" in _h and "time.sleep(8)" not in _h and "time.sleep(12)" not in _h)
+    check("하네스: 검출 계수로 '못 봤다' 와 '보고도 못 피했다' 를 구분한다",
+          "World.det_boxes" in _h and "리더를 한 번도 검출하지 못했다" in _h)
+    _W.reset()
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "

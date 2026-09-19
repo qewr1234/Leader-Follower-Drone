@@ -120,9 +120,18 @@ class World:
     f_n = f_e = f_d = 0.0
     f_yaw = 0.0
     have_fix = False
+    have_att = False     # ATTITUDE 를 한 번이라도 받았는가. 기수를 모른 채 기준점을 잡으면 안 된다.
 
     # 리더 오프셋 — 팔로워 초기 위치 기준 NED. 시나리오가 조작한다.
     l_n = l_e = l_d = 0.0
+    # 리더 진행 축 (수평 단위벡터). 기준점을 잡을 때의 팔로워 기수 방향이다. 정북 고정이면 직전 시나리오에서
+    # 남은 기수(요 드리프트·회피 요)가 그대로 이월돼 리더가 기체 뒤에 놓이고, 그 시나리오는 리더를 한 번도
+    # 못 본 채(mission=WAIT_LEADER) 끝난다 — 2026-09-20 min_separation 이 이 이유로 통째로 무효가 됐다.
+    a_n, a_e = 1.0, 0.0
+
+    # 인지 스텁 계수기 — '못 봤다' 와 '보고도 못 따라갔다' 를 판정에서 구분하기 위한 것
+    det_calls = 0
+    det_boxes = 0
 
     @classmethod
     def reset(cls):
@@ -132,10 +141,32 @@ class World:
         cls.stop = False
         cls.generation += 1
         cls.have_fix = False
+        cls.have_att = False
         cls.f_n = cls.f_e = cls.f_d = 0.0
         cls.f_yaw = 0.0
-        # 기본: 정북 방향 leader_front 앞, 같은 고도
+        cls.a_n, cls.a_e = 1.0, 0.0
+        cls.det_calls = cls.det_boxes = 0
+        # 기본: 정북 방향 leader_front 앞, 같은 고도 (기준점을 잡을 때 기수 방향으로 다시 놓는다)
         cls.l_n, cls.l_e, cls.l_d = ARGS.leader_front, 0.0, 0.0
+
+    @classmethod
+    def advance_leader(cls, dist):
+        """리더를 진행 축(기준점 당시 팔로워 기수) 방향으로 dist [m] 전진."""
+        cls.l_n += cls.a_n * dist
+        cls.l_e += cls.a_e * dist
+
+    @classmethod
+    def charge_leader(cls, dist):
+        """리더를 지금의 팔로워 위치 쪽으로 dist [m] 이동 (시선 방향을 매 스텝 다시 계산).
+
+        후퇴하는 팔로워를 계속 겨누므로 '정면 돌진' 이 기수와 무관하게 성립한다.
+        """
+        dn, de = cls.f_n - cls.l_n, cls.f_e - cls.l_e
+        h = float(np.hypot(dn, de))
+        if h < 1e-6:
+            return
+        cls.l_n += dn / h * dist
+        cls.l_e += de / h * dist
 
     @classmethod
     def relative_fru(cls):
@@ -198,11 +229,13 @@ class FakeDetector:
         pass
 
     def detect(self, image, roi=None):
+        World.det_calls += 1
         if not World.visible:
             return []
         u, v, half, _ = _bbox_px()
         if not (0 <= u < W and 0 <= v < H):
             return []                       # FOV 밖이면 안 보인다
+        World.det_boxes += 1
         return [{
             "bbox": [float(u - half), float(v - half), float(u + half), float(v + half)],
             "conf": 0.85,
@@ -457,6 +490,7 @@ def run_scenario(name):
 
     seen_modes, headings, ranges, vels, rows, seps = [], [], [], [], [], []
     last_heading = [None]
+    world_log_t = [0.0]
     sine_t0 = [None]
     land_seen_at = [None]
     took_over_at = [None]
@@ -477,15 +511,21 @@ def run_scenario(name):
             # 폐루프 월드: 팔로워가 실제로 움직인 만큼 리더까지의 거리가 변한다
             if t == "LOCAL_POSITION_NED":
                 World.f_n, World.f_e, World.f_d = float(msg.x), float(msg.y), float(msg.z)
-                if not World.have_fix:
-                    World.l_n = World.f_n + ARGS.leader_front
-                    World.l_e = World.f_e
+                # 기수를 알기 전에는 기준점을 잡지 않는다. 리더는 '정북' 이 아니라 '지금 기수 방향' 앞에 놓는다 —
+                # 직전 시나리오에서 남은 기수가 이월되면 정북 배치는 기체 뒤가 된다.
+                if not World.have_fix and World.have_att:
+                    World.a_n = float(np.cos(World.f_yaw))
+                    World.a_e = float(np.sin(World.f_yaw))
+                    World.l_n = World.f_n + ARGS.leader_front * World.a_n
+                    World.l_e = World.f_e + ARGS.leader_front * World.a_e
                     World.l_d = World.f_d
                     World.have_fix = True
                     log(f"월드 기준점: 팔로워 NED=({World.f_n:.1f},{World.f_e:.1f},"
-                        f"{World.f_d:.1f}), 리더 전방 {ARGS.leader_front}m")
+                        f"{World.f_d:.1f}) 기수 {np.degrees(World.f_yaw):.0f}°, "
+                        f"리더 기수 방향 {ARGS.leader_front}m 앞")
             elif t == "ATTITUDE":
                 World.f_yaw = float(msg.yaw)
+                World.have_att = True
 
             if t == "VFR_HUD":
                 last_heading[0] = float(msg.heading)
@@ -495,7 +535,8 @@ def run_scenario(name):
             if t == "LOCAL_POSITION_NED":
                 front, _, _ = World.relative_fru()
                 ranges.append((now, front, -World.f_d, in_fov()))     # fov 는 그 시점 값을 기록 (출력 시점 값이 아니라)
-                vels.append((now, float(msg.vx)))                     # 팔로워 북쪽 속도 (리더는 북진)
+                # 팔로워 속도의 '리더 진행 축' 성분. 축이 정북이 아니어도(기수 이월) 진폭비가 cos 로 깎이지 않는다.
+                vels.append((now, float(msg.vx) * World.a_n + float(msg.vy) * World.a_e))
                 # 최소 이격 판정: 3차원 거리, 시선방향 속도(+ 접근), 수평면에서 시선에 수직인 속도(측면 회피)
                 _dn, _de, _dd = World.l_n - World.f_n, World.l_e - World.f_e, World.l_d - World.f_d
                 _d3 = float(np.sqrt(_dn * _dn + _de * _de + _dd * _dd))
@@ -508,7 +549,14 @@ def run_scenario(name):
                         _vlat = float(np.hypot(float(msg.vx) - _al * _un, float(msg.vy) - _al * _ue))
                     else:
                         _vlat = 0.0
-                    seps.append((now, _d3, _vlos, _vlat))
+                    seps.append((now, _d3, _vlos, _vlat, int(in_fov())))
+                # 1Hz 월드 진단. STAT 이 mission=WAIT_LEADER 로만 나올 때 '리더가 어디 있었나' 를 콘솔에서 바로 본다
+                # (CSV 를 나중에 열어보지 않아도 원인이 남는다).
+                if name == "min_separation" and now - world_log_t[0] >= 1.0:
+                    world_log_t[0] = now
+                    _f, _r, _u = World.relative_fru()
+                    log(f"  [WORLD] front={_f:+.2f} right={_r:+.2f} up={_u:+.2f} d3={_d3:.2f} "
+                        f"fov={int(in_fov())} 기수={np.degrees(World.f_yaw):.0f}° 검출={World.det_boxes}/{World.det_calls}")
                 rows.append((now, front, -World.f_d, int(in_fov()), float(msg.vx), World.f_n, World.f_e, World.f_d,
                              World.l_n, World.l_e, World.l_d, seen_modes[-1][1] if seen_modes else "", last_heading[0]))
 
@@ -554,13 +602,32 @@ def run_scenario(name):
                     fail(f"C2: 조종사 탈환이 {now - took_over_at[0]:.1f}s 만에 LAND로 덮어써짐")
                     World.stop = True
 
+    def nap(sec):
+        """시나리오가 끝났으면 즉시 False 를 준다.
+
+        맨 time.sleep() 으로 자는 드라이버는 자기 시나리오가 끝난 뒤에 깨어나 **다음** 시나리오의 World
+        (visible, 기체 모드)를 건드린다. 그러면 다음 시나리오는 리더를 못 본 채 끝나고 원인은 로그에 안 남는다.
+        """
+        t_end = time.time() + sec
+        while time.time() < t_end:
+            if World.stop or World.generation != gen:
+                return False
+            time.sleep(0.05)
+        return not (World.stop or World.generation != gen)
+
+    def wait_fix():
+        while (not World.stop and World.generation == gen) and not World.have_fix:
+            time.sleep(0.2)
+        return not (World.stop or World.generation != gen)
+
     def driver():
         if name == "boot_no_leader":
             World.visible = False
             log("시나리오: 리더 미획득 상태로 대기 (C1)")
         elif name == "pilot_takeover":
             log("시나리오: 리더 소실 → FAILSAFE_LAND → 조종사 탈환 (C2)")
-            time.sleep(8)
+            if not nap(8):
+                return
             World.visible = False
             log("리더 소실 (range_coast 2s + lost_hold 8s = 10s 후 FAILSAFE_LAND 예상)")
         elif name == "handover":
@@ -568,13 +635,13 @@ def run_scenario(name):
             # 동안 리더는 화면 밖이다. 그 사이 미션은 FAILSAFE_LAND로 래치된다.
             # 그 뒤 GUIDED로 넘길 때 LAND가 튀어나오면 안 된다.
             log("시나리오: 리더 잠깐 보임 → 수동으로 12초 상승(리더 안 보임) → GUIDED 인계")
-            while (not World.stop and World.generation == gen) and not World.have_fix:
-                time.sleep(0.2)
-            time.sleep(4)                    # 리더를 잠깐 보여 last_seen_t를 세운다
+            if not wait_fix() or not nap(4):  # 리더를 잠깐 보여 last_seen_t를 세운다
+                return
             pilot.set_mode("LOITER")         # 조종사가 수동으로
             World.visible = False            # 상승 중 리더는 화면 밖
             log("수동 모드 + 리더 소실 — 미션은 FAILSAFE_LAND로 래치될 것")
-            time.sleep(12)
+            if not nap(12):
+                return
             World.visible = True             # 인계 시점에 리더를 다시 보여준다
             pilot.set_mode("GUIDED")
             guided_at[0] = time.time() - T0
@@ -584,9 +651,8 @@ def run_scenario(name):
             # 깊이만 죽이고 YOLO 검출은 유지한다. 수정 전 게이트는 bbox만 보고
             # "리더가 보인다"고 판단하므로 소실 판정이 영원히 안 난다.
             log("시나리오: 8초 뒤 깊이만 소실(검출은 유지) → 착륙하는가 (거리 게이트)")
-            while (not World.stop and World.generation == gen) and not World.have_fix:
-                time.sleep(0.2)
-            time.sleep(8)
+            if not wait_fix() or not nap(8):
+                return
             World.depth_ok = False
             depth_lost_at[0] = time.time() - T0
             log(f"깊이 소실 (t={depth_lost_at[0]:.1f}s). "
@@ -599,8 +665,8 @@ def run_scenario(name):
             # LOCAL_POSITION_NED가 없으면 leader_alt_est=None이 되고,
             # 수정 전 코드는 상대 z로 대체해 공중에서 착륙 판정을 통과시킨다.
             log("시나리오: 절대고도 없음 + 리더 하강 → 공중 착륙 판정 여부 (C3)")
-            while (not World.stop and World.generation == gen) and not World.have_fix:
-                time.sleep(0.2)
+            if not wait_fix():
+                return
             # 6초만 하강한다. landing_confirm_sec(1.8s)를 넘기기엔 충분하고,
             # 계속 내리면 리더가 FOV를 벗어나 "정당한" 리더 소실 failsafe가 걸려
             # 착륙 판정과 구분할 수 없게 된다.
@@ -616,10 +682,10 @@ def run_scenario(name):
             # P 제어라 평형 거리 = TARGET + v/KP_FORWARD 이므로, 그 값이 depth_max를
             # 넘으면 거리 관측을 잃고 무한히 뒤처진다 — 이것이 C4다.
             log("시나리오: 리더 0.3 m/s 전진 — 평형거리가 깊이창 안에 드는가 (C4)")
-            while (not World.stop and World.generation == gen) and not World.have_fix:
-                time.sleep(0.2)
+            if not wait_fix():
+                return
             while (not World.stop and World.generation == gen):
-                World.l_n += 0.3 * 0.1
+                World.advance_leader(0.3 * 0.1)
                 time.sleep(0.1)
 
         elif name == "leader_sine":
@@ -628,27 +694,27 @@ def run_scenario(name):
             # 1.15 rad/s 성분이 작아 이 결함을 자극하지 못했다.
             log(f"시나리오: 리더 {SINE_MEAN} ± {SINE_AMP} m/s 정현파 전진 (ω={SINE_W} rad/s, 주기 {2 * 3.14159 / SINE_W:.1f}s) "
                 f"— 팔로워 속도 진폭비 ≤ 1 인가 (스트링 안정성)")
-            while (not World.stop and World.generation == gen) and not World.have_fix:
-                time.sleep(0.2)
+            if not wait_fix():
+                return
             t_prev = time.time()
             sine_t0[0] = t_prev - T0
             while (not World.stop and World.generation == gen):
                 tn = time.time()
                 v = SINE_MEAN + SINE_AMP * np.sin(SINE_W * (tn - T0 - sine_t0[0]))
-                World.l_n += v * (tn - t_prev)
+                World.advance_leader(v * (tn - t_prev))
                 t_prev = tn
                 time.sleep(0.05)
 
         elif name == "min_separation":
-            log(f"시나리오: 리더 {SEP_SPEED} m/s 로 {SEP_STRAIGHT:.0f}초 북진(추종 정착) → 팔로워 쪽으로 "
+            log(f"시나리오: 리더 {SEP_SPEED} m/s 로 {SEP_STRAIGHT:.0f}초 전진(추종 정착) → 팔로워 쪽으로 "
                 f"{SEP_CHARGE} m/s 돌진. 접근 속도가 MAX_VX({main.MAX_VX}) 보다 커서 후퇴로는 못 벗어난다 "
                 f"— 측면 회피가 동작하는가")
             log(f"판정 기준: 접촉 {SEP_HARD_FLOOR_M:.2f}m, 회피 반경 {SEP_RADIUS_M:.1f}m, 측면 ≥ {SEP_MIN_LATERAL:.2f} m/s")
-            while (not World.stop and World.generation == gen) and not World.have_fix:
-                time.sleep(0.2)
+            if not wait_fix():
+                return
             t0 = time.time()
             while (not World.stop and World.generation == gen) and time.time() - t0 < SEP_STRAIGHT:
-                World.l_n += SEP_SPEED * 0.1
+                World.advance_leader(SEP_SPEED * 0.1)
                 time.sleep(0.1)
             d_start = float(np.sqrt((World.l_n - World.f_n) ** 2 + (World.l_e - World.f_e) ** 2
                                     + (World.l_d - World.f_d) ** 2))
@@ -661,19 +727,19 @@ def run_scenario(name):
                 if d_now <= SEP_ENTER_M:
                     break
                 tn = time.time()
-                World.l_n -= SEP_CHARGE * (tn - t_prev)     # 경과 시간으로 적분 (고정 스텝은 타이머 정확도에 좌우된다)
+                World.charge_leader(SEP_CHARGE * (tn - t_prev))   # 시선 방향, 경과 시간으로 적분 (고정 스텝은 타이머 정확도에 좌우된다)
                 t_prev = tn
                 time.sleep(0.05)
             log(f"돌진 종료 ({time.time() - t0:.1f}초, 거리 {d_now:.2f}m), 리더 정지 — 회복 관측")
 
         elif name == "hover_hold":
             log("시나리오: 리더 전진 후 정지 → 팔로워가 정위치를 유지하는가 (H2)")
-            while (not World.stop and World.generation == gen) and not World.have_fix:
-                time.sleep(0.2)
+            if not wait_fix():
+                return
             t0 = time.time()
             # 1단계: 0.3 m/s로 8초 전진 → FOLLOW 진입 + 팔로워가 뒤처진 상태를 만든다
             while (not World.stop and World.generation == gen) and time.time() - t0 < 8:
-                World.l_n += 0.3 * 0.1
+                World.advance_leader(0.3 * 0.1)
                 time.sleep(0.1)
             log(f"리더 정지. 이후 팔로워가 목표거리로 수렴하는지 관측")
 
@@ -777,9 +843,10 @@ def run_scenario(name):
         if len(seps) < 50:
             fail(f"거리 샘플 부족 ({len(seps)}개) — 판정 불가")
         else:
-            d_min = min(d for _, d, _, _ in seps)
+            d_min = min(x[1] for x in seps)
             inside = [x for x in seps if x[1] < radius]
             lat_max = max((x[3] for x in inside), default=0.0)
+            fov_in = sum(x[4] for x in inside)
             # 회피 반경 안에 있던 시간 구간에 '송신한' 명령의 측면 성분 — 제어기의 계약은 여기까지다.
             t_lo = min((x[0] for x in inside), default=None)
             t_hi = max((x[0] for x in inside), default=None)
@@ -794,11 +861,17 @@ def run_scenario(name):
                 f"{('%.2fm' % est_min) if est_min is not None else '없음'} (실제 {d_min:.2f}m)")
             verdict["note"] = (verdict.get("note", "") + f" ctrl {len(ctrl_in)}/{len(ctrl)}"
                                + (f" est_min {est_min:.2f}" if est_min is not None else " est_min none"))
-            if not ctrl_in:
+            log(f"  인지: 검출 {World.det_boxes}/{World.det_calls} 프레임, 회피 반경 안 FOV {fov_in}/{len(inside)} 샘플")
+            if World.det_boxes == 0:
+                fail(f"리더를 한 번도 검출하지 못했다 (검출 0/{World.det_calls}) — 시나리오가 리더를 시야에 놓지 "
+                     f"못했다는 뜻이다(기수 이월·기준점 오류). 회피 판정 무효")
+            elif not ctrl_in:
                 log("!! 제어기가 한 번도 불리지 않았다 — 미션이 추종을 막았다(LOST_HOLD 등). 회피 이전의 문제다")
             elif est_min is not None and est_min > radius:
                 log(f"!! 추정 거리가 회피 반경({radius:.1f}m) 밖이었다 — 제어기 관점에서는 회피 조건이 아니었다")
-            verdict["note"] = f"min_dist {d_min:.2f}m cmd_lat {cmd_lat:.2f} body_lat {lat_max:.2f} inside {len(inside)}"
+            verdict["note"] = (f"min_dist {d_min:.2f}m cmd_lat {cmd_lat:.2f} body_lat {lat_max:.2f} "
+                               f"inside {len(inside)} fov {fov_in} det {World.det_boxes}/{World.det_calls} "
+                               f"ctrl {len(ctrl_in)}/{len(ctrl)}")
             if not inside:
                 fail(f"회피 반경({radius:.1f}m) 안으로 들어가지 못해 회피가 발동하지 않음 "
                      f"(최소 {d_min:.2f}m) — 시나리오가 조건을 만들지 못했다. 판정 무효")
@@ -809,6 +882,9 @@ def run_scenario(name):
                 if cmd_lat < SEP_MIN_LATERAL:
                     fail(f"최소 이격: 회피 반경 안에서 '명령된' 측면 속도가 최대 {cmd_lat:.2f} m/s 뿐 "
                          f"(기대 ≥ {SEP_MIN_LATERAL:.2f}) — 제어기가 비켜서라고 시키지 않았다")
+                elif fov_in < len(inside) * 0.5:
+                    fail(f"회피 반경 안 {len(inside)}샘플 중 리더가 시야에 있던 것은 {fov_in}샘플 — "
+                         f"측면으로 비키는 동안 리더가 화면 밖으로 나갔다. 회피가 추적을 깨뜨린다")
                 elif lat_max < SEP_MIN_LATERAL * 0.5:
                     log(f"!! 주의: 측면 {cmd_lat:.2f} m/s 를 명령했는데 기체는 {lat_max:.2f} m/s 밖에 못 냈다 "
                         f"— 명령은 맞지만 기체가 따라오지 못한다 (제어기 결함 아님)")
