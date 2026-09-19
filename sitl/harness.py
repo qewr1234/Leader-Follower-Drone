@@ -76,10 +76,6 @@ SEP_SPEED, SEP_STRAIGHT = 0.30, 10.0
 SEP_CHARGE, SEP_CHARGE_SEC = 0.70, 8.0
 SEP_HARD_FLOOR_M = 0.15       # 이 아래면 접촉으로 본다
 SEP_MIN_LATERAL = 0.12        # 회피 반경 안에서 관측돼야 하는 시선수직(수평) 속도 [m/s]
-# 판정 기준값. --repo 로 수정 전 코드를 돌릴 때 그쪽 main 에 없는 상수를 참조하면 시나리오가 통째로 죽어
-# 대조군을 만들 수 없다 — 차등 검증의 전제라 반드시 getattr 폴백을 둔다 (2026-09-20 실제로 깨졌다).
-SEP_FLOOR_M = float(getattr(main, "MIN_SEPARATION_M", 2.0))
-SEP_RADIUS_M = float(getattr(main, "EVADE_RADIUS_M", 1.5))
 CX, CY = W / 2.0, H / 2.0
 
 
@@ -216,6 +212,12 @@ detector.load_model = lambda *a, **k: None
 os.environ["MARS_FC_PORT"] = ARGS.fc_port
 import main         # noqa: E402
 import mavlink_io   # noqa: E402
+
+# min_separation 판정 기준값. main 임포트 뒤에 둬야 한다(모듈 상단은 스텁 설치 전이라 main 이 없다).
+# --repo 로 수정 전 코드를 돌릴 때 그쪽 main 에 없는 상수를 직접 참조하면 시나리오가 통째로 죽어
+# 대조군을 만들 수 없다 — 차등 검증의 전제라 반드시 getattr 폴백을 둔다 (2026-09-20 실제로 두 번 깨졌다).
+SEP_FLOOR_M = float(getattr(main, "MIN_SEPARATION_M", 2.0))
+SEP_RADIUS_M = float(getattr(main, "EVADE_RADIUS_M", 1.5))
 from pymavlink import mavutil  # noqa: E402
 
 main.D435i = FakeCam

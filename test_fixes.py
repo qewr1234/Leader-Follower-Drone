@@ -1173,6 +1173,26 @@ _h = open("sitl/harness.py", encoding="utf-8").read()
 check("하네스: --all 이 min_separation 까지 포함 (10개)",
       '"leader_sine", "min_separation"] if ARGS.all' in _h)
 
+# 하네스를 '실제로 끝까지 로드'해 본다. 모듈 상단 상수가 main 임포트보다 앞서거나(NameError), 판정이 옛
+# 코드에 없는 상수를 직접 참조하면(AttributeError) SITL 을 켜기 전에는 안 드러난다 — 2026-09-20 두 번 깨졌다.
+import importlib.util as _ilu  # noqa: E402
+_saved_argv = sys.argv[:]
+sys.argv = ["harness.py", "--scenario", "min_separation", "--no-csv"]
+try:
+    _spec = _ilu.spec_from_file_location("_harness_probe", "sitl/harness.py")
+    _hmod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_hmod)
+    _load_err = None
+except Exception as _e:                                    # noqa: BLE001
+    _hmod, _load_err = None, f"{type(_e).__name__}: {_e}"
+finally:
+    sys.argv = _saved_argv
+check("하네스: 모듈이 끝까지 로드된다 (상수 순서·main 의존성) — SITL 없이 잡히는 유일한 지점",
+      _load_err is None, _load_err or "ok")
+check("하네스: 판정 기준값이 getattr 폴백이라 --repo 로 옛 코드를 돌려도 죽지 않는다 (차등 검증의 전제)",
+      _hmod is not None and 'getattr(main, "EVADE_RADIUS_M"' in _h and abs(_hmod.SEP_RADIUS_M - main.EVADE_RADIUS_M) < 1e-9,
+      f"radius={getattr(_hmod, 'SEP_RADIUS_M', None)}")
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "
