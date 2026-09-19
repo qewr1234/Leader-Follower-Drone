@@ -28,7 +28,7 @@ from analysis import stability_margins as sm  # noqa: E402
 IMG_DIR = os.path.join(_ROOT, "docs", "images")
 C = dict(blue="#2a78d6", orange="#eb6834", aqua="#1baf7a", yellow="#eda100", red="#e34948",
          gray="#9a9a96", surface="#fcfcfb", ink="#0b0b0b", ink2="#52514e", grid="#e6e6e3")
-SITL = {"before": [1.95], "current": [0.43, 0.72], "omega": 1.15}      # 2026-09-18 WSL1 ArduCopter 실측 (sitl/README.md)
+SITL = {"before": [1.95], "prev": [0.43, 0.72], "omega": 1.15}      # 2026-09-18 WSL1 ArduCopter 실측 (sitl/README.md). prev = 2026-09-18 수정 설계
 
 plt.rcParams.update({"font.size": 10, "axes.edgecolor": C["grid"], "axes.labelcolor": C["ink2"], "xtick.color": C["ink2"],
                      "ytick.color": C["ink2"], "text.color": C["ink"], "axes.titlecolor": C["ink"], "figure.facecolor": C["surface"],
@@ -42,12 +42,14 @@ def _style(ax):
 
 
 def fig_string_stability():
-    frf = sm.EkfFrf(sm.load_frf())
+    frf = sm.EkfFrf.pair(sm.load_frf())
     base = sm.Params()
+    leg = dict(kp=sm.LEGACY_FWD[0], kd=sm.LEGACY_FWD[1])
     W = np.logspace(-2, np.log10(20.0), 1500)
-    curves = [("P+D only (no feedforward)", sm.Params(kff=0.0), C["gray"]),
-              ("before fix: FF LPF 0.7 s, no self-velocity matching", base.copy(**sm.BEFORE), C["orange"]),
-              ("current: FF LPF 2.0 s + self-velocity LPF 0.3 s + soft deadzone", base, C["blue"])]
+    curves = [("P+D only (no feedforward, no time gap)", sm.Params(kff=0.0, kv=0.0), C["gray"]),
+              ("before fix (09-18): FF LPF 0.7 s, relative-velocity EKF", base.copy(**leg, **sm.BEFORE), C["orange"]),
+              ("09-18 fix: FF LPF 2.0 s + self-velocity LPF 0.3 s", base.copy(**leg, **sm.PREV), C["yellow"]),
+              ("current (09-19): ego-input EKF, FF LPF 0.1 s, time gap Kv 0.2, Kp 0.30", base, C["blue"])]
     fig, ax = plt.subplots(figsize=(9.2, 5.4), dpi=150)
     peaks = {}
     for label, p, col in curves:
@@ -59,24 +61,28 @@ def fig_string_stability():
     ax.axvline(SITL["omega"], color=C["grid"], lw=1.2)
     ax.text(SITL["omega"] * 1.06, 2.33, "SITL test: ω = 1.15 rad/s (T = 5.5 s)", color=C["ink2"], fontsize=8.5, va="top")
     # SITL 실측점 (흰 테두리 2px)
-    for key, col in (("before", C["orange"]), ("current", C["blue"])):
+    for key, col in (("before", C["orange"]), ("prev", C["yellow"])):
         for v in SITL[key]:
             ax.plot(SITL["omega"], v, "o", ms=9, mfc=col, mec="white", mew=2, zorder=5)
     ax.annotate("ArduCopter SITL, before fix: ×1.95 (FAIL)", (SITL["omega"], 1.95), xytext=(1.6, 1.95), fontsize=9,
                 color=C["ink"], va="center", arrowprops=dict(arrowstyle="-", color=C["ink2"], lw=0.8))
-    ax.annotate("SITL, current code: ×0.72 / ×0.43 (PASS)", (SITL["omega"], 0.72), xytext=(1.6, 0.62), fontsize=9,
+    ax.annotate("SITL, 09-18 fix: ×0.72 / ×0.43 (PASS)", (SITL["omega"], 0.72), xytext=(1.6, 0.62), fontsize=9,
                 color=C["ink"], va="center", arrowprops=dict(arrowstyle="-", color=C["ink2"], lw=0.8))
-    # 곡선 직접 라벨 (피크 근처)
+    # 곡선 직접 라벨 (피크 근처). 이득여유는 분석 JSON 에서 읽는다.
+    res = json.load(open(sm.JSON_PATH))
     wb, gb = peaks[curves[1][0]]
-    ax.annotate(f"before fix: peak {gb:.2f} at {wb:.2f} rad/s\n(gain margin 4.9 dB)", (wb, gb), xytext=(0.12, 1.58), fontsize=9,
-                color=C["ink"], arrowprops=dict(arrowstyle="-", color=C["ink2"], lw=0.8))
-    wc, gc = peaks[curves[2][0]]
-    ax.annotate(f"current: peak {gc:.2f} at {wc:.2f} rad/s\n(gain margin 14.4 dB)", (wc, gc), xytext=(0.028, 1.32), fontsize=9,
-                color=C["ink"], arrowprops=dict(arrowstyle="-", color=C["ink2"], lw=0.8))
-    ax.text(0.0115, 0.86, "P+D only: no amplification,\nbut 1.36 m lag at 0.3 m/s", color=C["ink2"], fontsize=8.5, va="top")
+    ax.annotate(f"before fix: peak {gb:.2f} at {wb:.2f} rad/s\n(gain margin {res['before']['forward']['gm_db']:.1f} dB)", (wb, gb),
+                xytext=(0.12, 1.58), fontsize=9, color=C["ink"], arrowprops=dict(arrowstyle="-", color=C["ink2"], lw=0.8))
+    wp_, gp_ = peaks[curves[2][0]]
+    ax.annotate(f"09-18 fix: peak {gp_:.2f} at {wp_:.2f} rad/s (GM {res['prev']['forward']['gm_db']:.1f} dB)", (wp_, gp_),
+                xytext=(0.028, 1.36), fontsize=9, color=C["ink"], arrowprops=dict(arrowstyle="-", color=C["ink2"], lw=0.8))
+    wc, gc = peaks[curves[3][0]]
+    ax.annotate(f"current: peak {gc:.3f} — string stable\n(gain margin {res['axes']['forward']['gm_db']:.1f} dB)", (0.3, gc),
+                xytext=(0.3, 1.16), fontsize=9, color=C["ink"], arrowprops=dict(arrowstyle="-", color=C["ink2"], lw=0.8))
+    ax.text(0.0115, 0.86, "P+D only: no amplification,\nbut 1.0 m lag at 0.3 m/s (Kp 0.30)", color=C["ink2"], fontsize=8.5, va="top")
     ax.set_xscale("log"); ax.set_xlim(0.01, 20); ax.set_ylim(0, 2.36)
     ax.set_xlabel("ω [rad/s]"); ax.set_ylabel("|Γ(jω)| = |v_follower / v_leader|")
-    ax.set_title("Leader→follower velocity gain: linear model vs ArduCopter SITL (2026-09-18)", loc="left", fontsize=11)
+    ax.set_title("Leader→follower velocity gain: linear model vs ArduCopter SITL", loc="left", fontsize=11)
     ax.legend(loc="upper left", fontsize=8.5, bbox_to_anchor=(0.0, -0.13), ncol=1)
     _style(ax)
     fig.tight_layout()

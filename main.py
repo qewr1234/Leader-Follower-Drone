@@ -75,7 +75,9 @@ MAX_VX = 0.35
 MAX_VY = 0.22
 MAX_VZ = 0.12
 
-KP_FORWARD, KD_FORWARD = 0.22, 0.05
+# 전후 Kp 0.22 → 0.30 (2026-09-19): 추정기가 자기 속도를 예측 입력으로 받으면서 이득여유가 14 → 27 dB 로 커져,
+# 시간간격 정책(KV_SELF)이 늘리는 정상상태 이격을 Kp 로 되사는 여유가 생겼다 (docs/STABILITY_MARGINS.md 7절).
+KP_FORWARD, KD_FORWARD = 0.30, 0.05
 KP_RIGHT, KD_RIGHT = 0.28, 0.04
 KP_UP, KD_UP = 0.18, 0.03
 # yaw: 선두를 카메라 시야(FOV ~69도) 중앙에 유지. bearing(rad) 오차 → yaw_rate(rad/s)
@@ -85,8 +87,11 @@ MAX_YAW_RATE = 0.35
 UNCERTAINTY_SLOWDOWN_TRACE = CONFIG["controller"].get("uncertainty_slowdown_trace", 4.0)
 # 리더 속도 피드포워드 (config controller.leader_vel_ff_*)
 KFF_LEADER_VEL = float(CONFIG["controller"].get("leader_vel_ff_gain", 0.8))
-FF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_tau_sec", 2.0))
-FF_SELF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_self_tau_sec", 0.3))
+FF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_tau_sec", 0.1))
+# 자기 속도 감쇠 (시간간격 정책). cmd 에 −KV_SELF·v_self 를 더한다 = 전후축에서는 목표 이격이 3.0 + (KV/Kp)·v 로
+# 속도에 비례해 벌어지는 constant-time-gap 정책과 같다. 등간격 정책은 선행 기체 정보만으로는 스트링 안정이
+# 안 되고(|Γ| 피크 1.05~1.14), 시간간격 h = KV/Kp ≈ 0.7 s 가 이를 1.00 으로 내린다 (docs/STABILITY_MARGINS.md 7절).
+KV_SELF = float(CONFIG["controller"].get("self_vel_damping", 0.2))
 FF_DEADBAND_MPS = float(CONFIG["controller"].get("leader_vel_ff_deadband_mps", 0.05))
 
 # 최소 이격: 이 거리 아래로는 접근 성분을 0 으로 자르고 침범량에 비례해 물러난다 (compute_velocity_cmd_from_estimate).
@@ -252,19 +257,6 @@ def follower_velocity_fru(vehicle_state):
     return np.array([vx * c + vy * s, -vx * s + vy * c, -vz])
 
 
-def self_velocity_lpf(prev, v_self_fru, dt):
-    """자기 속도(FC) 를 EKF 상대속도와 같은 지연(FF_SELF_TAU_SEC) 으로 늦춘다. prev 가 None 이면 현재 값으로 시작.
-
-    리더 속도 = 자기 속도 + 상대 속도 인데 두 항의 지연이 다르면 그 차이만큼 자기 속도가 피드포워드로 되먹임된다
-    (docs/STABILITY_MARGINS.md 2절의 H_m − E_v/s 항). EKF 속도 추정의 63% 응답이 0.30s 로 실측되어 그 값에 맞춘다.
-    """
-    v = np.asarray(v_self_fru, dtype=float)
-    if prev is None or FF_SELF_TAU_SEC <= 0.0:
-        return v
-    a = 1.0 - math.exp(-max(float(dt), 0.0) / FF_SELF_TAU_SEC)
-    return np.asarray(prev, dtype=float) + a * (v - np.asarray(prev, dtype=float))
-
-
 def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
     """피드포워드 항 갱신: 소프트 데드존(호버 잡음 억제) → 1차 저역통과(FF_TAU_SEC). leader_vel_fru 가 None 이면 0 으로 감쇠.
 
@@ -272,9 +264,10 @@ def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
     DB~2DB 구간에서 국소 기울기가 3 이라 실효 이득이 3·KFF 가 됐고, 리더 0.15 m/s 정현파에서 3.5배 증폭이 관측됐다.
     빼는 만큼 정상상태 오차가 KFF·DB/Kp 만큼 늘어(0.05 → 0.18m) 폭을 0.10 에서 0.05 로 줄였다.
 
-    저역통과 2.0s 와 자기 속도 정합 필터(self_velocity_lpf) 의 근거는 docs/STABILITY_MARGINS.md: FC 속도루프 0.3s,
-    EKF 속도 지연 0.30s(실측) 에서 예전 값(0.7s, 정합 없음) 은 GM 4.9dB·|Γ| 피크 1.80 (1.15 rad/s) 이었고,
-    지금 값은 GM 14.4dB·|Γ| 1.13 이다. 정상상태 오차 (1-KFF)·v/Kp 는 그대로다.
+    리더 속도는 IMM-EKF 가 절대 속도로 직접 추정한다(자기 속도는 예측 입력). 예전에는 자기 속도 + 상대 속도로
+    만들었고 두 항의 지연 차이가 양성 되먹임이 되어 정합 저역통과(0.3s)와 긴 FF 저역통과(2.0s)가 필요했다 — 지금은
+    그 경로가 없고, 긴 저역통과는 오히려 스트링 안정을 깬다(FF 가 P 응답보다 늦어 겹친다: τ 2.0s 에서 |Γ| 1.14,
+    0.1s 에서 1.00). 0.1s 는 호버 잡음(v̂ σ 0.07 m/s → 명령 σ 0.03 m/s)을 눌러 주는 최소값이다. docs/STABILITY_MARGINS.md.
     """
     target = np.zeros(3)
     if leader_vel_fru is not None:
@@ -288,33 +281,38 @@ def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
 
 
 def enforce_min_separation(cmd_fru, rel_fru):
-    """근접 시 두 단계로 개입한다. 1) 시선 방향 접근 성분 제거 2) 그래도 좁혀지면 측면 회피.
+    """근접 시 두 단계로 개입한다. 1) 시선 방향 접근 속도 상한(장벽) 2) 그래도 좁혀지면 측면 회피.
 
-    **1단계(접근 성분 제거)는 대부분의 구간에서 P 항과 중복이다.** 목표 3m·바닥 2m·KP 0.22 에서
-    P 항이 내는 후퇴가 -KP·(3-d) 이고 이 제약의 허용치가 -KS·(2-d) 이므로, 거리 1.42m 위에서는
-    P 가 항상 더 강하다(`test_fixes.py` 의 `이격:` 검사가 이 교차점을 고정한다). 실제로 무는 경우는
-    피드포워드가 바닥에서 0.275 m/s 를 넘을 때뿐인데, 그러려면 리더가 0.39 m/s 이상으로 움직여야 하고
-    그건 MAX_VX 0.35 로는 추종이 안 되는 속도다. 즉 이 단계는 '이론적 바닥'이지 상시 동작하는 보호가 아니다.
-    그래도 남겨 둔다 — 이득을 올리거나 MAX_VX 를 키우면 바로 의미가 생기는 자리이고, 비용이 0 이다.
+    **1단계는 접근 속도의 장벽이다: 명령의 시선 방향 성분 ≤ KS·(d − d_min).** 바닥(2 m) 밖에서는 남은
+    거리에 비례해 접근을 허용하고, 바닥 안에서는 침범량에 비례해 물러나게 한다 — 하나의 연속 함수다
+    (제어 장벽 함수 형태). 예전에는 바닥 안에서만 적용했는데, 그 구간에서는 P 항의 후퇴 −KP·(3−d) 가
+    교차점 (KS·2−KP·3)/(KS−KP) (KP 0.22 에서 1.42 m, 0.30 에서 1.00 m) 위에서 항상 더 강해 P 만 있는 경로에서는
+    한 번도 물지 않았다(`test_fixes.py` `이격:` 교차점 검사).
+    이 장벽이 실제로 하는 일은 **피드포워드가 파고드는 것을 막는 것**이다: 리더가 가까이 왔다가 멀어지기
+    시작하면 FF 는 앞으로 밀고 P 는 뒤로 당기는데, 1.8 m 에서 리더가 0.5 m/s 로 멀어지면 P −0.36 + FF +0.40 =
+    +0.04 로 바닥 안에서 접근 명령이 나온다. 장벽은 이것을 −0.12(물러남) 로 자른다. 요구도 FCR-16 은
+    "바닥 안에서 접근 명령이 나가지 않는다" 이고, 그 보증은 P 가 아니라 이 장벽이 준다.
 
-    **2단계(측면 회피)가 실제 보호다.** 리더가 MAX_VX 보다 빠르게 다가오면 정면 후퇴로는 원리적으로
-    벗어날 수 없다(0.5 m/s 로 다가오면 최소 0.84m, 0.6 m/s 면 접촉 — 오프라인 모의). 느린 기체가 쓸 수 있는
-    유일한 회피는 비켜서는 것이라, EVADE_RADIUS_M 안에서는 시선에 수직인 방향으로 측면 속도를 얹는다.
-    방향은 리더가 치우친 반대쪽 — 이미 오른쪽에 있으면 왼쪽으로 빠진다. 수직 성분은 쓰지 않는다(MAX_VZ 0.12 로 너무 느리다).
-        램프는 반경 안쪽 EVADE_RAMP_M 만에 최대치에 닿는다. 반경 전체로 훑으면 가장 위험한 근거리에서
-        회피가 가장 약해진다 — 첫 SITL 실측에서 0.65m 일 때 명령이 0.125 m/s 뿐이었고 측면 속도는 0.09 m/s 였다.
+    **2단계(측면 회피)가 정면 돌진에 대한 보호다.** 리더가 MAX_VX 보다 빠르게 다가오면 정면 후퇴로는 원리적으로
+    벗어날 수 없다. 느린 기체가 쓸 수 있는 유일한 회피는 비켜서는 것이라, EVADE_RADIUS_M 안에서는 시선에
+    수직인 방향으로 측면 속도를 얹는다. 방향은 리더가 치우친 반대쪽 — 이미 오른쪽에 있으면 왼쪽으로 빠진다.
+    수직 성분은 쓰지 않는다(MAX_VZ 0.12 로 너무 느리다). 램프는 반경 안쪽 EVADE_RAMP_M 만에 최대치에 닿는다.
+    반경 전체로 훑으면 가장 위험한 근거리에서 회피가 가장 약해진다 — 첫 SITL 실측에서 0.65m 일 때 명령이
+    0.125 m/s 뿐이었고 측면 속도는 0.09 m/s 였다.
+
+    **회피의 한계(요구도 FCR-17, analysis/evasion_sim.py):** 회피는 '지나가는' 리더에 대한 것이다. 리더가 매 순간
+    팔로워를 다시 겨누며 hypot(MAX_VX, MAX_VY)=0.41 m/s 보다 빠르게 추격하면 순수추격 기하상 어떤 제어기도
+    접촉을 피할 수 없다. 그 위는 속도 한계(MAX_V*) 를 올리거나 리더 운용 절차로 막아야 한다.
     """
     cmd = np.asarray(cmd_fru, dtype=float)[:3].copy()
     rel = np.asarray(rel_fru, dtype=float)[:3]
     dist = float(np.linalg.norm(rel))
-    if dist >= MIN_SEPARATION_M or dist < 1e-6:
-        if dist >= EVADE_RADIUS_M:
-            globals()["_evade_side"] = 0
+    if dist < 1e-6:
         return cmd
 
     u = rel / dist                                  # 리더 쪽 단위 벡터 (FRU)
     v_along = float(cmd @ u)                        # + 면 접근 중
-    v_allowed = -MIN_SEPARATION_KP * (MIN_SEPARATION_M - dist)   # 음수 = 물러나는 속도
+    v_allowed = MIN_SEPARATION_KP * (dist - MIN_SEPARATION_M)    # 바닥 밖 +: 접근 상한, 바닥 안 −: 물러나는 속도
     if v_along > v_allowed:
         cmd = cmd + (v_allowed - v_along) * u
 
@@ -336,12 +334,20 @@ def enforce_min_separation(cmd_fru, rel_fru):
     return cmd
 
 
-def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance=None, leader_vel_ff=None):
-    """IMM 추정(FRU 상대 위치·속도) → BODY_NED [vx, vy, vz, yaw_rate]. 네 축 모두 P+D + 리더 속도 피드포워드, 불확실하면 감속."""
+def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance=None, leader_vel_ff=None,
+                                       v_self_fru=None):
+    """IMM 추정(FRU 상대 위치·속도) → BODY_NED [vx, vy, vz, yaw_rate].
+
+    축마다  cmd = KFF·v_L + Kp·e + Kd·v_rel − KV·v_self.  마지막 항이 시간간격 정책이다: 전후축에서 정상상태
+    (cmd = v) 는 e = (v − KFF·(v−db) + KV·v)/Kp 라 이격이 속도에 비례해 벌어진다 (0.3 m/s 에서 0.53 m). 그 대가로
+    리더 속도 변동이 뒤 기체에서 증폭되지 않는다(|Γ| ≤ 1). v_self_fru 가 None(자기 속도 미수신)이면 이 항은 0 이다.
+    불확실하면(pos_cov_trace) 전체를 감속한다.
+    """
     if target_distance is None:
         target_distance = TARGET_DISTANCE_M
     front, right, up = (float(v) for v in np.asarray(rel_fru, dtype=float)[:3])
     v_front, v_right, v_up = (float(v) for v in np.asarray(rel_vel_fru, dtype=float)[:3])
+    vs_f, vs_r, vs_u = (0.0, 0.0, 0.0) if v_self_fru is None else (float(v) for v in np.asarray(v_self_fru, dtype=float)[:3])
 
     if pos_cov_trace > UNCERTAINTY_SLOWDOWN_TRACE:
         scale = 0.55
@@ -351,9 +357,9 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, targ
         scale = 1.0
 
     ff_f, ff_r, ff_u = (0.0, 0.0, 0.0) if leader_vel_ff is None else (float(v) for v in np.asarray(leader_vel_ff, dtype=float)[:3])
-    cmd_forward = clamp((KFF_LEADER_VEL * ff_f + KP_FORWARD * (front - float(target_distance)) + KD_FORWARD * v_front) * scale, -MAX_VX, MAX_VX)
-    cmd_right = clamp((KFF_LEADER_VEL * ff_r + KP_RIGHT * right + KD_RIGHT * v_right) * scale, -MAX_VY, MAX_VY)
-    cmd_up = clamp((KFF_LEADER_VEL * ff_u + KP_UP * up + KD_UP * v_up) * scale, -MAX_VZ, MAX_VZ)
+    cmd_forward = clamp((KFF_LEADER_VEL * ff_f + KP_FORWARD * (front - float(target_distance)) + KD_FORWARD * v_front - KV_SELF * vs_f) * scale, -MAX_VX, MAX_VX)
+    cmd_right = clamp((KFF_LEADER_VEL * ff_r + KP_RIGHT * right + KD_RIGHT * v_right - KV_SELF * vs_r) * scale, -MAX_VY, MAX_VY)
+    cmd_up = clamp((KFF_LEADER_VEL * ff_u + KP_UP * up + KD_UP * v_up - KV_SELF * vs_u) * scale, -MAX_VZ, MAX_VZ)
     # yaw: 선두 방위각을 0 으로 (시야 이탈 방지). BODY_NED yaw_rate 우회전 +, 타겟이 오른쪽이면 bearing + → 부호 일치.
     cmd_yaw_rate = clamp(KP_YAW * math.atan2(right, max(front, 0.5)) * scale, -MAX_YAW_RATE, MAX_YAW_RATE)
 
@@ -563,7 +569,6 @@ def main():
     current_body_cmd = np.zeros(4)
     prev_rpy_for_comp = None      # 직전 프레임 팔로워 (roll, pitch, yaw)
     ff_fru = np.zeros(3)          # 리더 속도 피드포워드 (FRU, 저역통과 상태)
-    v_self_lpf = None             # 자기 속도 정합 저역통과 상태 (FRU)
     v_leader_fru = None           # 리더 절대 속도 추정 (FRU). STAT 진단용으로 루프 밖에서도 참조
 
     print("=" * 90)
@@ -603,7 +608,6 @@ def main():
                 mission.reset()
                 prev_body_cmd = np.zeros(4)
                 ff_fru = np.zeros(3)
-                v_self_lpf = None
                 reset_evade_side()
                 last_land_send = 0.0
                 print(f"[SYS] {fc_mode} 진입 — 미션/명령 리셋")
@@ -663,11 +667,11 @@ def main():
                 prev_rpy_for_comp = cur_rpy
             else:
                 prev_rpy_for_comp = None
-            # CT 모델의 회전율은 리더 '절대' 속도로 추정한다 — 자기 속도를 카메라 프레임으로 넣어 준다.
-            # 보상(위에서 ego_vel 도 함께 회전) 뒤, predict 앞에 넣어야 프레임이 맞는다.
+            # 자기 속도는 EKF 예측의 입력이다 (상대 위치 = ∫(리더 절대 속도 − 자기 속도)). 보상(위에서 ego_vel 도
+            # 함께 회전) 뒤, predict 앞에 넣어야 프레임이 맞는다. 초기화 전에도 넣는다 — init 이 초기 절대 속도로 쓴다.
+            v_self_fru = follower_velocity_fru(vehicle_state) if (local_pos_fresh and attitude_fresh) else None
+            ekf.set_ego_velocity_cam(fru_to_camera_xyz(v_self_fru) if v_self_fru is not None else None)
             if ekf.initialized:
-                v_self_fru = follower_velocity_fru(vehicle_state) if (local_pos_fresh and attitude_fresh) else None
-                ekf.set_ego_velocity_cam(fru_to_camera_xyz(v_self_fru) if v_self_fru is not None else None)
                 ekf.predict(dt)
 
             # ---------------- 스케줄러 → 검출/추적 ----------------
@@ -708,7 +712,8 @@ def main():
             pos_cov_trace = float(np.trace(P_est[:3, :3])) if ekf.initialized else 999.0
             mu = ekf.get_model_probs() if ekf.initialized else np.array([0.0, 0.0])
             rel_fru = camera_xyz_to_fru(x_est[:3])
-            rel_vel_fru = camera_xyz_to_fru(x_est[3:6])
+            # 상태의 속도는 리더 '절대' 속도. 제어 D 항·미션 폴백은 상대 속도(절대 − 자기)를 쓴다.
+            rel_vel_fru = camera_xyz_to_fru(ekf.relative_velocity()) if ekf.initialized else np.zeros(3)
 
             follower_alt = get_follower_altitude_m(vehicle_state) if local_pos_fresh else None
             # 착륙 판정용 선두 고도는 AGL 근사여야 한다 (ESP32 alt 는 절대고도라 landing_z_thresh 와 비교 불가)
@@ -724,16 +729,13 @@ def main():
             vision_range_ok = bool(ekf.has_vision_range_fix())
             target_distance_m = TARGET_DISTANCE_M if vision_range_ok else TARGET_DISTANCE_GPS_ONLY_M
 
-            # 리더 절대 속도(FRU) = FC 자기 속도 + EKF 상대 속도. 미션(출발/정지/착륙 판단)과 피드포워드가 같이 쓴다.
-            # 상대 속도만 보면 후미가 선두 속도를 맞추는 순간 0 이 되어 '선두 정지' 로 오판한다. 자기 속도·자세가
-            # 신선하고 EKF 가 신뢰할 수 있을 때만 만들고, 없으면 미션은 상대 속도로 폴백한다.
-            # 자기 속도는 EKF 상대속도와 같은 지연으로 늦춘다(self_velocity_lpf) — 아니면 그 차이가 피드포워드로 되먹임된다.
+            # 리더 절대 속도(FRU) 는 EKF 상태 그대로다 (자기 속도가 예측 입력으로 들어가 있다). 미션(출발/정지/착륙
+            # 판단)과 피드포워드가 같이 쓴다. 상대 속도만 보면 후미가 선두 속도를 맞추는 순간 0 이 되어 '선두 정지' 로
+            # 오판한다. 자기 속도·자세가 신선하고 EKF 가 신뢰할 수 있을 때만 쓰고(아니면 상태 v 는 상대 속도에 불과),
+            # 없으면 미션은 상대 속도로 폴백한다.
             v_leader_fru = None
-            if ekf.initialized and ekf.is_reliable() and local_pos_fresh and attitude_fresh:
-                v_f = follower_velocity_fru(vehicle_state)
-                if v_f is not None:
-                    v_self_lpf = self_velocity_lpf(v_self_lpf, v_f, dt)
-                    v_leader_fru = v_self_lpf + rel_vel_fru
+            if ekf.initialized and ekf.is_reliable() and local_pos_fresh and attitude_fresh and v_self_fru is not None:
+                v_leader_fru = camera_xyz_to_fru(ekf.leader_velocity())
 
             mission_state, mission_policy = mission.update(
                 now=now, leader_visible=leader_visible_for_mission,
@@ -759,7 +761,8 @@ def main():
                     last_land_send = now
                     last_setpoint_time = now
             elif mission_policy["allow_follow"] and ekf.initialized:
-                desired_body_cmd = compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance_m, ff_fru)
+                desired_body_cmd = compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance_m, ff_fru,
+                                                                      v_self_fru=v_self_fru)
 
             # 수직 축은 리더 상대 고도를 따라간다 — 트래커가 지면의 무언가를 물면 계속 하강한다. AGL 바닥.
             if follower_alt is not None and follower_alt < MIN_AGL_M and desired_body_cmd[2] > 0.0:

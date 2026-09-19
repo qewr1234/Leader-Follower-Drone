@@ -87,7 +87,7 @@ def _import_main():
 
 
 main = _import_main()
-from imm_ekf import ImmEkf  # noqa: E402
+from imm_ekf import ImmEkf, LEGACY_TUNING  # noqa: E402
 
 FPS = 30.0
 SETPOINT_HZ = 10.0
@@ -96,7 +96,22 @@ TAU_SMOOTH = -(1.0 / FPS) / math.log(1.0 - SMOOTH_ALPHA)        # 0.1015 s: smoo
 
 
 # ---------------------------------------------------------------- 파라미터
-BEFORE = dict(tau_ff=0.7, tau_m=0.0, legacy_ff=True, deadband=0.10)   # 2026-09-18 수정 전 설계 (FF 저역통과 0.7s, 자기 속도 정합 없음, 0.10 램프 데드밴드)
+# 세 설계. 추정기까지 포함한다 — 2026-09-19 에 추정기가 리더 절대 속도 상태 + 자기 속도 예측 입력으로 바뀌었다.
+#   BEFORE : 2026-09-18 수정 전. FF 저역통과 0.7s, 자기 속도 정합 없음, 0.10 램프 데드밴드, 상대속도 추정기.
+#   PREV   : 2026-09-18 수정. FF 2.0s + 자기 속도 정합 0.3s + 소프트 데드존, 상대속도 추정기 (SITL leader_sine 0.72 가 이 설계).
+#   현재    : PREV 의 FF 파라미터 + 절대속도 추정기(자기 속도가 예측 입력). 정합 저역통과가 필요 없어졌다.
+#   전후 이득도 다르다: BEFORE/PREV 는 Kp 0.22, 현재는 0.30 (+ 자기 속도 감쇠 KV 0.2).
+LEGACY_FWD = (0.22, 0.05)
+BEFORE = dict(tau_ff=0.7, tau_m=0.0, legacy_ff=True, deadband=0.10, ego_input=False, legacy_ekf=True, kv=0.0)
+PREV = dict(tau_ff=2.0, tau_m=0.3, ego_input=False, legacy_ekf=True, kv=0.0)
+
+
+def legacy_axes():
+    return {"forward": LEGACY_FWD, "right": (main.KP_RIGHT, main.KD_RIGHT), "up": (main.KP_UP, main.KD_UP)}
+
+
+def current_axes():
+    return {"forward": (main.KP_FORWARD, main.KD_FORWARD), "right": (main.KP_RIGHT, main.KD_RIGHT), "up": (main.KP_UP, main.KD_UP)}
 
 
 class Params:
@@ -106,12 +121,15 @@ class Params:
         self.kp = main.KP_FORWARD
         self.kd = main.KD_FORWARD
         self.kff = main.KFF_LEADER_VEL
+        self.kv = main.KV_SELF      # 자기 속도 감쇠 (시간간격 정책 h = kv/kp). PREV/BEFORE 0
         self.tau_ff = main.FF_TAU_SEC
         self.tau_fc = 0.30      # ArduCopter 속도루프 등가 1차 시정수 (PSC_VELXY_P=2 → 0.5s 에 가속→자세 지연 포함, 보수적으로 0.3~0.5)
         self.tau_s = TAU_SMOOTH
         self.Td = 0.10          # 검출·추론 ~40ms + 10Hz ZOH 평균 50ms
         self.Tm = 0.10          # LOCAL_POSITION_NED 10Hz 수신 지연 (자기 속도)
-        self.tau_m = main.FF_SELF_TAU_SEC   # 자기 속도 정합 저역통과 (main.self_velocity_lpf). 0 이면 필터 없음 = 수정 전 설계
+        self.tau_m = 0.0        # [ego_input=False 전용] 자기 속도 정합 저역통과 (예전 main.self_velocity_lpf). PREV 0.3, BEFORE 0
+        self.ego_input = True   # 추정기가 자기 속도를 예측 입력으로 받는다 (리더 절대 속도 상태). False = 예전 상대속도 추정기 + v_self + v_rel
+        self.legacy_ekf = False  # FRF/체인에 예전 추정기 튜닝(프레임당 고정 전이행렬) 을 쓴다 — BEFORE/PREV 골든 보존용
         self.legacy_ff = False  # 체인 시뮬레이션에서 수정 전 leader_velocity_ff(램프 데드밴드) 를 쓴다
         self.scale = 1.0        # 불확실성 감속 배율 (1.0 / 0.75 / 0.55)
         self.deadband = None    # 체인 시뮬레이션에서 main.FF_DEADBAND_MPS 를 덮어쓸 값 (None = 코드 값)
@@ -128,14 +146,19 @@ class Params:
 
 
 # ---------------------------------------------------------------- IMM-EKF 주파수응답 실측
-def _run_ekf_sine(omega, fps=FPS):
-    """카메라 z(전방) 축에 d(t) = 3 + a·sin(ωt) 를 넣고 정착 후 d̂, v̂ 의 복소 이득을 최소제곱으로 뽑는다."""
+def _make_ekf(legacy=False):
+    return ImmEkf(**LEGACY_TUNING) if legacy else ImmEkf()
+
+
+def _run_ekf_sine(omega, fps=FPS, legacy=False):
+    """카메라 z(전방) 축에 d(t) = 3 + a·sin(ωt) 를 넣고 정착 후 d̂, v̂ 의 복소 이득을 최소제곱으로 뽑는다.
+    자기 속도 입력 0 이므로 상태 v 는 상대 속도와 같다 — 리더 운동에 대한 추정기 응답 E_p, E_v 가 나온다."""
     dt = 1.0 / fps
     period = 2 * math.pi / omega
     t_settle = max(3 * period, 10.0)
     t_fit = max(3 * period, 10.0)
     a = min(0.5, 2.0 / omega**2)               # 최대 가속 2 m/s² 로 제한 (실제 기동 범위)
-    ekf = ImmEkf()
+    ekf = _make_ekf(legacy)
     ekf.init(np.array([0.0, 0.0, 3.0]))
     n_settle, n_fit = int(t_settle / dt), int(t_fit / dt)
     ts = np.empty(n_fit); dp = np.empty(n_fit); dv = np.empty(n_fit)
@@ -171,12 +194,12 @@ def ekf_velocity_step_lag(v=0.3, fps=FPS, T=8.0):
     return {"t63_velocity_s": t63, "pos_lag_m_at_end": float(3.0 + v * T - x[2]), "vel_est_at_end": float(x[5])}
 
 
-def identify_ekf_frf(omegas=None):
+def identify_ekf_frf(omegas=None, legacy=False):
     if omegas is None:
         omegas = np.logspace(math.log10(0.03), math.log10(30.0), 28)
     Ep, Ev = [], []
     for w in omegas:
-        gp, gv = _run_ekf_sine(float(w))
+        gp, gv = _run_ekf_sine(float(w), legacy=legacy)
         Ep.append(gp); Ev.append(gv)
     return {"omega": [float(w) for w in omegas],
             "Ep_re": [g.real for g in Ep], "Ep_im": [g.imag for g in Ep],
@@ -185,6 +208,11 @@ def identify_ekf_frf(omegas=None):
 
 class EkfFrf:
     """실측 FRF 를 임의 ω 로 보간. 측정 범위 밖은 이상 추정기(E_p=1, E_v=jω) 쪽으로 붙인다."""
+
+    @staticmethod
+    def pair(frf_data):
+        """load_frf() 결과 → {'current': EkfFrf, 'legacy': EkfFrf}. 전달함수들이 Params.legacy_ekf 로 고른다."""
+        return {"current": EkfFrf(frf_data["current"]), "legacy": EkfFrf(frf_data["legacy"])}
 
     def __init__(self, frf):
         self.w = np.asarray(frf["omega"], dtype=float)
@@ -209,30 +237,53 @@ class EkfFrf:
 
 # ---------------------------------------------------------------- 전달함수
 def _pieces(p, w, frf):
+    f = (frf["legacy" if p.legacy_ekf else "current"] if isinstance(frf, dict) else frf)
     s = 1j * w
     P = (1.0 / (p.tau_s * s + 1)) * np.exp(-s * p.Td) * (1.0 / (p.tau_fc * s + 1))
-    Ep, Ev = frf(w)
+    Ep, Ev = f(w)
     A = p.scale * (p.kp * Ep + p.kd * Ev) / s
     B = p.scale * p.kff / (p.tau_ff * s + 1)
     C = Ev / s
-    Hm = np.exp(-s * p.Tm) / (p.tau_m * s + 1)
-    return P, A, B, C, Hm
+    Dm = np.exp(-s * p.Tm)                     # 자기 속도 수신 지연
+    Hm = Dm / (p.tau_m * s + 1)
+    return P, A, B, C, Hm, Dm, Ep, Ev
+
+
+def _self_terms(p, w, frf):
+    """자기 속도 v_F → 명령 u 의 전달 (부호는 음성 되먹임이 양). (전체, 피드포워드가 만드는 부분) 을 돌려준다.
+
+    ego_input=True (현재): 추정기가 자기 속도를 예측 입력으로 받으므로 p̂ = E_p·p_L − [E_p(1−D_m)+D_m]·p_F,
+    v̂_L = E_v·[p_L − (1−D_m)·p_F], v̂_rel = v̂_L − D_m·v_F. 자기 위치·속도 경로가 지연 없이 되먹임되고(1−D_m 만큼만
+    추정기를 거친다), 피드포워드 경로는 v_F 가 오르면 v̂_L 이 내려가는 **음성** 되먹임이 된다.
+    ego_input=False (PREV/BEFORE): v̂_L = H_m·v_F + E_v·(p_L − p_F) 라 H_m − E_v/s 만큼 양성 되먹임.
+    """
+    P, A, B, C, Hm, Dm, Ep, Ev = _pieces(p, w, frf)
+    s = 1j * w
+    kv_term = p.scale * p.kv * Dm                    # −KV·v_self (FC 수신 지연만, 음성 되먹임)
+    if p.ego_input:
+        Gp = Ep * (1 - Dm) + Dm
+        Gv = Ev * (1 - Dm) / s + Dm
+        Gff = Ev * (1 - Dm) / s
+        ff_self = B * Gff
+        return p.scale * (p.kp * Gp / s + p.kd * Gv) + ff_self + kv_term, ff_self
+    return A - B * (Hm - C) + kv_term, -B * (Hm - C)
 
 
 def open_loop(p, w, frf):
-    P, A, B, C, Hm = _pieces(p, w, frf)
-    return P * (A - B * (Hm - C))
+    P = _pieces(p, w, frf)[0]
+    return P * _self_terms(p, w, frf)[0]
 
 
 def self_feedback_path(p, w, frf):
-    """양성 되먹임 경로 P·B·(H_m − C) 단독 이득 (main.leader_velocity_ff 주석의 '루프 이득')."""
-    P, A, B, C, Hm = _pieces(p, w, frf)
-    return P * B * (Hm - C)
+    """피드포워드를 통한 자기 속도 경로의 단독 이득 |P·(FF 자기 항)|. PREV/BEFORE 에서는 양성 되먹임(main.leader_velocity_ff
+    주석의 '루프 이득'), 현재 설계에서는 음성 되먹임이라 크기만 의미가 있다."""
+    P = _pieces(p, w, frf)[0]
+    return P * _self_terms(p, w, frf)[1]
 
 
 def leader_to_follower(p, w, frf):
-    P, A, B, C, Hm = _pieces(p, w, frf)
-    return P * (A + B * C) / (1 + P * (A - B * (Hm - C)))
+    P, A, B, C, *_ = _pieces(p, w, frf)
+    return P * (A + B * C) / (1 + open_loop(p, w, frf))
 
 
 def sensitivity(p, w, frf):
@@ -310,7 +361,7 @@ def _legacy_leader_velocity_ff(prev_ff, leader_vel_fru, dt):
 class _Follower:
     def __init__(self, x0, p):
         self.x = float(x0); self.v = 0.0
-        self.ekf = ImmEkf(); self.ekf.init(np.array([0.0, 0.0, 3.0]))
+        self.ekf = _make_ekf(p.legacy_ekf); self.ekf.init(np.array([0.0, 0.0, 3.0]))
         self.ff = np.zeros(3); self.cmd = np.zeros(4)
         self.sent = 0.0                                  # FC 가 현재 들고 있는 setpoint
         self.delay = [0.0] * max(1, int(round(p.Td * FPS)))     # 검출·전송 지연 버퍼
@@ -323,8 +374,9 @@ def chain_sim(n_followers=4, v_leader=0.3, T=50.0, p=None, profile="step", omega
     """리더 + n 팔로워 체인. 각 팔로워는 앞 기체와의 거리만 카메라 z 축 측정으로 받는다(잡음 없음).
     profile: 'step' = 2s 뒤 1s 램프로 v_leader, 30s 에 정지 / 'sine' = v_leader + amp·sin ωt (amp 기본 = v_leader)."""
     p = p or Params()
-    saved = (main.KFF_LEADER_VEL, main.FF_TAU_SEC, main.FF_DEADBAND_MPS)
+    saved = (main.KFF_LEADER_VEL, main.FF_TAU_SEC, main.FF_DEADBAND_MPS, main.KP_FORWARD, main.KD_FORWARD, main.KV_SELF)
     main.KFF_LEADER_VEL, main.FF_TAU_SEC = p.kff, p.tau_ff
+    main.KP_FORWARD, main.KD_FORWARD, main.KV_SELF = p.kp, p.kd, p.kv
     if p.deadband is not None:
         main.FF_DEADBAND_MPS = p.deadband
     dt = 1.0 / FPS
@@ -349,16 +401,25 @@ def chain_sim(n_followers=4, v_leader=0.3, T=50.0, p=None, profile="step", omega
             x_front, v_front = xl, vl
             for i, f in enumerate(fols):
                 d = x_front - f.x
+                f.vmeas.append(f.v); v_self = f.vmeas.pop(0)              # FC 자기 속도 (Tm 지연)
+                if p.ego_input:
+                    f.ekf.set_ego_velocity_cam([0.0, 0.0, v_self])       # 예측 입력 (카메라 z = 전방)
                 f.ekf.predict(dt)
                 f.ekf.update_position3d(np.array([0.0, 0.0, d]))
                 xe, _ = f.ekf.get_state()
-                rel = main.camera_xyz_to_fru(xe[:3]); relv = main.camera_xyz_to_fru(xe[3:6])
-                f.vmeas.append(f.v); v_self = f.vmeas.pop(0)
-                if p.tau_m > 0:
-                    f.v_self_f += (v_self - f.v_self_f) * (1.0 - math.exp(-dt / p.tau_m)); v_self = f.v_self_f
+                rel = main.camera_xyz_to_fru(xe[:3])
+                if p.ego_input:
+                    relv = main.camera_xyz_to_fru(f.ekf.relative_velocity())
+                    v_lead_est = main.camera_xyz_to_fru(f.ekf.leader_velocity())[0]
+                else:
+                    relv = main.camera_xyz_to_fru(xe[3:6])
+                    if p.tau_m > 0:
+                        f.v_self_f += (v_self - f.v_self_f) * (1.0 - math.exp(-dt / p.tau_m)); v_self = f.v_self_f
+                    v_lead_est = v_self + relv[0]
                 ff_fn = _legacy_leader_velocity_ff if p.legacy_ff else main.leader_velocity_ff
-                f.ff = ff_fn(f.ff, [v_self + relv[0], 0.0, 0.0], dt)
-                u = main.compute_velocity_cmd_from_estimate(rel, relv, 1.0, None, f.ff)
+                f.ff = ff_fn(f.ff, [v_lead_est, 0.0, 0.0], dt)
+                u = main.compute_velocity_cmd_from_estimate(rel, relv, 1.0, None, f.ff,
+                                                            v_self_fru=[v_self, 0.0, 0.0] if p.ego_input else None)
                 f.cmd = main.smooth_velocity_cmd(f.cmd, u, alpha=SMOOTH_ALPHA, dt=dt)
                 if k % send_every == 0:
                     f.delay.append(float(f.cmd[0]))
@@ -369,7 +430,8 @@ def chain_sim(n_followers=4, v_leader=0.3, T=50.0, p=None, profile="step", omega
                 x_front, v_front = f.x, f.v
             hist["t"].append(t); hist["leader_v"].append(vl)
     finally:
-        main.KFF_LEADER_VEL, main.FF_TAU_SEC, main.FF_DEADBAND_MPS = saved
+        (main.KFF_LEADER_VEL, main.FF_TAU_SEC, main.FF_DEADBAND_MPS,
+         main.KP_FORWARD, main.KD_FORWARD, main.KV_SELF) = saved
     for key in ("t", "leader_v"):
         hist[key] = np.asarray(hist[key])
     hist["err"] = [np.asarray(e) for e in hist["err"]]; hist["v"] = [np.asarray(v) for v in hist["v"]]
@@ -402,16 +464,17 @@ W = np.logspace(-2, math.log10(30.0), 3000)
 
 
 def load_frf(identify=False):
+    """{'current': 현재 추정기 FRF, 'legacy': 예전 추정기 FRF}. JSON 에 있으면 재사용, 없으면 실측(각 ~40s)."""
+    data = {}
     if not identify and os.path.exists(JSON_PATH):
         with open(JSON_PATH) as f:
             data = json.load(f)
-        if "ekf_frf" in data:
-            return data["ekf_frf"]
-    return identify_ekf_frf()
+    return {"current": data.get("ekf_frf") or identify_ekf_frf(),
+            "legacy": data.get("ekf_frf_legacy") or identify_ekf_frf(legacy=True)}
 
 
 def compute_all(frf_data, chain=True):
-    frf = EkfFrf(frf_data)
+    frf = EkfFrf.pair(frf_data)
     base = Params()
     res = {"params": {k: getattr(base, k) for k in vars(base)},
            "gains": {"forward": (main.KP_FORWARD, main.KD_FORWARD), "right": (main.KP_RIGHT, main.KD_RIGHT),
@@ -419,47 +482,64 @@ def compute_all(frf_data, chain=True):
                      "limits": (main.MAX_VX, main.MAX_VY, main.MAX_VZ, main.MAX_YAW_RATE)},
            "ekf_step": ekf_velocity_step_lag(), "axes": {}, "kff_sweep": {}, "robustness": [], "yaw": {}}
     # 축별 (KFF = 설계값)
-    for name, (kp, kd) in (("forward", (main.KP_FORWARD, main.KD_FORWARD)), ("right", (main.KP_RIGHT, main.KD_RIGHT)),
-                           ("up", (main.KP_UP, main.KD_UP))):
+    for name, (kp, kd) in current_axes().items():
         p = base.copy(kp=kp, kd=kd)
         r = margins(open_loop(p, W, frf), W)
         r.update(string_stability(p, W, frf))
         r["self_fb_peak"] = float(np.max(np.abs(self_feedback_path(p, W, frf))))
         res["axes"][name] = r
-    # 수정 전 설계 (축별)
-    res["before"] = {}
-    for name, (kp, kd) in (("forward", (main.KP_FORWARD, main.KD_FORWARD)), ("right", (main.KP_RIGHT, main.KD_RIGHT)),
-                           ("up", (main.KP_UP, main.KD_UP))):
-        p = base.copy(kp=kp, kd=kd, **BEFORE)
-        r = margins(open_loop(p, W, frf), W); r.update(string_stability(p, W, frf))
-        r["self_fb_peak"] = float(np.max(np.abs(self_feedback_path(p, W, frf))))
-        res["before"][name] = r
-    # 전후축 KFF 스윕 (P+D 만 / 현재 / 수정 전 / KFF=1 / KFF=1 & 저역통과·정합 없음)
-    for label, kw in (("kff0", dict(kff=0.0)), ("kff0.8", dict()), ("before", dict(**BEFORE)), ("kff1.0", dict(kff=1.0)),
-                      ("kff1.0_nolpf", dict(kff=1.0, tau_ff=1e-3, tau_m=0.0))):
+    # 수정 전(BEFORE) / 직전(PREV) 설계 (축별)
+    for key, design in (("before", BEFORE), ("prev", PREV)):
+        res[key] = {}
+        for name, (kp, kd) in legacy_axes().items():
+            p = base.copy(kp=kp, kd=kd, **design)
+            r = margins(open_loop(p, W, frf), W); r.update(string_stability(p, W, frf))
+            r["self_fb_peak"] = float(np.max(np.abs(self_feedback_path(p, W, frf))))
+            res[key][name] = r
+    # 전후축 KFF 스윕 (P+D 만 / 현재 / 직전 / 수정 전 / KFF=1 / KFF=1 & 저역통과 없음)
+    for label, kw in (("kff0", dict(kff=0.0, kv=0.0)), ("kff0.8", dict()), ("prev", dict(kp=LEGACY_FWD[0], kd=LEGACY_FWD[1], **PREV)),
+                      ("before", dict(kp=LEGACY_FWD[0], kd=LEGACY_FWD[1], **BEFORE)),
+                      ("kff1.0", dict(kff=1.0)), ("kff1.0_nolpf", dict(kff=1.0, tau_ff=1e-3)), ("kv0", dict(kv=0.0)),
+                      ("kv0_tau2.0", dict(kv=0.0, tau_ff=2.0))):
         p = base.copy(**kw)
         r = margins(open_loop(p, W, frf), W)
         r.update(string_stability(p, W, frf))
         r["self_fb_peak"] = float(np.max(np.abs(self_feedback_path(p, W, frf))))
         r["ss_err_per_mps"] = (1.0 - p.kff) / p.kp
         res["kff_sweep"][label] = r
-    # [제안] 개선안 스윕: FF 저역통과 τ_ff × 자기 속도 정합 저역통과 τ_m (KFF 설계값)
+    # [2026-09-18 의 결정 기록] 상대속도 추정기에서 FF 저역통과 τ_ff × 자기 속도 정합 저역통과 τ_m (KFF 설계값)
     res["proposed"] = {}
     for tau_ff in (0.7, 1.0, 1.5, 2.0, 3.0):
         for tau_m in (0.0, 0.3, 0.5):
-            p = base.copy(tau_ff=tau_ff, tau_m=tau_m)
+            p = base.copy(tau_ff=tau_ff, tau_m=tau_m, ego_input=False, legacy_ekf=True, kv=0.0, kp=LEGACY_FWD[0], kd=LEGACY_FWD[1])
             r = margins(open_loop(p, W, frf), W); r.update(string_stability(p, W, frf))
             r["self_fb_peak"] = float(np.max(np.abs(self_feedback_path(p, W, frf))))
             res["proposed"][f"tau_ff{tau_ff}_tau_m{tau_m}"] = r
-    # 권고안 후보 (τ_ff 2.0, τ_m 0.3) 에서 KFF × Kd
+    # 현재 추정기(절대 속도)에서 KFF × Kd (τ_ff 코드값) — FCR-10 의 |Γ| 피크와 정상상태 오차의 교환표
     res["recommended_grid"] = {}
-    for kff in (0.6, 0.7, 0.8):
+    for kff in (0.6, 0.7, 0.8, 0.9, 1.0):
         for kd in (0.05, 0.10, 0.15):
-            p = base.copy(tau_ff=2.0, tau_m=0.3, kff=kff, kd=kd)
+            p = base.copy(kff=kff, kd=kd)
             r = margins(open_loop(p, W, frf), W); r.update(string_stability(p, W, frf))
             r["ss_err_per_mps"] = (1.0 - kff) / p.kp
             res["recommended_grid"][f"kff{kff}_kd{kd}"] = r
-    res["recommended_params"] = {"tau_ff": base.tau_ff, "tau_m": base.tau_m, "kff": base.kff, "kd": base.kd}
+    # 현재 추정기에서 τ_ff × KV 스윕 (KFF 코드값, Kp 코드값) — FF 저역통과와 시간간격 정책의 스트링 피크
+    res["ego_tau_ff"] = {}
+    for tau_ff in (0.1, 0.2, 0.3, 0.5, 1.0, 2.0):
+        for kv in (0.0, 0.1, 0.2, 0.3):
+            p = base.copy(tau_ff=tau_ff, kv=kv)
+            r = margins(open_loop(p, W, frf), W); r.update(string_stability(p, W, frf))
+            r["self_fb_peak"] = float(np.max(np.abs(self_feedback_path(p, W, frf))))
+            r["ss_err_per_mps"] = (1.0 - p.kff + kv) / p.kp
+            res["ego_tau_ff"][f"tau_ff{tau_ff}_kv{kv}"] = r
+    # Kp 스윕 (KV·τ_ff 코드값): 시간간격 정책이 늘린 이격을 Kp 로 되사는 여유
+    res["kp_sweep"] = {}
+    for kp in (0.22, 0.26, 0.30, 0.35):
+        p = base.copy(kp=kp)
+        r = margins(open_loop(p, W, frf), W); r.update(string_stability(p, W, frf))
+        r["ss_err_per_mps"] = (1.0 - p.kff + p.kv) / kp
+        res["kp_sweep"][f"kp{kp}"] = r
+    res["recommended_params"] = {"tau_ff": base.tau_ff, "kff": base.kff, "kp": base.kp, "kd": base.kd, "kv": base.kv, "ego_input": True}
     # 데드밴드: 수정 전 램프 target = v·(|v|−DB)/DB (DB<|v|<2DB) 의 국소 기울기 최대 3, 현재 소프트 데드존은 1
     res["deadband_slope"] = {"before_ramp_max": 3.0, "current_soft": 1.0}
     # 불확실성 감속
@@ -482,31 +562,32 @@ def compute_all(frf_data, chain=True):
     res["sampling"] = {"setpoint_hz": SETPOINT_HZ, "nyquist_rad_s": math.pi * SETPOINT_HZ,
                        "w_gc_over_nyquist": res["axes"]["forward"]["w_gc"] / (math.pi * SETPOINT_HZ)}
     if chain:
-        pb = base.copy(**BEFORE)
+        pb = base.copy(kp=LEGACY_FWD[0], kd=LEGACY_FWD[1], **BEFORE)
+        pp = base.copy(kp=LEGACY_FWD[0], kd=LEGACY_FWD[1], **PREV)
         w_sine = res["before"]["forward"]["w_peak"]          # 수정 전 설계의 |Γ| 피크 주파수 (≈1.15) 에서 비교
         h = chain_sim(p=base)
         res["chain_step"] = chain_summary(h, t_from=0.0)
-        h0 = chain_sim(p=base.copy(kff=0.0))
+        h0 = chain_sim(p=base.copy(kff=0.0, kv=0.0))
         res["chain_step_kff0"] = chain_summary(h0, t_from=0.0)
         hb = chain_sim(p=pb)
         res["chain_step_before"] = chain_summary(hb, t_from=0.0)
         hs = chain_sim(p=base, profile="sine", omega=w_sine, v_leader=0.15, T=80.0)
         res["chain_sine"] = dict(omega=w_sine, **chain_sine_amplitudes(hs, w_sine, t_from=30.0))
-        hs0 = chain_sim(p=base.copy(kff=0.0), profile="sine", omega=w_sine, v_leader=0.15, T=80.0)
+        hs0 = chain_sim(p=base.copy(kff=0.0, kv=0.0), profile="sine", omega=w_sine, v_leader=0.15, T=80.0)
         res["chain_sine_kff0"] = dict(omega=w_sine, **chain_sine_amplitudes(hs0, w_sine, t_from=30.0))
         hsb = chain_sim(p=pb, profile="sine", omega=w_sine, v_leader=0.15, T=80.0)
         res["chain_sine_before"] = dict(omega=w_sine, **chain_sine_amplitudes(hsb, w_sine, t_from=30.0))
         gr = res["axes"]["forward"]
         hsr = chain_sim(p=base, profile="sine", omega=gr["w_peak"], v_leader=0.15, T=120.0)
         res["chain_sine_at_own_peak"] = dict(omega=gr["w_peak"], **chain_sine_amplitudes(hsr, gr["w_peak"], t_from=40.0))
-        # SITL leader_sine 시나리오와 같은 조건 (리더 0.25 ± 0.05, 1.15 rad/s), 1단
+        # SITL leader_sine 시나리오와 같은 조건 (리더 0.25 ± 0.05, 1.15 rad/s), 1단. SITL 실측 0.72 는 PREV 설계.
         res["sitl_like"] = {}
-        for label, pv in (("current", base), ("before", pb)):
+        for label, pv in (("current", base), ("prev", pp), ("before", pb)):
             hv = chain_sim(n_followers=1, p=pv, profile="sine", omega=1.15, v_leader=0.25, amp=0.05, T=80.0)
             res["sitl_like"][label] = chain_sine_amplitudes(hv, 1.15, t_from=30.0)["stage_ratios"][0]
         # 선형 모델 검증: 데드밴드·포화 밖의 작은 진폭 (리더 0.30 ± 0.02 m/s), 2단
         res["validation"] = []
-        for label, pv in (("current", base), ("kff0", base.copy(kff=0.0)), ("before", pb)):
+        for label, pv in (("current", base), ("kff0", base.copy(kff=0.0, kv=0.0)), ("prev", pp), ("before", pb)):
             for wv in (1.15, 0.35):
                 hv = chain_sim(n_followers=2, p=pv, profile="sine", omega=wv, v_leader=0.30, amp=0.02, T=80.0)
                 av = chain_sine_amplitudes(hv, wv, t_from=30.0)
@@ -551,10 +632,17 @@ def print_tables(res):
             r = res["proposed"][f"tau_ff{tff}_tau_m{tm}"]
             row.append(f"{_fmt(r['gm_db'])}dB / {_fmt(r['Ms'],2)} / {_fmt(r['peak'],2)}({_fmt(r['w_peak'],2)}) / {_fmt(r['self_fb_peak'],2)}")
         print(f"| {tff}s | " + " | ".join(row) + " |")
-    print("\n[KFF × Kd 교환표 (τ_ff 2.0, τ_m 0.3): PM / GM / Ms / |Γ|피크 / 정상상태 오차]")
+    print("\n[현재 추정기 τ_ff × KV (KFF·Kp 코드값): |Γ|피크(ω) / GM / 정상상태 오차]")
+    kvs = (0.0, 0.1, 0.2, 0.3)
+    print("| τ_ff \\ KV | " + " | ".join(str(k) for k in kvs) + " |"); print("|---|" + "---|" * len(kvs))
+    for tau_ff in (0.1, 0.2, 0.3, 0.5, 1.0, 2.0):
+        row = [res["ego_tau_ff"][f"tau_ff{tau_ff}_kv{kv}"] for kv in kvs]
+        print(f"| {tau_ff}s | " + " | ".join(f"{_fmt(r['peak'],3)}({_fmt(r['w_peak'],2)}) / {_fmt(r['gm_db'])}dB / {_fmt(r['ss_err_per_mps'],2)}" for r in row) + " |")
+    print("[Kp 스윕 (KV·τ_ff 코드값)] " + "; ".join(f"Kp {k[2:]}: |Γ| {_fmt(r['peak'],3)} GM {_fmt(r['gm_db'])}dB PM {_fmt(r['pm_deg'],0)}° e_ss {_fmt(r['ss_err_per_mps'],2)}" for k, r in res["kp_sweep"].items()))
+    print("\n[현재 추정기 KFF × Kd 교환표 (τ_ff 코드값): PM / GM / Ms / |Γ|피크 / 정상상태 오차]")
     print("| KFF \\ Kd | 0.05 | 0.10 | 0.15 |")
     print("|---|---|---|---|")
-    for kff in (0.6, 0.7, 0.8):
+    for kff in (0.6, 0.7, 0.8, 0.9, 1.0):
         row = []
         for kd in (0.05, 0.10, 0.15):
             r = res["recommended_grid"][f"kff{kff}_kd{kd}"]
@@ -590,7 +678,7 @@ def print_tables(res):
               " | 수정 전: " + ", ".join(f"{v:.3f}" for v in sm["stage_ratios"]))
         sr = res["chain_sine_at_own_peak"]
         print(f"[현재 설계 자체 피크 ω={sr['omega']:.2f}] 단별 진폭비: " + ", ".join(f"{v:.3f}" for v in sr["stage_ratios"]))
-        print(f"[SITL leader_sine 조건 (0.25±0.05, 1.15)] 1단 진폭비 현재 {res['sitl_like']['current']:.3f} / 수정 전 {res['sitl_like']['before']:.3f}")
+        print(f"[SITL leader_sine 조건 (0.25±0.05, 1.15)] 1단 진폭비 현재 {res['sitl_like']['current']:.3f} / 직전(SITL 실측 0.72) {res['sitl_like']['prev']:.3f} / 수정 전 {res['sitl_like']['before']:.3f}")
         print("[선형 모델 검증: 리더 0.30±0.02 m/s] " + "; ".join(
             f"{v['case']}@{v['omega']}: 선형 {v['linear']:.3f} / 비선형 {v['nonlinear_stage1']:.3f}" for v in res["validation"]))
         d = res["deadband_lowspeed_ratios"]
@@ -602,13 +690,14 @@ def make_plots(res, frf_data):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    frf = EkfFrf(frf_data); base = Params()
+    frf = EkfFrf.pair(frf_data); base = Params()
     os.makedirs(IMG_DIR, exist_ok=True)
     # 1) 전후축 보드 (KFF 0 / 0.8 / 1.0)
     fig, ax = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
-    for label, kw, c in (("P+D only (KFF=0)", dict(kff=0.0), "gray"), ("before 2026-09-18 (FF LPF 0.7s, no self-vel LPF)", dict(**BEFORE), "tab:red"),
-                         ("KFF=1.0, no LPF", dict(kff=1.0, tau_ff=1e-3, tau_m=0.0), "tab:purple"),
-                         ("current (FF LPF 2.0s + self-vel LPF 0.3s)", {}, "tab:green")):
+    for label, kw, c in (("P+D only (KFF=0)", dict(kff=0.0, kv=0.0), "gray"),
+                         ("before 2026-09-18 (FF LPF 0.7s, relative-velocity EKF)", dict(kp=LEGACY_FWD[0], kd=LEGACY_FWD[1], **BEFORE), "tab:red"),
+                         ("2026-09-18 fix (FF LPF 2.0s + self-vel LPF 0.3s)", dict(kp=LEGACY_FWD[0], kd=LEGACY_FWD[1], **PREV), "tab:orange"),
+                         ("current (ego-input EKF, FF LPF 0.1s, time-gap KV 0.2, Kp 0.30)", {}, "tab:green")):
         L = open_loop(base.copy(**kw), W, frf)
         ax[0].semilogx(W, 20 * np.log10(np.abs(L)), color=c, label=label)
         ax[1].semilogx(W, np.degrees(np.unwrap(np.angle(L))), color=c)
@@ -665,8 +754,9 @@ def make_plots(res, frf_data):
     fig.tight_layout(); fig.savefig(os.path.join(IMG_DIR, "stability_robustness.png"), dpi=130); plt.close(fig)
     # 5) EKF FRF
     fig, ax = plt.subplots(1, 2, figsize=(9, 3.8))
-    w = np.asarray(frf_data["omega"]); Ep = np.asarray(frf_data["Ep_re"]) + 1j * np.asarray(frf_data["Ep_im"])
-    Ev = np.asarray(frf_data["Ev_re"]) + 1j * np.asarray(frf_data["Ev_im"])
+    fd = frf_data["current"]
+    w = np.asarray(fd["omega"]); Ep = np.asarray(fd["Ep_re"]) + 1j * np.asarray(fd["Ep_im"])
+    Ev = np.asarray(fd["Ev_re"]) + 1j * np.asarray(fd["Ev_im"])
     ax[0].semilogx(w, 20 * np.log10(np.abs(Ep)), "o-", label="|d̂/d|"); ax[0].semilogx(w, 20 * np.log10(np.abs(Ev / (1j * w))), "s-", label="|v̂/(jω d)|")
     ax[0].set_ylabel("[dB]"); ax[0].set_title("IMM-EKF measured FRF (magnitude)"); ax[0].legend(fontsize=8); ax[0].grid(True, which="both", alpha=0.3)
     ax[1].semilogx(w, np.degrees(np.unwrap(np.angle(Ep))), "o-", label="∠ d̂/d"); ax[1].semilogx(w, np.degrees(np.unwrap(np.angle(Ev / (1j * w)))), "s-", label="∠ v̂/(jω d)")
@@ -693,7 +783,7 @@ if __name__ == "__main__":
     if args.plots:
         make_plots(res, frf_data)
         print(f"[plots] {IMG_DIR}/stability_*.png")
-    payload = _jsonable(res); payload["ekf_frf"] = frf_data
+    payload = _jsonable(res); payload["ekf_frf"] = frf_data["current"]; payload["ekf_frf_legacy"] = frf_data["legacy"]
     os.makedirs(os.path.dirname(JSON_PATH), exist_ok=True)
     with open(JSON_PATH, "w") as f:
         json.dump(payload, f, indent=1, ensure_ascii=False)

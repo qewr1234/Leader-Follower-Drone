@@ -964,43 +964,47 @@ _f_half = main.leader_velocity_ff([0, 0, 0], [1.5 * _db, 0, 0], 100.0)
 _f_3db = main.leader_velocity_ff([0, 0, 0], [3.0 * _db, 0, 0], 100.0)
 _f_tau = main.leader_velocity_ff([0, 0, 0], [0.3, 0, 0], main.FF_TAU_SEC)
 _f_none = main.leader_velocity_ff([0.3, 0, 0], None, 100.0)
-check("FF: 소프트 데드존(0.5·db→0, 1.5·db→0.5·db, 3·db→2·db: 기울기 1), 시정수 τ 에서 63% (τ=2.0s), None 이면 0 으로 감쇠",
+check("FF: 소프트 데드존(0.5·db→0, 1.5·db→0.5·db, 3·db→2·db: 기울기 1), 시정수 τ 에서 63% (τ=0.1s — 긴 저역통과는 스트링 안정을 깬다), None 이면 0 으로 감쇠",
       _f_small[0] == 0.0 and abs(_f_half[0] - 0.5 * _db) < 1e-9 and abs(_f_3db[0] - 2.0 * _db) < 1e-9
-      and abs(_f_tau[0] - (0.3 - _db) * (1 - _math.exp(-1))) < 1e-9 and abs(main.FF_TAU_SEC - 2.0) < 1e-9
+      and abs(_f_tau[0] - (0.3 - _db) * (1 - _math.exp(-1))) < 1e-9 and abs(main.FF_TAU_SEC - 0.1) < 1e-9
       and abs(_f_none[0]) < 1e-9, f"{_f_small[0]:.3f} {_f_half[0]:.3f} {_f_3db[0]:.3f} {_f_tau[0]:.3f} {_f_none[0]:.3f}")
-_sl0 = main.self_velocity_lpf(None, [0.3, 0, 0], 0.1)
-_sl1 = main.self_velocity_lpf([0, 0, 0], [0.3, 0, 0], main.FF_SELF_TAU_SEC)
-check("FF: 자기 속도 정합 저역통과 — 첫 샘플은 그대로, 시정수(0.3s = EKF 속도 지연 실측)에서 63%",
-      np3.allclose(_sl0, [0.3, 0, 0]) and abs(_sl1[0] - 0.3 * (1 - _math.exp(-1))) < 1e-9 and abs(main.FF_SELF_TAU_SEC - 0.3) < 1e-9,
-      f"{_sl0[0]:.3f} {_sl1[0]:.3f}")
+check("FF: 자기 속도 정합 저역통과(self_velocity_lpf) 는 제거됨 — 리더 절대 속도를 EKF 가 직접 추정하므로 자기 속도 경로가 없다",
+      not hasattr(main, "self_velocity_lpf") and not hasattr(main, "FF_SELF_TAU_SEC")
+      and "leader_vel_ff_self_tau_sec" not in open("config.py", encoding="utf-8").read())
 
 
-def _sim_1d(kff, v_l=0.3, tau_fc=0.3, delta_ekf=1.0, T=40.0):
-    """1축 폐루프: FC 속도루프 1차 지연 τ, EKF 상대속도 1차 지연 δ(최악 1s), 리더 v_l 등속. (정상상태 오차, 최대 |오차|) 반환."""
-    saved = main.KFF_LEADER_VEL; main.KFF_LEADER_VEL = kff
-    dt = 1 / 30; front, v_f, v_rel_est = 3.0, 0.0, 0.0; ff = np3.zeros(3); cmd = np3.zeros(4); e_max = 0.0; v_self = None
+def _sim_1d(kff, v_l=0.3, tau_fc=0.3, delta_ekf=1.0, T=40.0, kv=None):
+    """1축 폐루프: FC 속도루프 1차 지연 τ, EKF 리더 절대속도 추정 1차 지연 δ(최악 1s), 리더 v_l 등속. (정상상태 오차, 최대 |오차|) 반환.
+    추정기가 자기 속도를 예측 입력으로 받으므로 리더 절대 속도 추정은 리더 운동만 늦게 따라가고, 상대 속도 = 추정 − 자기 속도."""
+    saved = (main.KFF_LEADER_VEL, main.KV_SELF); main.KFF_LEADER_VEL = kff
+    if kv is not None:
+        main.KV_SELF = kv
+    dt = 1 / 30; front, v_f, v_L_est = 3.0, 0.0, 0.0; ff = np3.zeros(3); cmd = np3.zeros(4); e_max = 0.0
     try:
         for _ in range(int(T / dt)):
             v_rel = v_l - v_f
-            v_rel_est += (v_rel - v_rel_est) * (dt / delta_ekf)
-            v_self = main.self_velocity_lpf(v_self, [v_f, 0.0, 0.0], dt)
-            ff = main.leader_velocity_ff(ff, [v_self[0] + v_rel_est, 0.0, 0.0], dt)
-            u = main.compute_velocity_cmd_from_estimate([front, 0, 0], [v_rel_est, 0, 0], 1.0, None, ff)
+            v_L_est += (v_l - v_L_est) * (dt / delta_ekf)
+            ff = main.leader_velocity_ff(ff, [v_L_est, 0.0, 0.0], dt)
+            u = main.compute_velocity_cmd_from_estimate([front, 0, 0], [v_L_est - v_f, 0, 0], 1.0, None, ff, v_self_fru=[v_f, 0.0, 0.0])
             cmd = main.smooth_velocity_cmd(cmd, u, alpha=0.28, dt=dt)
             v_f += (cmd[0] - v_f) * (dt / tau_fc)
             front += v_rel * dt
             e_max = max(e_max, abs(front - 3.0))
     finally:
-        main.KFF_LEADER_VEL = saved
+        main.KFF_LEADER_VEL, main.KV_SELF = saved
     return front - 3.0, e_max
 
 
 _e_ff, _emax_ff = _sim_1d(_kff)
-_e_p, _ = _sim_1d(0.0)
-_e_theory_ff, _e_theory_p = (0.3 - _kff * (0.3 - _db)) / main.KP_FORWARD, 0.3 / main.KP_FORWARD
-check("FF: 1축 폐루프(FC τ=0.3s, EKF 지연 1s) 정상상태 오차 = (v − KFF·(v−DB))/Kp (소프트 데드존), P 만이면 v/Kp — 발산·진동 없음",
+_e_p, _ = _sim_1d(0.0, kv=0.0)
+_e_theory_ff = (0.3 - _kff * (0.3 - _db) + main.KV_SELF * 0.3) / main.KP_FORWARD
+_e_theory_p = 0.3 / main.KP_FORWARD
+check("FF: 1축 폐루프(FC τ=0.3s, EKF 지연 1s) 정상상태 오차 = (v − KFF·(v−DB) + KV·v)/Kp (소프트 데드존 + 시간간격), P 만이면 v/Kp — 발산·진동 없음",
       abs(_e_ff - _e_theory_ff) < 0.05 and abs(_e_p - _e_theory_p) < 0.05 and _emax_ff < 1.0,
       f"ff={_e_ff:.2f}m(이론 {_e_theory_ff:.2f}) p={_e_p:.2f}m(이론 {_e_theory_p:.2f}) max|e|={_emax_ff:.2f}")
+check("FF (시간간격 정책): 0.3 m/s 추종의 정상상태 이격 증가는 KV·v/Kp = 0.20 m — Kp 0.30 이 0.22 였다면 0.27 m",
+      abs(main.KV_SELF - 0.2) < 1e-9 and abs(main.KP_FORWARD - 0.30) < 1e-9 and abs(_e_theory_ff - 0.533) < 0.01,
+      f"e_ss={_e_theory_ff:.3f}m")
 
 # ------------------------------------------------- 미션: 리더 절대 속도(자기 속도 + 상대 속도) 기준
 _mv = dict(rel_est=[3.0, 0.0, 0.0], leader_alt=50.0, pos_cov_trace=1.0)
@@ -1033,7 +1037,7 @@ check("rx: 2초에 HB 2개 → HB=1, 나머지 0, 호출 뒤 카운터 리셋",
 
 # ------------------------------------------------- 분석: 바깥 루프 안정성 여유 (docs/STABILITY_MARGINS.md)
 from analysis import stability_margins as _sm  # noqa: E402
-_frf = _sm.EkfFrf(_sm.load_frf())               # docs/stability_margins.json 의 IMM-EKF 실측 주파수응답 (없으면 재실측 ~40s)
+_frf = _sm.EkfFrf.pair(_sm.load_frf())          # docs/stability_margins.json 의 IMM-EKF 실측 주파수응답 {현재, 예전 추정기} (없으면 재실측 ~40s 씩)
 _lag = _sm.ekf_velocity_step_lag()
 check("분석: IMM-EKF 속도 추정 63% 응답 ≤ 0.5s, 램프에 위치 지연 없음",
       _lag["t63_velocity_s"] is not None and _lag["t63_velocity_s"] <= 0.5 and abs(_lag["pos_lag_m_at_end"]) < 0.01,
@@ -1048,20 +1052,30 @@ def _margins_of(**kw):
     return r
 
 
-_r0 = _margins_of(kff=0.0)
-check("분석: P+D 기준선(KFF=0) 전후축 PM ≥ 45°, GM ≥ 6dB, Ms ≤ 1.5, |Γ| ≤ 1 (스트링 안정)",
+_r0 = _margins_of(kff=0.0, kv=0.0)
+check("분석: P+D 기준선(KFF=0, KV=0) 전후축 PM ≥ 45°, GM ≥ 6dB, Ms ≤ 1.5, |Γ| ≤ 1 (스트링 안정)",
       _r0["pm_deg"] >= 45 and _r0["gm_db"] >= 6 and _r0["Ms"] <= 1.5 and _r0["peak"] <= 1.0 + 1e-3,
       f"PM={_r0['pm_deg']:.1f} GM={_r0['gm_db']:.1f} Ms={_r0['Ms']:.2f} Γ={_r0['peak']:.3f}")
-_rb = _margins_of(tau_ff=0.7, tau_m=0.0)
-check("분석 골든: 수정 전 설계(FF τ 0.7s, 자기 속도 정합 없음) 전후축 GM 4.9dB·Ms 2.3·|Γ| 피크 1.80 @1.15rad/s — 결함의 기록 (회귀 방지용 대조)",
+_LEG = dict(kp=_sm.LEGACY_FWD[0], kd=_sm.LEGACY_FWD[1])
+_rb = _margins_of(**_LEG, **_sm.BEFORE)
+check("분석 골든: 수정 전 설계(FF τ 0.7s, 자기 속도 정합 없음, 상대속도 추정기) 전후축 GM 4.9dB·Ms 2.3·|Γ| 피크 1.80 @1.15rad/s — 결함의 기록 (SITL 실측 1.95 와 대조된 골든)",
       abs(_rb["gm_db"] - 4.9) < 0.3 and abs(_rb["Ms"] - 2.31) < 0.1 and abs(_rb["peak"] - 1.80) < 0.05 and abs(_rb["w_peak"] - 1.15) < 0.1,
       f"GM={_rb['gm_db']:.2f} Ms={_rb['Ms']:.2f} Γ={_rb['peak']:.3f}@{_rb['w_peak']:.2f}")
-_rr = _margins_of()                      # 코드 값 (τ_ff 2.0, τ_m 0.3)
-check("분석: 현재 설계(코드 값: FF τ 2.0s + 자기 속도 정합 LPF 0.3s) 전 축 PM ≥ 45°, GM ≥ 12dB, Ms ≤ 1.35, |Γ| 피크 ≤ 1.15, 양성 되먹임 경로 피크 ≤ 0.15",
-      all(_margins_of(kp=kp, kd=kd)["gm_db"] >= 12 and _margins_of(kp=kp, kd=kd)["pm_deg"] >= 45
+_rp = _margins_of(**_LEG, **_sm.PREV)
+check("분석 골든: 직전 설계(2026-09-18: FF τ 2.0s + 자기 속도 정합 0.3s, 상대속도 추정기) GM 14.4dB·|Γ| 1.13 — SITL leader_sine 0.72 로 검증된 설계의 기록",
+      abs(_rp["gm_db"] - 14.4) < 0.3 and abs(_rp["peak"] - 1.126) < 0.02 and abs(_rp["self_fb_peak"] - 0.13) < 0.02,
+      f"GM={_rp['gm_db']:.2f} Γ={_rp['peak']:.3f} fb={_rp['self_fb_peak']:.2f}")
+_rr = _margins_of()                      # 코드 값 (절대속도 추정기, τ_ff 0.1, KV 0.2, Kp 0.30)
+check("분석 (FCR-10): 현재 설계(절대속도 추정기 + FF τ 0.1s + 시간간격 KV 0.2 + Kp 0.30) 전 축 PM ≥ 45°, GM ≥ 15dB, Ms ≤ 1.25, "
+      "|Γ| 피크 ≤ 1.0 (스트링 안정), FF 자기 경로 ≤ 0.15",
+      all(_margins_of(kp=kp, kd=kd)["gm_db"] >= 15 and _margins_of(kp=kp, kd=kd)["pm_deg"] >= 45 and _margins_of(kp=kp, kd=kd)["peak"] <= 1.0 + 1e-3
           for kp, kd in ((main.KP_RIGHT, main.KD_RIGHT), (main.KP_UP, main.KD_UP)))
-      and _rr["gm_db"] >= 12 and _rr["Ms"] <= 1.35 and _rr["peak"] <= 1.15 and _rr["self_fb_peak"] <= 0.15 and abs(_rr["dc_gain"] - 1.0) < 0.01,
-      f"GM={_rr['gm_db']:.1f} Ms={_rr['Ms']:.2f} Γ={_rr['peak']:.3f} fb={_rr['self_fb_peak']:.2f}")
+      and _rr["gm_db"] >= 15 and _rr["Ms"] <= 1.25 and _rr["peak"] <= 1.0 + 1e-3 and _rr["self_fb_peak"] <= 0.15 and abs(_rr["dc_gain"] - 1.0) < 0.01,
+      f"GM={_rr['gm_db']:.1f} PM={_rr['pm_deg']:.0f} Ms={_rr['Ms']:.2f} Γ={_rr['peak']:.3f} fb={_rr['self_fb_peak']:.2f}")
+_rkv0 = _margins_of(kv=0.0)
+_rtau = _margins_of(tau_ff=2.0)
+check("분석 (FCR-10): 시간간격 항을 빼거나(KV=0) FF 저역통과를 2.0s 로 되돌리면 |Γ| 피크가 1 을 넘는다 — 두 선택의 근거",
+      _rkv0["peak"] > 1.03 and _rtau["peak"] > 1.03, f"KV=0 → {_rkv0['peak']:.3f}, τ_ff 2.0 → {_rtau['peak']:.3f}")
 
 # ------------------------------------------------- 추적성: docs/REQUIREMENTS.md 의 참조가 코드와 맞는가
 from analysis import trace_check as _tc  # noqa: E402
@@ -1122,17 +1136,40 @@ check("IMM: 자기 속도 없이는 CT 회전율이 실제 선회율과 무관 �
 check("IMM: 자기 속도를 넣으면 절대 속도로 회전율을 추정해 실제 선회율을 따라간다 (카메라 관례상 부호 반전)",
       -0.62 < _w_on_slow < -0.38 and -1.2 < _w_on_fast < -0.8, f"on: {_w_on_slow:.3f}(참값 -0.50) / {_w_on_fast:.3f}(참값 -1.00)")
 
-# 모드 확률은 이 구조에서 움직이지 않는다 — 결함이 아니라 상대상태 필터의 성질이다. 회귀로 고정한다.
+# EST-15: 모드 확률이 리더 기동에 반응한다. 두 가지가 같이 필요했다 — (1) 상태 속도를 리더 절대 속도로 (추종 중에도
+# 기동이 보인다), (2) 전이확률을 체류시간 기반으로 (프레임당 고정 행렬은 30fps 에서 우도가 쌓이기 전에 1/3 로 되돌렸다).
+_p_ct_straight = float(_imm_follow(0.0).get_model_probs()[1])
 _p_ct_slow = float(_imm_follow(0.5).get_model_probs()[1])
 _p_ct_fast = float(_imm_follow(1.0).get_model_probs()[1])
-_p_stat = 0.05 / (0.05 + 0.10)      # 전이행렬 [[0.95,0.05],[0.10,0.90]] 의 정상분포: p_ct = 1/3
-check("IMM: 추종 중에는 CT 모드 확률이 전이행렬 정상분포(1/3) 근처에 머문다 — 상대상태를 필터링하므로 "
-      "팔로워가 잘 따라갈수록 리더 기동이 상대상태에서 사라져 두 모델의 우도가 구분되지 않는다 (VERIFICATION 참조)",
-      abs(_p_ct_slow - _p_stat) < 0.06 and abs(_p_ct_fast - _p_stat) < 0.06 and abs(_p_stat - 1/3) < 1e-9,
-      f"p_ct {_p_ct_slow:.3f} / {_p_ct_fast:.3f} (정상분포 {_p_stat:.3f})")
+check("IMM (EST-15): 추종 중에도 CT 모드 확률이 리더 기동을 따른다 — 직진 < 0.2, 선회 0.5 rad/s > 0.4, 선회 1.0 rad/s > 0.7",
+      _p_ct_straight < 0.2 and _p_ct_slow > 0.4 and _p_ct_fast > 0.7 and _p_ct_straight < _p_ct_slow < _p_ct_fast,
+      f"p_ct 직진 {_p_ct_straight:.3f} / 선회0.5 {_p_ct_slow:.3f} / 선회1.0 {_p_ct_fast:.3f}")
+import imm_ekf as _ie  # noqa: E402
+_Pi = _ie.transition_matrix(1.0 / 30.0)
+_stat_ct = _Pi[0, 1] / (_Pi[0, 1] + _Pi[1, 0])
+check("IMM: 전이확률은 체류시간 기반(dt/τ) 이라 프레임률과 무관하고 정상분포 p_ct 는 1/3 을 유지한다 (30fps 프레임당 0.0033/0.0067)",
+      abs(_Pi[0, 1] - (1 / 30) / 10.0) < 1e-9 and abs(_Pi[1, 0] - (1 / 30) / 5.0) < 1e-9 and abs(_stat_ct - 1 / 3) < 1e-9
+      and np3.allclose(_ie.transition_matrix(1 / 30, None), _ie.TRANS_PROB_LEGACY),
+      f"Pi={_Pi.round(4).tolist()} 정상분포 {_stat_ct:.3f}")
 _ek_noego = ImmEkf(); _ek_noego.init([0.0, 0.0, 3.0])
-check("IMM: 자기 속도를 주지 않으면 leader_velocity() 는 상대 속도 그대로 (기본값 0)",
-      np3.allclose(_ek_noego.filters[0].leader_velocity(), _ek_noego.filters[0].x[3:6]))
+check("IMM: 자기 속도를 주지 않으면 상태 속도는 상대 속도와 같다 (예전 상대 필터와 동일한 거동)",
+      np3.allclose(_ek_noego.filters[0].leader_velocity(), _ek_noego.filters[0].x[3:6])
+      and np3.allclose(_ek_noego.relative_velocity(), _ek_noego.leader_velocity()))
+# 절대 속도 상태의 정의 검사: 팔로워가 0.3 m/s 로 전진하고 리더가 3m 앞에 고정(상대 위치 일정)이면 리더도 0.3 m/s.
+_ek_abs = ImmEkf(); _ek_abs.set_ego_velocity_cam([0.0, 0.0, 0.3]); _ek_abs.init([0.0, 0.0, 3.0])
+for _ in range(120):
+    _ek_abs.set_ego_velocity_cam([0.0, 0.0, 0.3]); _ek_abs.predict(1 / 30); _ek_abs.update_position3d([0.0, 0.0, 3.0])
+check("IMM: 상태 속도 = 리더 절대 속도 (팔로워 0.3 m/s 전진 + 상대 위치 고정 → 리더 0.3 m/s, 상대 속도 0)",
+      abs(_ek_abs.leader_velocity()[2] - 0.3) < 0.02 and abs(_ek_abs.relative_velocity()[2]) < 0.02,
+      f"vL={_ek_abs.leader_velocity()[2]:.3f} vrel={_ek_abs.relative_velocity()[2]:.3f}")
+# 자기 속도가 끊기면(None) 상태 속도는 상대 속도로 수렴하고, 돌아오면 절대 속도로 복귀한다 — 정지 가정 폴백.
+for _ in range(90):
+    _ek_abs.set_ego_velocity_cam(None); _ek_abs.predict(1 / 30); _ek_abs.update_position3d([0.0, 0.0, 3.0])
+_v_drop = float(_ek_abs.leader_velocity()[2])
+for _ in range(90):
+    _ek_abs.set_ego_velocity_cam([0.0, 0.0, 0.3]); _ek_abs.predict(1 / 30); _ek_abs.update_position3d([0.0, 0.0, 3.0])
+check("IMM: 자기 속도 미수신(None) 3s 뒤 상태 속도는 상대 속도(0)로, 복귀 3s 뒤 다시 절대 속도(0.3)로 — 폴백이 발산하지 않음",
+      abs(_v_drop) < 0.05 and abs(_ek_abs.leader_velocity()[2] - 0.3) < 0.05, f"끊김 {_v_drop:.3f} → 복귀 {_ek_abs.leader_velocity()[2]:.3f}")
 
 # ------------------------------------------------- 최소 이격 + 측면 회피
 _ms, _rad = main.MIN_SEPARATION_M, main.EVADE_RADIUS_M
@@ -1150,8 +1187,8 @@ check("이격: 전후축이 아니라 3차원 거리로 판정 — 선회 중 �
 
 # P 항과의 중복 구간 — 이 교차점이 '1단계가 대부분 놀고 있다'는 사실의 근거다 (main.enforce_min_separation 주석)
 _cross = (main.MIN_SEPARATION_KP * _ms - main.KP_FORWARD * main.TARGET_DISTANCE_M) / (main.MIN_SEPARATION_KP - main.KP_FORWARD)
-check("이격: 거리 1.42m 위에서는 P 항이 제약보다 강하다 — 1단계는 이론적 바닥이지 상시 보호가 아님",
-      abs(_cross - 1.42) < 0.02
+check("이격: P 항만 있으면 교차점(KP 0.30 → 1.00m; 0.22 였을 때 1.42m) 위에서 P 후퇴가 장벽보다 강하다 — 장벽의 실제 역할은 FF 파고들기 차단",
+      abs(_cross - (0.6 * _ms - main.KP_FORWARD * 3.0) / (0.6 - main.KP_FORWARD)) < 1e-9 and 0.9 < _cross < 1.5
       and main.KP_FORWARD * (_ms - main.TARGET_DISTANCE_M) < -main.MIN_SEPARATION_KP * (_ms - _ms),
       f"교차 {_cross:.3f}m")
 
@@ -1255,6 +1292,32 @@ if _hmod is not None:
     _W.reset()
 
 # ---------------------------------------------------------------- 
+# ------------------------------------------------- 이격 장벽 (FCR-16): 피드포워드가 파고드는 것을 막는가
+# 리더가 가까이 왔다가 멀어지면 FF 는 앞으로, P 는 뒤로. 1.8m 에서 P −0.264 + FF +0.32 = +0.056 (접근) — 장벽이 자른다.
+_ff_push = main.enforce_min_separation([0.056, 0.0, 0.0], [1.8, 0.0, 0.0])
+check("이격 장벽: 바닥 안(1.8m)에서 FF 가 만든 접근 명령(+0.056)은 물러남(−0.12)으로 잘린다 — P 가 아니라 장벽이 주는 보증",
+      abs(_ff_push[0] - (-main.MIN_SEPARATION_KP * 0.2)) < 1e-9, f"{_ff_push}")
+_ff_out = main.enforce_min_separation([0.35, 0.0, 0.0], [2.2, 0.0, 0.0])
+check("이격 장벽: 바닥 밖(2.2m)에서도 접근 속도는 KS·(d−d_min)=0.12 로 제한된다 (연속 장벽)",
+      abs(_ff_out[0] - main.MIN_SEPARATION_KP * 0.2) < 1e-9, f"{_ff_out}")
+_ff_far = main.enforce_min_separation([0.35, 0.0, 0.0], [2.6, 0.0, 0.0])
+check("이격 장벽: 2.58m 밖에서는 허용치가 MAX_VX 를 넘어 명령이 그대로다 (평상시 추종에 개입 없음)",
+      abs(_ff_far[0] - 0.35) < 1e-9, f"{_ff_far}")
+
+# ------------------------------------------------- 회피 경계 (FCR-17): analysis/evasion_sim.py
+from analysis import evasion_sim as _ev  # noqa: E402
+_ev_bound = _ev.escape_speed_bound()
+_ev_s07 = _ev.simulate(0.7, mode="straight")
+_ev_p04 = _ev.simulate(0.4, mode="pursuit")
+_ev_p07 = _ev.simulate(0.7, mode="pursuit")
+check("회피 경계: 지나가는 리더 0.7 m/s 는 접촉 없이 비켜선다 (최소 거리 ≥ 0.4m, 명령 측면 ≥ 0.12 m/s)",
+      not _ev_s07["contact"] and _ev_s07["min_dist"] >= 0.4 and _ev_s07["max_cmd_lat"] >= 0.12,
+      f"min={_ev_s07['min_dist']:.2f}m lat={_ev_s07['max_cmd_lat']:.2f}")
+check(f"회피 경계: 추격형 접근도 상한 hypot(MAX_VX,MAX_VY)={_ev_bound:.2f} 아래(0.4 m/s)면 접촉 없음",
+      not _ev_p04["contact"] and _ev_p04["min_dist"] >= 1.0, f"min={_ev_p04['min_dist']:.2f}m")
+check("회피 경계 골든: 추격형 0.7 m/s 는 상한 위라 접촉한다 — 제어 결함이 아니라 속도 한계 (MAX_V* 인상 또는 운용 절차)",
+      _ev_p07["contact"] and _ev_p07["max_cmd_lat"] >= 0.2, f"min={_ev_p07['min_dist']:.2f}m lat={_ev_p07['max_cmd_lat']:.2f}")
+
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "
       f"({len(failures)} 실패)")

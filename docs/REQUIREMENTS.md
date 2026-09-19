@@ -23,21 +23,21 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | ID | 요구도 | 출처 | 방법 | 검증 근거 | 상태 |
 |---|---|---|---|---|---|
 | FCR-01 | 팔로워는 리더 후방 목표 이격 3.0 m(`TARGET_DISTANCE_M`)를 유지하며, 리더 정지 후 목표 ±0.5 m 로 수렴하고 2.3 m 안쪽으로 접근하지 않는다 | README 제어 법칙 | T | CL[리더 정지 후 최소 접근]; SITL[hover_hold] | 검증됨 |
-| FCR-02 | 리더 등속 0.3 m/s 추종 시 정상상태 거리 오차가 이론값 (1−KFF)·v/Kp 와 ±0.05 m 로 일치하고 평형 거리가 깊이창(목표+3 m) 안에 든다 | README 제어 법칙 | A, T | UT[FF: 1축 폐루프]; CL[FOLLOW 중(리더]; SITL[depth_range]; AN[kff_sweep.kff0.8.ss_err_per_mps] | 검증됨 |
+| FCR-02 | 리더 등속 0.3 m/s 추종 시 정상상태 거리 오차가 이론값 (v − KFF·(v−DB) + KV·v)/Kp (0.53 m) 와 ±0.05 m 로 일치하고 평형 거리가 깊이창(목표+3 m) 안에 든다 | README 제어 법칙 | A, T | UT[FF: 1축 폐루프]; UT[FF (시간간격 정책)]; CL[FOLLOW 중(리더]; SITL[depth_range]; AN[kff_sweep.kff0.8.ss_err_per_mps] | 검증됨 (SITL 은 Kp 0.22·KV 0 설계로 실측 — 재실행 필요) |
 | FCR-03 | 속도 명령은 BODY_NED 프레임으로 축별 한계(0.35 / 0.22 / 0.12 m/s, yaw 0.35 rad/s)에 포화되고 yaw_rate 마스크를 항상 유효로 보낸다 | main.py | T, I | UT[C5:]; INSPECT[main.py:MAX_VX = 0.35] | 검증됨 |
 | FCR-04 | 속도 setpoint 는 10 Hz(9.5~10.5 Hz) 로 송신한다 | main.py `SETPOINT_PERIOD_SEC` | T | CL[setpoint 송신율] | 검증됨 |
 | FCR-05 | 기수는 리더 방위각을 0 으로 유지하고, 명령 yaw_rate 0 에서 기체가 스스로 회전하지 않는다 | VERIFICATION C5 | T, A | UT[C5:]; SITL[hold_heading]; AN[yaw.nominal.pm_deg] | 검증됨 |
 | FCR-06 | 명령 평활은 프레임률과 무관하게 같은 시정수를 갖는다 | main.py `smooth_velocity_cmd` | T | UT[평활:] | 검증됨 |
 | FCR-07 | 위치 공분산 trace 가 2 / 4 를 넘으면 명령을 0.75 / 0.55 배로 줄인다 | config `controller.uncertainty_slowdown_trace` | A | AN[kff_sweep.scale0.55.gm_db] | 부분 (여유 분석만, 배율 단위 검사 없음) |
-| FCR-08 | 리더 절대 속도(0.3 s 정합 저역통과한 자기 속도 + EKF 상대 속도)를 KFF 0.8 로 피드포워드하되 0.05 m/s 소프트 데드존(기울기 1)과 2.0 s 저역통과를 거치고, 인자가 없으면 기존 명령과 같다 | README 제어 법칙, STABILITY_MARGINS 7절 | T | UT[FF:]; CL[FOLLOW 중(리더]; SITL[depth_range]; SITL[leader_sine] | 검증됨 (SITL 재실행: depth_range 후반 4.1 m, leader_sine 0.72) |
-| FCR-09 | 바깥 루프는 전 축에서 위상여유 ≥ 45°, 이득여유 ≥ 6 dB, 감도 피크 Ms ≤ 2 를 만족한다 | STABILITY_MARGINS 1·4절 | A | AN[axes.forward.pm_deg]; AN[axes.forward.gm_db]; AN[axes.right.gm_db]; UT[분석: 현재 설계]; UT[분석 골든:] | 검증됨 (분석: GM 14.4 / 13.3 / 14.9 dB, Ms ≤ 1.35. 수정 전은 4.9 / 4.4 / 5.3 dB 로 미충족이었음 — 골든 검사가 그 값을 기록) |
-| FCR-10 | 리더→팔로워 속도 전달 \|Γ(jω)\| 이 모든 주파수에서 1 이하다 (스트링 안정, 다중 기체 체인 전제) | STABILITY_MARGINS 6절 | A | AN[axes.forward.peak]; AN[validation]; UT[분석: 현재 설계] | 부분 (피크 1.13 @0.27 rad/s — 피드포워드+P 겹침. 수정 전 1.80 @1.15. KFF 0.6 이면 1.02, 체인 운용 전 결정) |
+| FCR-08 | IMM-EKF 가 직접 추정한 리더 절대 속도를 KFF 0.8 로 피드포워드하되 0.05 m/s 소프트 데드존(기울기 1)과 0.1 s 저역통과를 거치고, 자기 속도 감쇠 −KV·v_self(0.2, 시간간격 정책)를 더하며, 인자가 없으면 기존 명령과 같다 | README 제어 법칙, STABILITY_MARGINS 7절 | T | UT[FF:]; CL[FOLLOW 중(리더]; SITL[depth_range]; SITL[leader_sine] | 검증됨 (SITL 은 직전 설계 실측: depth_range 4.1 m, leader_sine 0.72 — 현재 설계 예측은 AN[sitl_like.current], 재실행 필요) |
+| FCR-09 | 바깥 루프는 전 축에서 위상여유 ≥ 45°, 이득여유 ≥ 6 dB, 감도 피크 Ms ≤ 2 를 만족한다 | STABILITY_MARGINS 1·4절 | A | AN[axes.forward.pm_deg]; AN[axes.forward.gm_db]; AN[axes.right.gm_db]; UT[분석 (FCR-10)]; UT[분석 골든:] | 검증됨 (분석: GM 18.4 / 18.7 / 19.7 dB, PM 96°, Ms ≤ 1.18. 직전 설계 14.4 dB, 수정 전 4.9 dB — 골든 검사가 두 값을 기록) |
+| FCR-10 | 리더→팔로워 속도 전달 \|Γ(jω)\| 이 모든 주파수에서 1 이하다 (스트링 안정, 다중 기체 체인 전제) | STABILITY_MARGINS 6·7절 | A, T | AN[axes.forward.peak]; AN[validation]; AN[sitl_like.current]; UT[분석 (FCR-10)]; SITL[leader_sine] | 검증됨 (분석: 1.000 / 1.000 / 0.999 — 절대속도 추정기 + FF τ 0.1 s + 시간간격 KV 0.2. KV=0 이면 1.14, τ 2.0 이면 1.08 — 골든 검사가 기록. SITL leader_sine 은 직전 설계 실측 0.72, 현재 설계 재실행 필요) |
 | FCR-11 | FC ATTITUDE 의 roll/pitch/yaw 변화량으로 매 프레임 EKF 상대 상태를 역회전해 기체 기울어짐이 리더 이동으로 보이지 않게 하고, 그 보정이 CT 각속도로 새지 않는다 | README 안전 설계 | T | UT[자세보정:]; UT[ego-yaw:] | 검증됨 (실기 미검증) |
 | FCR-12 | 비전 거리가 없고 GPS 상대위치만 있으면 이격을 8 m 로 넓힌다 | README 안전 설계 | T | UT[gps-only:] | 검증됨 |
 | FCR-13 | 출발·정지·착륙 판단은 리더 절대 속도(ESP32 > 자기+상대 > 상대 폴백) 로 한다 | README 안전 설계 | T | UT[미션:]; CL[리더 출발 후]; CL[추종 중(t=8s)]; SITL[depth_range] | 검증됨 |
-| FCR-14 | 피드포워드를 뺀 P+D 기준선은 PM ≥ 45°, GM ≥ 6 dB, Ms ≤ 1.5, 스트링 안정을 만족한다 | STABILITY_MARGINS 1절 | A | AN[kff_sweep.kff0.gm_db]; UT[분석: P+D] | 검증됨 (분석) |
-| FCR-16 | 리더까지의 3차원 거리가 최소 이격(2.0 m) 아래면 명령의 접근 성분을 제거하고 침범량에 비례해 물러난다 | VERIFICATION 남은 결함(선회 시 최근접 1.59 m) | T, A, I | UT[이격:]; INSPECT[config.py:"min_separation_m": 2.0] | 부분 (단위 검증. **거리 1.42 m 위에서는 P 항이 이 제약보다 강해 실제로는 발동하지 않는다** — 해석으로 확인, FCR-17 이 실제 보호) |
-| FCR-17 | 리더가 MAX_VX(0.35 m/s)보다 빠르게 **한 방향으로** 다가오면 정면 후퇴로는 벗어날 수 없다. 회피 반경(1.5 m) 안에서는 시선에 수직인 수평 방향으로 비켜서서 접촉을 피한다 | 오프라인 모의: 0.7 m/s 정면 접근 시 회피 없으면 0.01 m(접촉), 있으면 0.41 m | T | UT[회피:]; SITL[min_separation] | 부분 (**리더가 계속 재조준하며 추격하면 접촉을 피할 수 없다** — 순수추격 기하, 폐루프 모의에서 최대 측면 오프셋 0.14 m 로 0.02 m 접촉 후 소실→FAILSAFE_LAND. 지나가는 리더에만 유효) |
+| FCR-14 | 피드포워드·시간간격 항을 뺀 P+D 기준선은 PM ≥ 45°, GM ≥ 6 dB, Ms ≤ 1.5, 스트링 안정을 만족한다 | STABILITY_MARGINS 1절 | A | AN[kff_sweep.kff0.gm_db]; UT[분석: P+D] | 검증됨 (분석: GM 24.6 dB, \|Γ\| 1.000) |
+| FCR-16 | 명령의 시선 방향 접근 속도는 모든 거리에서 KS·(d − 2.0 m) 이하다 (연속 장벽): 바닥 밖에서는 접근 상한, 안에서는 침범량에 비례한 후퇴. 특히 피드포워드가 바닥 안에서 접근 명령을 만들지 못한다 | VERIFICATION 남은 결함(선회 시 최근접 1.59 m) | T, A, I | UT[이격:]; UT[이격 장벽:]; INSPECT[config.py:"min_separation_m": 2.0] | 검증됨 (P 항만의 경로에서는 교차점 1.0 m 위에서 P 가 더 강해 놀지만, FF 파고들기(1.8 m 에서 +0.04 → −0.12)는 이 장벽만 막는다 — 단위 검사) |
+| FCR-17 | 회피 반경(1.5 m) 안에서는 시선에 수직인 수평 방향으로 비켜선다. 보증 범위: (a) 한 방향으로 지나가는 리더는 1.0 m/s 까지 접촉 없이 비킨다, (b) 재조준하며 추격하는 리더는 hypot(MAX_VX, MAX_VY)=0.41 m/s 아래에서만 — 그 위는 순수추격 기하상 어떤 제어기로도 불가능하다 | analysis/evasion_sim.py | T, A | UT[회피:]; UT[회피 경계:]; UT[회피 경계 골든]; SITL[min_separation] | 검증됨 (범위 명시. 모의: straight 0.7 m/s → 0.62 m, pursuit 0.4 → 1.88 m, pursuit 0.7 → 접촉(골든). SITL min_separation 통과 — 사용자 실행, 수치 기록 대기) |
 | FCR-15 | 리더 속도가 0.25 ± 0.05 m/s, 1.15 rad/s 정현파일 때 팔로워 속도 진폭비가 1 이하다 (실제 FC 에서의 스트링 안정성) | STABILITY_MARGINS 6절, sitl/README | T | SITL[leader_sine]; AN[sitl_like.current] | 검증됨 (SITL 실측 0.43 / 0.72, 예측 0.70. 수정 전 코드 대조군 1.95 FAIL — 차등 검증) |
 
 ### EST — 인지 / 추정
@@ -45,7 +45,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | ID | 요구도 | 출처 | 방법 | 검증 근거 | 상태 |
 |---|---|---|---|---|---|
 | EST-01 | IMM-EKF(CV+CT) 가 상대 위치·속도를 추정하고 속도 추정의 63 % 응답이 0.5 s 이내이며 램프에 위치 지연이 없다 | imm_ekf.py | A, T | AN[ekf_step.t63_velocity_s]; UT[분석: IMM-EKF] | 검증됨 (0.30 s) |
-| EST-15 | 모드 확률이 리더 기동에 따라 움직여 "mode-aware" 추정이 실제로 동작한다 | 프로젝트 이름(MARS-IMM) | T | UT[IMM: 추종 중에는] | **미충족** (구조적. 상대상태를 필터링하므로 추종이 잘 될수록 리더 기동이 상대상태에서 사라져 두 모델이 구분되지 않는다. p_ct 는 전이행렬 정상분포 1/3 에 머문다 — VERIFICATION 참조) |
+| EST-15 | 모드 확률이 리더 기동에 따라 움직여 "mode-aware" 추정이 실제로 동작한다: 추종 중 직진 p_ct < 0.2, 선회 0.5 rad/s > 0.4, 1.0 rad/s > 0.7 | 프로젝트 이름(MARS-IMM) | T | UT[IMM (EST-15)]; UT[IMM: 전이확률]; UT[IMM: 상태 속도] | 검증됨 (0.11 / 0.72 / 0.86. 두 가지가 필요했다 — 상태 속도를 리더 절대 속도로(자기 속도는 예측 입력), 전이확률을 체류시간 기반으로. 둘 중 하나만으로는 각각 0.35 / 0.11 — VERIFICATION 참조) |
 | EST-02 | 측정은 신뢰도로 R 을 적응하고 카이제곱 게이트(3D 11.34, 2D 9.21)로 거른다. RGB-D, bearing, ESP32 위치, ESP32 속도 네 경로 모두 같은 게이트를 지난다 | config `reliability` | T | UT[C4: MAD]; UT[C4: 정상]; UT[ESP32 속도:] | 검증됨 |
 | EST-13 | ESP32 상대 속도는 필터 상태 직접 대입이 아니라 정규 칼만 속도 측정 갱신으로 반영한다. 게이트를 통과한 것만 쓰고, 공분산은 임의 축소가 아니라 갱신 결과로 줄어든다 | VERIFICATION 남은 결함 | T | UT[ESP32 속도:] | 검증됨 |
 | EST-14 | CT 모델의 회전율은 리더 절대 속도(상대 + 자기 속도)로 추정한다. 상대 속도만 쓰면 추종이 정착할수록 방향각이 정의되지 않아 회전율이 실제와 무관해진다 | VERIFICATION 남은 결함 | T | UT[IMM:] | 검증됨 |
@@ -124,11 +124,8 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 
 | ID | 상태 | 필요한 것 |
 |---|---|---|
-| FCR-10 | 부분 | 남은 피크 1.13 은 피드포워드+P 겹침. 3대 이상 체인이면 KFF 0.6(1.02) 또는 ESP32 선두 절대 속도 방송으로 자기 속도 경로 제거 |
 | EST-12 | 미충족 | 리더 드론 데이터셋 확장, 재학습 |
-| EST-15 | 미충족 | 셋 중 택일: (1) CT 모델 제거하고 단일 CV 로 단순화, (2) 리더 절대상태를 필터링하도록 구조 변경(팔로워 위치·속도를 더해 월드 기준 상태로), (3) 현 상태 유지하고 한계를 명시. 측정상 융합 출력은 세 경우가 같다 |
-| FCR-16 | 부분 | 이득을 올리거나 MAX_VX 를 키우면 의미가 생기는 자리. 지금은 P 항과 중복이라 제거해도 동작이 같다 |
-| FCR-17 | 부분 | 추격형 접근은 `MAX_VY`(0.22)가 리더 접근 속도보다 작은 한 기하적으로 불가능하다 — 셋 중 택일: (1) `MAX_VX`·`MAX_VY` 인상, (2) 리더 운용 절차로 금지하고 한계 명시, (3) 회피 실패 시 즉시 상승/하강을 추가(`MAX_VZ` 0.12 로는 더 불리) |
+| FCR-02/08/10 | 검증됨(분석) | 제어 파라미터가 바뀌었다(Kp 0.30, τ_ff 0.1, KV 0.2, 절대속도 추정기). SITL `depth_range`·`leader_sine`·`hover_hold` 재실행으로 예측(정상상태 3.53 m, 진폭비 AN[sitl_like.current])을 확인해야 한다 |
 | FCR-07 | 부분 | 감속 배율 0.75 / 0.55 의 단위 검사 추가 |
 | EST-02 | 부분 | 카이제곱 임계 경계값 단위 검사 추가 |
 | EST-10 | 부분 | 실외 역광·강한 빛 조건에서 노출 옵션 실기 확인 |
