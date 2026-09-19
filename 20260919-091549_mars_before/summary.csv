@@ -1,0 +1,2 @@
+scenario,result,frames,note,why
+leader_sine,FAIL,1501,"ratio 2.15 mean 0.24m/s dist 3.45m","스트링 불안정: 리더 속도 변동이 팔로워에서 2.15배로 증폭 (ω=1.15 rad/s). 체인 n 단 뒤에는 2.15^n 배"

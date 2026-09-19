@@ -1,0 +1,10 @@
+scenario,result,frames,note,why
+boot_no_leader,PASS,1004,"",""
+pilot_takeover,PASS,996,"",""
+air_landing,PASS,990,"",""
+depth_range,PASS,986,"final 4.02m peak 5.29m target 3.0m",""
+hover_hold,PASS,986,"final 3.02m peak 5.29m target 3.0m",""
+hold_heading,PASS,986,"heading drift 0.0deg",""
+depth_loss,PASS,993,"land delay 10.0s",""
+handover,PASS,1001,"",""
+leader_sine,PASS,1504,"ratio 0.70 mean 0.24m/s dist 3.47m",""
