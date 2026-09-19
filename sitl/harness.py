@@ -75,7 +75,11 @@ SINE_DURATION = SINE_SETTLE + 6 * 2 * 3.14159 / SINE_W   # 정착 뒤 6주기 (�
 SEP_SPEED, SEP_STRAIGHT = 0.30, 10.0
 SEP_CHARGE, SEP_CHARGE_SEC = 0.70, 8.0
 SEP_HARD_FLOOR_M = 0.15       # 이 아래면 접촉으로 본다
-SEP_MIN_LATERAL = 0.08        # 회피 반경 안에서 관측돼야 하는 시선수직(수평) 속도 [m/s]
+SEP_MIN_LATERAL = 0.12        # 회피 반경 안에서 관측돼야 하는 시선수직(수평) 속도 [m/s]
+# 판정 기준값. --repo 로 수정 전 코드를 돌릴 때 그쪽 main 에 없는 상수를 참조하면 시나리오가 통째로 죽어
+# 대조군을 만들 수 없다 — 차등 검증의 전제라 반드시 getattr 폴백을 둔다 (2026-09-20 실제로 깨졌다).
+SEP_FLOOR_M = float(getattr(main, "MIN_SEPARATION_M", 2.0))
+SEP_RADIUS_M = float(getattr(main, "EVADE_RADIUS_M", 1.5))
 CX, CY = W / 2.0, H / 2.0
 
 
@@ -615,6 +619,7 @@ def run_scenario(name):
             log(f"시나리오: 리더 {SEP_SPEED} m/s 로 {SEP_STRAIGHT:.0f}초 북진(추종 정착) → "
                 f"팔로워 쪽으로 {SEP_CHARGE} m/s 돌진 {SEP_CHARGE_SEC:.0f}초. 접근 속도가 "
                 f"MAX_VX({main.MAX_VX}) 보다 커서 후퇴로는 못 벗어난다 — 측면 회피가 동작하는가")
+            log(f"판정 기준: 접촉 {SEP_HARD_FLOOR_M:.2f}m, 회피 반경 {SEP_RADIUS_M:.1f}m, 측면 ≥ {SEP_MIN_LATERAL:.2f} m/s")
             while (not World.stop and World.generation == gen) and not World.have_fix:
                 time.sleep(0.2)
             t0 = time.time()
@@ -735,7 +740,7 @@ def run_scenario(name):
                          f"체인 n 단 뒤에는 {ratio:.2f}^n 배")
 
     if name == "min_separation":
-        floor, radius = float(main.MIN_SEPARATION_M), float(main.EVADE_RADIUS_M)
+        floor, radius = SEP_FLOOR_M, SEP_RADIUS_M
         if len(seps) < 50:
             fail(f"거리 샘플 부족 ({len(seps)}개) — 판정 불가")
         else:

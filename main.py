@@ -95,6 +95,7 @@ MIN_SEPARATION_KP = float(CONFIG["controller"].get("min_separation_kp", 0.6))
 # 측면 회피: 후퇴가 MAX_VX 에 포화된 뒤의 마지막 수단.
 EVADE_RADIUS_M = float(CONFIG["controller"].get("evade_radius_m", 1.5))
 EVADE_SPEED_MPS = float(CONFIG["controller"].get("evade_speed_mps", 0.22))
+EVADE_RAMP_M = max(float(CONFIG["controller"].get("evade_ramp_m", 0.3)), 1e-6)
 
 SETPOINT_PERIOD_SEC = 0.10
 # C2: LAND 가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
@@ -290,6 +291,8 @@ def enforce_min_separation(cmd_fru, rel_fru):
     벗어날 수 없다(0.5 m/s 로 다가오면 최소 0.84m, 0.6 m/s 면 접촉 — 오프라인 모의). 느린 기체가 쓸 수 있는
     유일한 회피는 비켜서는 것이라, EVADE_RADIUS_M 안에서는 시선에 수직인 방향으로 측면 속도를 얹는다.
     방향은 리더가 치우친 반대쪽 — 이미 오른쪽에 있으면 왼쪽으로 빠진다. 수직 성분은 쓰지 않는다(MAX_VZ 0.12 로 너무 느리다).
+        램프는 반경 안쪽 EVADE_RAMP_M 만에 최대치에 닿는다. 반경 전체로 훑으면 가장 위험한 근거리에서
+        회피가 가장 약해진다 — 첫 SITL 실측에서 0.65m 일 때 명령이 0.125 m/s 뿐이었고 측면 속도는 0.09 m/s 였다.
     """
     cmd = np.asarray(cmd_fru, dtype=float)[:3].copy()
     rel = np.asarray(rel_fru, dtype=float)[:3]
@@ -306,7 +309,7 @@ def enforce_min_separation(cmd_fru, rel_fru):
     if dist < EVADE_RADIUS_M:
         # 수평면에서 시선에 수직인 방향. 리더가 정면(right≈0)이면 부호가 정해지지 않으므로 오른쪽으로 통일한다.
         lat = -1.0 if rel[1] > 0.0 else 1.0         # 리더가 오른쪽이면 왼쪽(-)으로 비킨다
-        frac = clamp((EVADE_RADIUS_M - dist) / max(EVADE_RADIUS_M, 1e-6), 0.0, 1.0)
+        frac = clamp((EVADE_RADIUS_M - dist) / EVADE_RAMP_M, 0.0, 1.0)
         cmd[1] += lat * EVADE_SPEED_MPS * frac
 
     lim = (MAX_VX, MAX_VY, MAX_VZ)
