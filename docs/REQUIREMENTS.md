@@ -119,6 +119,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | IF-15 | 리더 패킷에 yaw 가 없으면 None 으로 구분한다 (0 = 북쪽으로 오해하지 않음) | leader_telemetry.py | T | UT[편대: 패킷에 yaw] | 검증됨 |
 | IF-16 | ESP32 상대위치는 팔로워 ATTITUDE yaw 가 `ATTITUDE_MAX_AGE_SEC`(0.3 s) 보다 오래되면 만들지 않는다(`stale_follower_attitude`) — 오래된 yaw 로 회전한 값이 gps 관측으로 EKF 에 들어가지 않게 | leader_telemetry.py | T | UT[안전: 팔로워 자세 신선도] | 검증됨 |
 | IF-17 | 컴패니언은 미션 상태 변화(LOST_HOLD/FAILSAFE_LAND/착륙 판정)·GUIDED 진입·FC 상태 정체·전방 정지·LAND 송신·종료를 STATUSTEXT 로 GCS 에 알린다 (ArduPilot 은 대상 없는 메시지를 다른 링크로 중계) | main.py `send_statustext` | T | UT[안전: STATUSTEXT] | 검증됨 (송신; GCS 화면 표시는 실기 확인) |
+| IF-18 | UWB 거리 GT(선두 태그 ↔ 후미 앵커)는 후미 시리얼(`uwb_reader.py`) 또는 선두 패킷 `uwb_range` 로 받아 앵커·태그 오프셋을 EKF 시선으로 보정해 로그 `uwb.*` 에만 남긴다 — **제어·EKF 에는 쓰지 않는다** (추정기를 재는 자) | EXPERIMENT_PROTOCOL 2절 | T, I | UT[논문 도구: UWB]; UT[논문 도구: 선두 패킷의 uwb_range]; UT[논문 도구: 제어는 UWB]; CL[정현파(sine) 로그: 논문 분석에 필요한 열] | 검증됨 (실기 모듈 미검증 — 정적 교정은 프로토콜 3절) |
 
 ### OPS — 운용 / 유지
 
@@ -128,6 +129,10 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | OPS-02 | 모터 테스트 프로토타입 등 죽은 코드가 없다 | VERIFICATION | I | UT[정리:] | 검증됨 |
 | OPS-03 | 모든 요구도의 검증 근거가 실제 검사·시나리오·분석 키를 가리킨다 | 이 문서 | T | UT[추적성:] | 검증됨 |
 | OPS-04 | `main.main()` 은 가짜 FC·가짜 시계로 결정론 실행되어 예외 없이 끝난다 | test_closed_loop.py | T | CL[main.main()] | 검증됨 |
+| OPS-05 | FC 속도루프 식별: `analysis/id_flight.py` 는 GUIDED 에서 축별 계단(진폭 상한 0.5/0.3/0.15, 총 120 s, 모드·신선도·고도 감시) 을 보내며 기록하고, `analysis/identify_plant.py` 가 1차+지연(K, τ, L) 을 시뮬레이션 오차 최소화로 맞춰 외루프 여유를 재계산한다 | EXPERIMENT_PROTOCOL 5절 E1 | T | UT[논문 도구: id_flight]; UT[논문 도구: 자체검사]; CL[정현파(sine) 로그 → analysis/identify_plant.py] | 검증됨 (합성·가짜 FC; 실기 식별값은 미확보) |
+| OPS-06 | 정현파 시험 로그에서 리더→팔로워 속도 이득 \|Γ(jω)\| 과 위상을 페이저 최소제곱으로 뽑고(리더 출처 esp32/uwb, ekf 는 추정기 FRF 로 치우쳐 참고용) 선형 모델 예측과 비교한다 | analysis/sine_gain.py | T | UT[논문 도구: 자체검사]; CL[정현파(sine) 로그 → analysis/sine_gain.py] | 검증됨 (폐루프 실제 코드 ↔ 선형 모델 ↔ 도구: 0.699 vs 0.669, 위상 −132 vs −131°) |
+| OPS-07 | IMM-EKF 일관성: NIS(RGB-D 3차원·bearing 2차원·ESP32 3차원) 의 평균과 χ² 95 % 구간, UWB 거리 GT 로 1차원 NEES·잔차 바이어스/σ 를 계산한다 (scipy 없이 정확한 χ² 분위수) | analysis/nees_nis.py | T | UT[논문 도구: chi2_ppf]; UT[논문 도구: 자체검사]; CL[정현파(sine) 로그 → analysis/nees_nis.py] | 검증됨 (합성; 실기 NEES 는 UWB 정적 교정 뒤) |
+| OPS-08 | 폐루프 하네스는 `--log-dir` 로 main 의 실제 JSONL 로그와 가짜 UWB GT 를 남기고 `--scenario sine` 에서 위 세 도구를 그 로그에 돌려 3자 일치를 회귀로 검사한다 | test_closed_loop.py | T | CL[정현파(sine):] | 검증됨 |
 
 ## 2. 역추적: SITL 시나리오 → 요구도
 
@@ -159,6 +164,8 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | EST-13 | 검증됨 (합성) | 실기 드론 표적을 하늘·나무 배경에서 3 / 5 / 8 m 에 두고 `depth_valid_count`·`depth_m` 로그 분포 확인 (FLIGHT_SAFETY_CHECKLIST 3절 B-6) |
 | EST-18 | 검증됨 (송신) | 실기 STAT `rx[Hz] ATT=30` 확인. 안 되면 SRn_EXTRA1 로 폴백 |
 | IF-17 | 검증됨 (송신) | Mission Planner / QGC 화면에 컴패니언 STATUSTEXT 가 뜨는지 실기 확인 (sysid 255 = GCS 로 기록됨) |
+| OPS-05 | 검증됨 (가짜 FC) | 실기 `id_flight.py` 3축 → `docs/plant_id.json`, τ_fc 가정 0.3 s 교체 (EXPERIMENT_PROTOCOL E1) |
+| OPS-07 | 검증됨 (합성) | UWB 정적 교정(바이어스·σ) 뒤 실기 NEES; NIS 가 구간 밖이면 R 재조정 |
 | SAF-10 | 부분 | 카메라 스톨 30 회 → HOLD → 종료 폐루프 시나리오 |
 | SAF-15 | 미검증 | 폐루프 실비행(안전줄·저고도부터) |
 | SAF-05 | 부분 | 하네스 조종사 링크에 RC override 를 넣어 LOITER 중 고도를 유지하게 고치고 `handover` 재실행 (sitl/README 6절) |

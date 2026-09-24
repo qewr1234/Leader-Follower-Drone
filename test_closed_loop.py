@@ -45,9 +45,11 @@ _P.add_argument("--frames", type=int, default=1200)
 #   lost_alt : 25 s 영구 소실 뒤 30 s 부터 HEARTBEAT 만 끊긴다 — 35 s 의 FAILSAFE_LAND 에서 LAND 를 보내지 않는다 (--autonomous-land 1 로 실행)
 #   takeover : HEARTBEAT 1 Hz, 25 s 영구 소실, 조종사가 34.6 s 에 LOITER 로 탈환 — 35.0 s 의 FAILSAFE_LAND 결정이 직전 heartbeat(34.03 s,
 #              GUIDED) 를 근거로 LAND 를 보내 조종사를 덮어쓰면 안 된다 (--autonomous-land 1 로 실행)
-_P.add_argument("--scenario", default="default", choices=["default", "tilt", "nan", "fc_stale", "climb", "lost_alt", "takeover"])
+#   sine     : 리더 0.25 ± 0.05 m/s, 1.15 rad/s 정현파 (SITL leader_sine 과 같은 자극) — analysis/sine_gain.py 검증용 로그 (--log-dir)
+_P.add_argument("--scenario", default="default", choices=["default", "tilt", "nan", "fc_stale", "climb", "lost_alt", "takeover", "sine"])
 _P.add_argument("--level", type=int, default=None, help="controller.level_by_attitude 강제 (0/1). 없으면 config 값")
 _P.add_argument("--autonomous-land", type=int, default=None, help="mission.autonomous_land 강제 (0/1). 없으면 config 값(False)")
+_P.add_argument("--log-dir", default=None, help="이 디렉터리에 main 의 JSONL 로그를 남긴다 (분석 스크립트 검증용). 가짜 UWB 거리 GT 도 켠다")
 ARGS = _P.parse_args()
 
 import numpy as np  # noqa: E402
@@ -321,6 +323,15 @@ def scenario_lost_alt(t):
     FC.mute_heartbeat = t >= 30.0
 
 
+SINE_OMEGA, SINE_V0, SINE_AMP = 1.15, 0.25, 0.05
+
+
+def scenario_sine(t):
+    _handover(t)
+    if t >= 3.0:
+        World.l_n += (SINE_V0 + SINE_AMP * math.sin(SINE_OMEGA * (t - 3.0))) * CLOCK.DT
+
+
 def scenario_takeover(t):
     FC.hb_period = 1.0
     scenario_default(t)
@@ -331,7 +342,7 @@ def scenario_takeover(t):
 
 _SCENARIOS = {"default": scenario_default, "tilt": scenario_tilt, "nan": scenario_nan,
               "fc_stale": scenario_fc_stale, "climb": scenario_climb, "lost_alt": scenario_lost_alt,
-              "takeover": scenario_takeover}
+              "takeover": scenario_takeover, "sine": scenario_sine}
 
 
 def scenario(t):
@@ -398,6 +409,28 @@ if ARGS.level is not None:
     main.LEVEL_BY_ATTITUDE = bool(ARGS.level)
 if ARGS.autonomous_land is not None:
     main.AUTONOMOUS_LAND = bool(ARGS.autonomous_land)
+if ARGS.log_dir:
+    main.CONFIG["logger"]["enabled"] = True
+    main.CONFIG["logger"]["log_dir"] = ARGS.log_dir
+    # 가짜 UWB: 선두↔후미 실제 3D 거리 + 3 cm 잡음, 10 Hz. 앵커/태그 오프셋 0.
+    import uwb_reader as _uwb
+    _rng_uwb = np.random.default_rng(7)
+
+    class _FakeUwbRx:
+        def __init__(self):
+            self.latest, self._last_t = None, -1e9
+
+        def read_latest(self):
+            if CLOCK.sim - self._last_t >= 0.1:
+                self._last_t = CLOCK.sim
+                d = math.sqrt((World.l_n - World.f_n) ** 2 + (World.l_e - World.f_e) ** 2 + (World.l_d - World.f_d) ** 2)
+                self.latest = _uwb.UwbRange(range_m=d + float(_rng_uwb.normal(0.0, 0.03)), rx_time=CLOCK.t, seq=int(CLOCK.sim * 10))
+            return self.latest
+
+        def close(self):
+            pass
+    main.UWB_ENABLED, main.UWB_KIND = True, "serial"
+    main.open_uwb_receiver = lambda: _FakeUwbRx()
 if ARGS.scenario == "nan":
     _nan_fired = []
 
@@ -509,6 +542,35 @@ elif ARGS.scenario == "climb":
     check("안전(climb): 리더 0.1 m/s 상승을 따라 올라가다가(45 s 에 +3 m 이상) 인계 고도 + MAX_CLIMB_ABOVE_ENTRY_M(5 m) 천장에 붙어 멈춘다(최대 +5.3 m 이하, 62 s 에 +4.7~5.3 m)",
           _mid > _entry + 3.0 and _max <= _entry + main.MAX_CLIMB_ABOVE_ENTRY_M + 0.3 and abs(_end - _entry - main.MAX_CLIMB_ABOVE_ENTRY_M) <= 0.3,
           f"entry={_entry:.2f} 45s=+{_mid - _entry:.2f} max=+{_max - _entry:.2f} 62s=+{_end - _entry:.2f} m")
+elif ARGS.scenario == "sine":
+    _fv = [s[2] for s in _sp_between(15.0, 39.9)]
+    check("정현파(sine): 리더 0.25±0.05 m/s·1.15 rad/s 를 추종하며 FOLLOW/LEADER_HOVER 에 머물고 전진 명령이 유한·한계 안",
+          all(math.isfinite(v) and abs(v) <= main.MAX_VX + 1e-9 for v in _fv) and state_at(30.0) in ("FOLLOW", "LEADER_HOVER"),
+          f"n={len(_fv)} state@30={state_at(30.0)}")
+    if ARGS.log_dir:
+        import glob
+        from analysis import sine_gain as _sg, nees_nis as _nn, identify_plant as _ip
+        from analysis.logtools import Log as _Log
+        _path = sorted(glob.glob(str(Path(ARGS.log_dir) / "*.jsonl")))[-1]
+        _lg = _Log.load(_path)
+        _r = _sg.analyze(_lg, omega=SINE_OMEGA, t0=15.0, t1=40.0, leader="uwb")
+        _pr = _sg.predicted_gain(SINE_OMEGA)
+        check("정현파(sine) 로그 → analysis/sine_gain.py(uwb): 실측 |Γ| 이 선형 모델 예측의 0.9~1.1 배, 위상 ±10° (실제 코드 폐루프 ↔ 선형 모델 ↔ 분석 도구 3자 일치)",
+              0.9 <= _r["gain"] / _pr["gain"] <= 1.1 and abs(_r["phase_deg"] - _pr["phase_deg"]) <= 10.0,
+              f"측정 {_r['gain']:.3f}±{_r['gain_std']:.3f} @{_r['phase_deg']:+.0f}° 예측 {_pr['gain']:.3f} @{_pr['phase_deg']:+.0f}°")
+        _cons = _nn.analyze(_lg, t0=5.0, uwb_sigma=0.03)
+        check("정현파(sine) 로그 → analysis/nees_nis.py: RGB-D NIS n>500, 거리 NEES n>500 이고 잡음 없는 가짜 세계에서는 과소신뢰(NIS 평균 < 3, 잔차 σ ≤ 0.05 m) 로 판정",
+              _cons["nis"]["rgbd"]["n"] > 500 and _cons["range_nees"]["n"] > 500 and _cons["nis"]["rgbd"]["mean"] < 3.0 and _cons["range_nees"]["resid_std_m"] <= 0.05,
+              f"NIS n={_cons['nis']['rgbd']['n']} mean={_cons['nis']['rgbd']['mean']:.2f}; NEES n={_cons['range_nees']['n']} resid σ={_cons['range_nees']['resid_std_m']:.3f}")
+        _t, _u, _y = _ip.load_main_log(_path)
+        _id = _ip.fit_fopdt(_t, _u[:, 0], _y[:, 0])
+        check("정현파(sine) 로그 → analysis/identify_plant.py: 가짜 FC(τ 0.3 s, 10 Hz ZOH) 를 K 0.95~1.05, τ+L 0.25~0.45 s, fit > 95 % 로 되찾음",
+              0.95 <= _id["K"] <= 1.05 and 0.25 <= _id["t63_s"] <= 0.45 and _id["fit_pct"] > 95.0,
+              f"K={_id['K']:.3f} tau={_id['tau']:.3f} L={_id['L']:.3f} fit={_id['fit_pct']:.1f}%")
+        _last = _lg.rows[-1]
+        check("정현파(sine) 로그: 논문 분석에 필요한 열이 전부 있다 (t_mono, uwb.range_center_m, ekf.P_pos, reliability.gate_d2, control.body_vx, vehicle_state.local_position.vx)",
+              all(k in _last for k in ("t_mono", "uwb.range_center_m", "ekf.P_pos", "reliability.gate_d2", "control.body_vx", "vehicle_state.local_position.vx", "uwb.residual_m")),
+              f"keys={len(_last)}")
 elif ARGS.scenario == "lost_alt":
     check("안전(lost_alt): 영구 소실 뒤 HEARTBEAT 가 끊기면(30 s~) 모드를 모르므로 autonomous_land=1 이어도 FAILSAFE_LAND 에서 LAND 를 보내지 않는다",
           main.AUTONOMOUS_LAND and not [c for c in FC.mode_calls if c[2] == "LAND"] and state_at(36.0) in ("FAILSAFE_LAND", "WAIT_LEADER"),

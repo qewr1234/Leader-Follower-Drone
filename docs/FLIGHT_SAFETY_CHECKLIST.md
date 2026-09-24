@@ -126,6 +126,7 @@ for s in "tilt --level 0" tilt nan fc_stale "climb --frames 1900" "lost_alt --au
 | B-10 | RC failsafe 시험 | 위키 `radio-failsafe.rst` 의 Test #1~#3 (프롭 제거, 송신기 끔) — GCS HUD 에 "Radio Failsafe" 와 설정한 동작 | |
 | B-11 | 킬스위치 | `MOTOR_ESTOP` 스위치로 arm 상태에서 모터 정지 확인 | |
 | B-12 | 진동·호버 스로틀 | 위키 "First Flight with Copter" 의 진동 측정·호버 스로틀은 **조종사 단독 비행(F-0)** 에서 끝내 둔다 | |
+| B-13 | UWB 거리 GT (논문용, 선택) | `[STAT] uwb=` 가 10 Hz 로 갱신되고 정적 교정(EXPERIMENT_PROTOCOL 3절) 의 σ ≤ 0.10 m | GT 없이도 비행은 되지만 논문 데이터는 안 나온다 |
 
 ---
 

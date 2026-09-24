@@ -126,6 +126,24 @@ CONFIG = {
         "enabled": True,
         "log_dir": "logs",
     },
+    # ---- UWB 거리 GT (uwb_reader.py, docs/EXPERIMENT_PROTOCOL.md) — 로그 전용, 제어에 쓰지 않는다 ----
+    "uwb": {
+        "enabled": False,
+        # "serial": 후미 Jetson 에 붙인 UWB 모듈이 거리를 한 줄씩 찍는다 (권장 — ESP-NOW 링크와 독립)
+        # "leader_packet": 선두 ESP32 가 잰 거리를 텔레메트리 JSON 의 "uwb_range" 로 보낸다
+        "kind": "serial",
+        "port": os.environ.get("MARS_UWB_PORT", "/dev/ttyUSB1"),
+        "baud": 115200,
+        "unit": "m",                 # 모듈이 찍는 단위: m / cm / mm (줄에 단위가 있으면 그것이 우선)
+        "max_age_sec": 0.5,
+        "min_m": 0.2,
+        "max_m": 60.0,
+        # 후미 UWB 안테나 위치 (카메라 원점 기준 FRU, m) 와 선두 태그 위치 (선두 시각 중심 기준, 선두 FRU, m). 줄자로 재서 적는다.
+        "anchor_offset_fru": [0.0, 0.0, 0.0],
+        "tag_offset_leader_fru": [0.0, 0.0, 0.0],
+        # 정적 교정(docs/EXPERIMENT_PROTOCOL.md 3절) 으로 얻은 바이어스 [m] — 측정값에서 뺀다.
+        "bias_m": 0.0,
+    },
     # ---- 미션 정책 ----
     "mission": {
         # 자율 착륙(FAILSAFE_LAND / CONFIRMED_LANDING 에서 LAND 모드 송신). False(기본) 면 그 상태에서도 0 속도(위치 유지)를

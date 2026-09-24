@@ -33,6 +33,7 @@ from reliability import ReliabilityEstimator
 from scheduler import PerceptionScheduler
 from tracker import LeaderTracker
 from utils_geometry import bbox_center, clamp
+from uwb_reader import UwbRangeReceiver, UwbRange, uwb_block
 
 # ============================================================
 # 실행 설정
@@ -97,6 +98,11 @@ FORMATION_CFG = CONFIG.get("formation", {})
 FOLLOWER_ID = str(FORMATION_CFG.get("follower_id", "F1"))
 LEADER_ID = str(FORMATION_CFG.get("leader_id", "") or "")
 FF_SOURCE = str(FORMATION_CFG.get("ff_source", "vision"))     # "vision" | "broadcast" | "auto"
+
+# UWB 거리 GT (config uwb.*). 로그(uwb.*)에만 남기고 제어에는 절대 쓰지 않는다 — 추정기를 재는 자다.
+UWB_CFG = CONFIG.get("uwb", {})
+UWB_ENABLED = bool(UWB_CFG.get("enabled", False))
+UWB_KIND = str(UWB_CFG.get("kind", "serial"))
 
 SETPOINT_PERIOD_SEC = 0.10
 # 자율 착륙 정책 (config mission.autonomous_land). False(기본) 면 FAILSAFE_LAND / CONFIRMED_LANDING 에서도 모드를 바꾸지 않고
@@ -461,6 +467,29 @@ def fuse_esp32(ekf, rel, leader_meas):
             "r_esp_gps": r_esp_gps, "r_esp_time": r_esp_time}
 
 
+def open_uwb_receiver():
+    """UWB 시리얼 수신기. 장치·pyserial 이 없어도 None 으로 조용히 (GT 는 비행에 필수가 아니다)."""
+    if not UWB_ENABLED or UWB_KIND != "serial":
+        return None
+    rx = UwbRangeReceiver(port=UWB_CFG.get("port", "/dev/ttyUSB1"), baud=UWB_CFG.get("baud", 115200),
+                          unit=UWB_CFG.get("unit", "m"), min_m=UWB_CFG.get("min_m", 0.2), max_m=UWB_CFG.get("max_m", 60.0))
+    try:
+        rx.start()
+    except Exception as exc:
+        print(f"[WARN] UWB 비활성: {type(exc).__name__}: {exc}")
+        return None
+    return rx
+
+
+def _uwb_tag_offset_fru(rel_heading):
+    """선두 태그 오프셋(선두 FRU) 을 후미 FRU 로. 상대 heading 을 모르면 시선과 나란하다고 본다."""
+    off = np.asarray(UWB_CFG.get("tag_offset_leader_fru", (0.0, 0.0, 0.0)), dtype=float)
+    if rel_heading is None or not np.any(off):
+        return off
+    from formation import rotate_fru_about_up
+    return rotate_fru_about_up(off, float(rel_heading))
+
+
 def open_leader_receiver():
     """ESP32 수신기. 장치가 없거나 pyserial 이 없어도 예외를 내지 않고 None — 비전 단독으로 날아야 한다."""
     if not USE_LEADER_ESP32:
@@ -531,7 +560,8 @@ def build_log_row(s):
             "rel_vel_fru": lm.get("rel_vel_fru", np.zeros(3)), "rel_vel_cam": lm.get("rel_vel_cam", np.zeros(3)),
             **esp,
         },
-        "ekf": {"x": s["x_est"], "P_trace_pos": s["pos_cov_trace"], "mu": s["mu"], "coast_time": ekf.coast_time,
+        "ekf": {"x": s["x_est"], "P_trace_pos": s["pos_cov_trace"], "P_pos": s.get("P_pos", np.zeros(6)), "P_vel": s.get("P_vel", np.zeros(3)),
+                "mu": s["mu"], "coast_time": ekf.coast_time,
                 "range_coast_time": ekf.range_coast_time, "vision_range_coast_time": ekf.vision_range_coast_time,
                 "initialized": ekf.initialized, "reliable": ekf.is_reliable() if ekf.initialized else False},
         "relative_fru": dict(zip(("front", "right", "up"), s["rel_fru"]), **dict(zip(("v_front", "v_right", "v_up"), s["rel_vel_fru"]))),
@@ -541,6 +571,7 @@ def build_log_row(s):
                     "yaw_rate": cmd[3], "target_distance_m": s["target_distance_m"], "vision_range_ok": s["vision_range_ok"],
                     "ff_front": s["ff_fru"][0], "ff_right": s["ff_fru"][1], "ff_up": s["ff_fru"][2]},
         "formation": s.get("formation", {}),
+        "uwb": s.get("uwb", {"available": False}),
     }
 
 
@@ -581,6 +612,9 @@ def main():
           f"slot={(f'{formation_slot.slot_id} {formation_slot.frame} {formation_slot.offset}' if formation_slot else 'LOS(default)')} "
           f"ff_source={FF_SOURCE} level_by_attitude={LEVEL_BY_ATTITUDE}")
     leader_rx = open_leader_receiver()
+    uwb_rx = open_uwb_receiver()
+    if UWB_ENABLED:
+        print(f"[UWB] kind={UWB_KIND} {'serial ' + str(UWB_CFG.get('port')) if uwb_rx else ''} — 로그 전용(제어 미사용)")
     log = ExperimentLogger(CONFIG["logger"]["log_dir"]) if CONFIG["logger"]["enabled"] else None
 
     last_track = None
@@ -592,6 +626,7 @@ def main():
     prev_mission_state = None     # STATUSTEXT 는 상태가 바뀔 때만
     fwd_clear_m = None            # 전방 여유 거리 (원시 깊이)
     prev_fwd_stop = False
+    uwb_row = {"available": False}   # UWB GT 로그 블록 (STAT 이 직전 프레임 값을 찍는다)
     prev_fc_accepts = False       # GUIDED 진입 에지 검출용
     cam_fail_streak = fc_fail_streak = 0
     last_fused_rx_time = None     # 마지막으로 EKF 에 융합한 ESP32 패킷의 rx_time
@@ -677,6 +712,8 @@ def main():
                       f"vL={(float(np.linalg.norm(v_leader_fru)) if v_leader_fru is not None else float('nan')):.2f} "
                       f"ff={ff_fru[0]:+.2f}({ff_src}) slot={slot_label} hdg={heading_src} "
                       f"fwd={(fwd_clear_m if fwd_clear_m is not None else float('nan')):.1f}m "
+                      + (f"uwb={uwb_row.get('range_center_m', float('nan')):.2f}m(Δ{(uwb_row.get('residual_m') if uwb_row.get('residual_m') is not None else float('nan')):+.2f}) " if UWB_ENABLED else "")
+                      +
                       f"fresh=LP{int(local_pos_fresh)}/ATT{int(attitude_fresh)}/HB{int(fc_mode_known)} {stream_rates_text(now)}")
                 if SEND_MAVLINK_COMMANDS and not fc_accepts_setpoints:
                     print(f"[WARN] FC mode={fc_mode}: 송신 중단됨 (ArduPilot: GUIDED / PX4: OFFBOARD 필요)")
@@ -791,6 +828,17 @@ def main():
             esp_visible = bool(leader_meas.get("available", False))
             leader_vel_world = np.asarray(leader_meas["leader_vel_enu"], dtype=float) if esp_visible else None
 
+            # UWB 거리 GT — 로그에만. 시리얼이면 수신기, leader_packet 이면 텔레메트리 패킷의 uwb_range.
+            uwb_meas = None
+            if uwb_rx is not None:
+                uwb_meas = uwb_rx.read_latest()
+            elif UWB_ENABLED and UWB_KIND == "leader_packet" and leader_packet is not None and getattr(leader_packet, "uwb_range", None) is not None:
+                uwb_meas = UwbRange(range_m=float(leader_packet.uwb_range), rx_time=float(leader_packet.rx_time), seq=int(leader_packet.seq))
+            _uwb_bias = float(UWB_CFG.get("bias_m", 0.0))
+            if uwb_meas is not None and _uwb_bias != 0.0:      # 정적 교정 바이어스 (수신기 객체는 그대로 두고 복사본에 적용)
+                uwb_meas = UwbRange(range_m=uwb_meas.range_m - _uwb_bias, rx_time=uwb_meas.rx_time, seq=uwb_meas.seq,
+                                    quality=uwb_meas.quality, raw=uwb_meas.raw)
+
             # 미션의 "리더가 보인다" = 거리를 아는가. bbox 유무나 is_reliable()(bearing-only 로도 참)은 거리 관측을
             # 보장하지 않아 깊이가 죽어도 소실 판정이 안 나기 때문이다. RGB-D 와 ESP32 위치만 range_coast 를 되돌린다.
             leader_visible_for_mission = bool(ekf.has_range_fix())
@@ -829,6 +877,10 @@ def main():
             slot_err, slot_degraded = slot_error_fru(rel_fru, active_slot, rel_heading, follower_yaw,
                                                      min_distance=0.0 if vision_range_ok else TARGET_DISTANCE_GPS_ONLY_M)
             slot_label = active_slot.slot_id + ("~LOS" if slot_degraded else "")
+            uwb_row = uwb_block(uwb_meas, now, float(UWB_CFG.get("max_age_sec", 0.5)),
+                                rel_fru=(rel_fru if (ekf.initialized and ekf.is_reliable()) else None),
+                                anchor_offset_fru=UWB_CFG.get("anchor_offset_fru", (0.0, 0.0, 0.0)),
+                                tag_offset_fru=_uwb_tag_offset_fru(rel_heading), source=UWB_KIND) if UWB_ENABLED else {"available": False}
             # 피드포워드 소스: "vision" = 자기 속도 + EKF 상대 속도(기존), "broadcast" = 선두가 방송한 절대 속도(있을 때만),
             # "auto" = 방송이 있으면 방송, 없으면 vision. 방송이면 자기 속도 양성 되먹임 경로 자체가 없다 (STABILITY_MARGINS 7.2).
             ff_input, ff_src = v_leader_fru, "vision"
@@ -999,6 +1051,9 @@ def main():
                     rel_vel_fru=rel_vel_fru, vehicle_state=vehicle_state, gps_fresh=gps_fresh,
                     local_pos_fresh=local_pos_fresh, attitude_fresh=attitude_fresh, current_body_cmd=current_body_cmd,
                     target_distance_m=target_distance_m, vision_range_ok=vision_range_ok,
+                    P_pos=(P_est[:3, :3][np.triu_indices(3)] if ekf.initialized else np.zeros(6)),
+                    P_vel=(np.diag(P_est[3:6, 3:6]) if ekf.initialized else np.zeros(3)),
+                    uwb=uwb_row,
                     formation=dict(slot_id=active_slot.slot_id, frame=active_slot.frame, degraded_to_los=slot_degraded,
                                    rel_heading=rel_heading, heading_source=heading_src, slot_err_fru=slot_err,
                                    ff_source=ff_src))))
@@ -1018,7 +1073,8 @@ def main():
             print(f"[WARN] hold send failed: {exc}")
         # FC 소켓도 닫는다. 안 닫으면 udpin 포트를 계속 쥐고 있어 같은 프로세스에서 다시 연결할 때(SITL 하네스가
         # 시나리오마다 main 을 재실행) 새 소켓이 패킷을 못 받아 heartbeat 를 영원히 기다린다.
-        for closer in ((leader_rx.close if leader_rx is not None else None), cam.stop, getattr(master, "close", None)):
+        for closer in ((leader_rx.close if leader_rx is not None else None), (uwb_rx.close if uwb_rx is not None else None),
+                       cam.stop, getattr(master, "close", None)):
             try:
                 if closer:
                     closer()

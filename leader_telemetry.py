@@ -65,6 +65,7 @@ class LeaderPacket:
     raw: Optional[Dict[str, Any]] = None
     leader_id: str = ""           # 편대: 어느 리더의 패킷인가 (ArduPilot FOLL_SYSID 역할). 없으면 ""
     acc: Optional[tuple] = None   # 편대: 선두 가속도 (vx/vy/vz 와 같은 프레임). FOLLOW_TARGET.acc 대응. 없으면 None
+    uwb_range: Optional[float] = None   # 선두 UWB 가 잰 선두↔후미 거리 [m] (GT 전용, 제어 미사용). 없거나 비유한·0 이하면 None
 
 
 # ============================================================
@@ -300,6 +301,13 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
         leader_id = "" if leader_id is None else str(leader_id)
         _acc = [_get_any(d, keys, None) for keys in (("ax", "acc_x"), ("ay", "acc_y"), ("az", "acc_z"))]
         acc = None if any(a is None for a in _acc) else tuple(float(a) for a in _acc)
+        _uwb = _get_any(d, ["uwb_range", "uwb", "range_uwb", "uwb_m"], None)
+        try:
+            uwb_range = None if _uwb is None else float(_uwb)
+        except (TypeError, ValueError):
+            uwb_range = None
+        if uwb_range is not None and not (math.isfinite(uwb_range) and uwb_range > 0.0):
+            uwb_range = None          # 거리 필드가 나빠도 패킷은 살린다 (GT 는 부가 정보)
 
         return LeaderPacket(
             timestamp=timestamp,
@@ -318,6 +326,7 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
             raw=d,
             leader_id=leader_id,
             acc=acc,
+            uwb_range=uwb_range,
         )
 
     except Exception:

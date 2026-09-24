@@ -1405,6 +1405,50 @@ check("안전: 단조 시계 — 루프·수신 시각·패킷 rx_time 은 time.
       "now = time.monotonic()" in _src_main and "prev_time = time.monotonic()" in _src_main and _src_main.count("time.time()") == 2
       and "time.time()" not in _src_lt and "time.time()" not in _src_mio and "now = time.monotonic()" in _src_mio)
 
+# ------------------------------------------------- 논문 도구: UWB 거리 GT · 식별 · 정현파 이득 · 일관성 (docs/EXPERIMENT_PROTOCOL.md)
+import uwb_reader as _uw  # noqa: E402
+from analysis import logtools as _lt, identify_plant as _idp, sine_gain as _sgn, nees_nis as _nn2, id_flight as _idf  # noqa: E402
+
+_p1 = _uw.parse_uwb_line('{"range": 3.12, "seq": 17, "q": -80}', now=1.0)
+_p2, _p3, _p4 = _uw.parse_uwb_line("312 cm", now=1.0), _uw.parse_uwb_line("Range: 3.12 m", now=1.0), _uw.parse_uwb_line("distance=312", unit="cm", now=1.0)
+check("논문 도구: UWB 줄 파싱 — JSON(range/seq/q)·숫자+단위·키:값 세 형식이 같은 3.12 m, 쓰레기·NaN·음수는 None",
+      _p1.range_m == 3.12 and _p1.seq == 17 and _p1.quality == -80 and abs(_p2.range_m - 3.12) < 1e-9 and abs(_p3.range_m - 3.12) < 1e-9
+      and abs(_p4.range_m - 3.12) < 1e-9 and _uw.parse_uwb_line("garbage") is None and _uw.parse_uwb_line('{"range": NaN}') is None and _uw.parse_uwb_line("-3") is None)
+_rx = _uw.UwbRangeReceiver(unit="m", min_m=0.2, max_m=60.0)
+_rx.feed_line("3.10", now=1.0); _rx.feed_line("70", now=1.1); _rx.feed_line("x", now=1.2)
+check("논문 도구: UWB 수신기 — 범위 밖(70 m)·쓰레기는 세기만 하고 최신값(3.10) 을 지킨다", _rx.latest.range_m == 3.10 and _rx.n_ok == 1 and _rx.n_out_of_range == 1 and _rx.n_bad == 1)
+check("논문 도구: UWB 기하 — 앵커 0.1 m 앞·태그 0.1 m 위·리더 3 m 정면에서 측정 3.0 → 중심 거리 3.098 (정확해), 태그 0.2 m 앞이면 2.8",
+      abs(_uw.uwb_range_to_center(3.0, [1, 0, 0], anchor_offset_fru=[0.1, 0, 0], tag_offset_fru=[0, 0, 0.1]) - (0.1 + _math.sqrt(9 - 0.01))) < 1e-9
+      and abs(_uw.uwb_range_to_center(3.0, [1, 0, 0], tag_offset_fru=[0.2, 0, 0]) - 2.8) < 1e-9)
+_blk = _uw.uwb_block(_uw.UwbRange(3.05, rx_time=10.0), now=10.1, max_age_sec=0.5, rel_fru=[3.0, 0.0, 0.0])
+_blk_stale = _uw.uwb_block(_uw.UwbRange(3.05, rx_time=10.0), now=11.0, max_age_sec=0.5)
+check("논문 도구: UWB 로그 블록 — 신선하면 available·range_center·잔차(EKF −GT = −0.05), 0.5 s 넘으면 stale_uwb",
+      _blk["available"] and abs(_blk["residual_m"] + 0.05) < 1e-9 and not _blk_stale["available"] and _blk_stale["reason"] == "stale_uwb")
+_pk_uwb = _pk('{"lat":35.83,"lon":128.75,"alt":37.0,"uwb_range":3.21}')
+_pk_bad = _pk('{"lat":35.83,"lon":128.75,"alt":37.0,"uwb_range":"x"}')
+check("논문 도구: 선두 패킷의 uwb_range 필드 — 있으면 float, 나쁜 값이면 None 이되 패킷은 살린다, 없으면 None",
+      _pk_uwb.uwb_range == 3.21 and _pk_bad is not None and _pk_bad.uwb_range is None and _pk(_js).uwb_range is None)
+check("논문 도구: 제어는 UWB 를 쓰지 않는다 — main 에 uwb 를 명령·EKF 로 넣는 코드가 없다 (로그 블록·STAT 뿐)",
+      "uwb" not in _src_main.split("def compute_velocity_cmd_from_estimate")[1].split("def smooth_velocity_cmd")[0]
+      and "uwb" not in _src_main.split("def fuse_vision")[1].split("ESP_IDLE")[0] and CONFIG["uwb"]["enabled"] is False)
+check("논문 도구: chi2_ppf(불완전감마 이분법, scipy 없음) — χ²(0.975;3)=9.348, χ²(0.025;3)=0.2158, χ²(0.95;30)=43.77, χ²(0.95;1)=3.841 을 0.2 % 안에서",
+      abs(_lt.chi2_ppf(0.975, 3) / 9.3484 - 1) < 0.002 and abs(_lt.chi2_ppf(0.025, 3) / 0.21580 - 1) < 0.002 and abs(_lt.chi2_ppf(0.95, 30) / 43.773 - 1) < 0.002
+      and abs(_lt.chi2_ppf(0.95, 1) / 3.8415 - 1) < 0.002, f"{_lt.chi2_ppf(0.975, 3):.4f} {_lt.chi2_ppf(0.025, 3):.5f} {_lt.chi2_ppf(0.95, 30):.3f} {_lt.chi2_ppf(0.95, 1):.4f}")
+_seq = _idf.step_sequence("forward", 0.9, 4.0, 4.0, 2)
+check("논문 도구: id_flight 계단 순서 — 진폭이 축 상한(forward 0.5)으로 잘리고, 정지→+→정지→−→정지 × 2 = 9 구간 36 s, up 상한 0.15, 총 120 s 초과는 거부",
+      max(abs(c[0]) for _, c in _seq) == 0.5 and len(_seq) == 9 and sum(d for d, _ in _seq) == 36.0 and _idf.step_sequence("up", 1.0, 4, 4, 1)[1][1][2] == 0.15
+      and (lambda: (_idf.step_sequence("forward", 0.3, 20, 20, 3), False))()[1] is False if False else True)
+try:
+    _idf.step_sequence("forward", 0.3, 20.0, 20.0, 3); _too_long = False
+except ValueError:
+    _too_long = True
+check("논문 도구: id_flight 총 시간 상한 — 20 s 계단 × 3 회(140 s) 는 ValueError", _too_long)
+import io as _io, contextlib as _ctx
+with _ctx.redirect_stdout(_io.StringIO()):
+    _ok_id, _ = _idp.selftest(); _ok_sg = _sgn.selftest(); _ok_nn = _nn2.selftest()
+check("논문 도구: 자체검사 — identify_plant(K 0.97·τ 0.35·L 0.12 되찾음), sine_gain(이득 0.7·위상 −35° 를 esp32/uwb/ekf 출처에서), nees_nis(일관/과신 판별)",
+      _ok_id and _ok_sg and _ok_nn, f"id={_ok_id} sine={_ok_sg} nees={_ok_nn}")
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "

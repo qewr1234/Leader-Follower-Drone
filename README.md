@@ -314,5 +314,6 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 - [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) — 바깥 루프 선형 모델, 위상·이득 여유, 스트링 안정성, 체인 시뮬레이션, 개선안
 - [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 86개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
 - [docs/FLIGHT_SAFETY_CHECKLIST.md](docs/FLIGHT_SAFETY_CHECKLIST.md) — 실비행 안전 점검서: ArduCopter 소스로 확인한 FC 동작, FC 파라미터, 지상 점검 12항목, 단계별 비행 계획, 남은 위험
+- [docs/EXPERIMENT_PROTOCOL.md](docs/EXPERIMENT_PROTOCOL.md) — 논문(AST)용 비행 캠페인: UWB 거리 GT 장비·교정, 실험 카드 E1~E7, 분석 도구(`analysis/id_flight.py`·`identify_plant.py`·`sine_gain.py`·`nees_nis.py`), go/no-go 기준
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
 - [docs/images/README.md](docs/images/README.md) — README 그림 파일과 수정 방법
