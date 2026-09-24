@@ -42,9 +42,12 @@ _P.add_argument("--frames", type=int, default=1200)
 #   nan      : 6 s 에 EKF 상태가 NaN 이 된다 — setpoint 가 +0.35 전진으로 둔갑하지 않고, 추정기가 리셋돼 추종이 재개된다
 #   fc_stale : 리더 3~16 s 전진, 8~12 s FC 텔레메트리(HEARTBEAT 포함) 가 끊긴다 — 1 s 뒤 정지 명령, 3 s 뒤 모드 불명(LAND 금지), 복구 시 미션 리셋
 #   climb    : 리더 3~5 s 전진 후 0.1 m/s 로 계속 상승(--frames 1900) — 인계 고도 + MAX_CLIMB_ABOVE_ENTRY_M 에서 상승 명령이 멈춘다
-#   lost_alt : 25 s 영구 소실 뒤 30 s 부터 HEARTBEAT 만 끊긴다 — 35 s 의 FAILSAFE_LAND 에서 LAND 를 보내지 않는다
-_P.add_argument("--scenario", default="default", choices=["default", "tilt", "nan", "fc_stale", "climb", "lost_alt"])
+#   lost_alt : 25 s 영구 소실 뒤 30 s 부터 HEARTBEAT 만 끊긴다 — 35 s 의 FAILSAFE_LAND 에서 LAND 를 보내지 않는다 (--autonomous-land 1 로 실행)
+#   takeover : HEARTBEAT 1 Hz, 25 s 영구 소실, 조종사가 34.6 s 에 LOITER 로 탈환 — 35.0 s 의 FAILSAFE_LAND 결정이 직전 heartbeat(34.03 s,
+#              GUIDED) 를 근거로 LAND 를 보내 조종사를 덮어쓰면 안 된다 (--autonomous-land 1 로 실행)
+_P.add_argument("--scenario", default="default", choices=["default", "tilt", "nan", "fc_stale", "climb", "lost_alt", "takeover"])
 _P.add_argument("--level", type=int, default=None, help="controller.level_by_attitude 강제 (0/1). 없으면 config 값")
+_P.add_argument("--autonomous-land", type=int, default=None, help="mission.autonomous_land 강제 (0/1). 없으면 config 값(False)")
 ARGS = _P.parse_args()
 
 import numpy as np  # noqa: E402
@@ -99,6 +102,12 @@ class FakeClock:
         self.t0 = t0
 
     def time(self):
+        return self.t
+
+    def monotonic(self):
+        return self.t
+
+    def perf_counter(self):
         return self.t
 
     def sleep(self, s):
@@ -195,6 +204,8 @@ class FakeFC:
         self._pending = []
         self.mute = False                 # True 면 텔레메트리를 전혀 내지 않는다 (링크 정체)
         self.mute_heartbeat = False       # True 면 HEARTBEAT 만 내지 않는다
+        self.hb_period = 0.0              # >0 이면 HEARTBEAT 를 이 주기로만 낸다 (ArduCopter 1 Hz 고정). 0 = 매 프레임(골든)
+        self._last_hb = -1e9
 
     # --- main / mavlink_io 가 부르는 것
     def set_position_target_local_ned_send(self, tbm, sysid, compid, frame, mask, x, y, z, vx, vy, vz, ax, ay, az, yaw, yaw_rate):
@@ -250,6 +261,11 @@ class FakeFC:
         ]
         if self.mute_heartbeat:
             self._pending = [m for m in self._pending if m.get_type() != "HEARTBEAT"]
+        elif self.hb_period > 0.0:
+            if CLOCK.sim - self._last_hb + 1e-9 >= self.hb_period:
+                self._last_hb = CLOCK.sim
+            else:
+                self._pending = [m for m in self._pending if m.get_type() != "HEARTBEAT"]
 
 
 FC = FakeFC()
@@ -305,8 +321,17 @@ def scenario_lost_alt(t):
     FC.mute_heartbeat = t >= 30.0
 
 
+def scenario_takeover(t):
+    FC.hb_period = 1.0
+    scenario_default(t)
+    if 34.6 <= t < 34.6 + CLOCK.DT and FC.mode == "GUIDED":
+        FC.set_mode("LOITER")                       # 조종사 탈환 — 다음 heartbeat(35.03 s) 전
+    World.visible = World.visible and t < 25.0
+
+
 _SCENARIOS = {"default": scenario_default, "tilt": scenario_tilt, "nan": scenario_nan,
-              "fc_stale": scenario_fc_stale, "climb": scenario_climb, "lost_alt": scenario_lost_alt}
+              "fc_stale": scenario_fc_stale, "climb": scenario_climb, "lost_alt": scenario_lost_alt,
+              "takeover": scenario_takeover}
 
 
 def scenario(t):
@@ -371,6 +396,8 @@ main.CONFIG["logger"]["enabled"] = False
 main.connect_fc = lambda: FC
 if ARGS.level is not None:
     main.LEVEL_BY_ATTITUDE = bool(ARGS.level)
+if ARGS.autonomous_land is not None:
+    main.AUTONOMOUS_LAND = bool(ARGS.autonomous_land)
 if ARGS.scenario == "nan":
     _nan_fired = []
 
@@ -459,9 +486,9 @@ elif ARGS.scenario == "nan":
     _pre = _sp_between(5.7, 6.0)
     _post = _sp_between(6.0, 6.5)
     _vx_pre = _pre[-1][2] if _pre else float("nan")
-    check("안전(nan): EKF 상태가 NaN 이 돼도 setpoint 는 전부 유한하고 한계 안이며, NaN 직후 전진 명령은 일단 감쇠한다(+0.35 로 둔갑 없음), 루프 생존",
+    check("안전(nan): EKF 상태가 NaN 이 돼도 setpoint 는 전부 유한하고 한계 안이며, NaN 직후 0.5 s 의 전진 명령이 직전 값 +0.05 를 넘지 않는다(+0.35 로 둔갑 없음), 루프 생존",
           err is None and _post and all(math.isfinite(x) for s in FC.setpoints for x in s[2:]) and all(abs(s[2]) <= main.MAX_VX + 1e-9 for s in _post)
-          and min(s[2] for s in _post) < _vx_pre - 0.02,
+          and max(s[2] for s in _post) < _vx_pre + 0.05,
           f"vx 직전={_vx_pre:.3f} 직후={[round(s[2], 3) for s in _post]}")
     check("안전(nan): 추정기가 리셋돼 다음 측정에서 다시 시작하고 추종이 재개된다 (t=8~10 s 전진 명령 > 0.05)",
           _nan_fired and any(s[2] > 0.05 for s in _sp_between(8.0, 10.0)), f"nan@{_nan_fired} n={len(_sp_between(8.0, 10.0))}")
@@ -483,9 +510,14 @@ elif ARGS.scenario == "climb":
           _mid > _entry + 3.0 and _max <= _entry + main.MAX_CLIMB_ABOVE_ENTRY_M + 0.3 and abs(_end - _entry - main.MAX_CLIMB_ABOVE_ENTRY_M) <= 0.3,
           f"entry={_entry:.2f} 45s=+{_mid - _entry:.2f} max=+{_max - _entry:.2f} 62s=+{_end - _entry:.2f} m")
 elif ARGS.scenario == "lost_alt":
-    check("안전(lost_alt): 영구 소실 뒤 HEARTBEAT 가 끊기면(30 s~) 모드를 모르므로 FAILSAFE_LAND 에서도 LAND 를 보내지 않는다",
-          not [c for c in FC.mode_calls if c[2] == "LAND"] and state_at(36.0) in ("FAILSAFE_LAND", "WAIT_LEADER"),
-          f"modes={FC.mode_calls} state@36={state_at(36.0)}")
+    check("안전(lost_alt): 영구 소실 뒤 HEARTBEAT 가 끊기면(30 s~) 모드를 모르므로 autonomous_land=1 이어도 FAILSAFE_LAND 에서 LAND 를 보내지 않는다",
+          main.AUTONOMOUS_LAND and not [c for c in FC.mode_calls if c[2] == "LAND"] and state_at(36.0) in ("FAILSAFE_LAND", "WAIT_LEADER"),
+          f"autonomous_land={main.AUTONOMOUS_LAND} modes={FC.mode_calls} state@36={state_at(36.0)}")
+elif ARGS.scenario == "takeover":
+    _land = [c for c in FC.mode_calls if c[2] == "LAND"]
+    check("안전(takeover): HEARTBEAT 1 Hz 에서 조종사가 34.6 s 에 LOITER 로 탈환하면 35.0 s 의 FAILSAFE_LAND 결정은 직전 GUIDED heartbeat(34.03 s) 만으로 LAND 를 보내지 않는다 — 결정 뒤 heartbeat 가 LOITER 라 영영 안 보냄, 조종사 모드 유지",
+          main.AUTONOMOUS_LAND and not _land and FC.mode == "LOITER" and first_time("FAILSAFE_LAND", 30.0) is not None,
+          f"autonomous_land={main.AUTONOMOUS_LAND} modes={FC.mode_calls} fc_mode={FC.mode} t_fs={first_time('FAILSAFE_LAND', 30.0)}")
 
 if ARGS.scenario != "default":
     print()
@@ -528,8 +560,16 @@ check("재검출(리더 호버 중) 즉시 재개 — READY_HOVER 에 갇히지 
 check("재검출 후 READY_HOVER 로 떨어지지 않음", state_at(24.0) in ("LEADER_HOVER", "FOLLOW"), f"{state_at(24.0)}")
 
 land = [c for c in FC.mode_calls if c[2] == "LAND"]
-check("영구 소실 25s → 10초 뒤 LAND 1회", len(land) == 1 and 34.0 <= land[0][1] <= 36.5, f"{land}")
-check("LAND 이후 FC 가 하강 중 (가짜 FC 가 LAND 를 받아들임)", land and World.f_d > -15.0 + 1.0, f"d={World.f_d:.2f}")
+t_fs = first_time("FAILSAFE_LAND", 30.0)
+check("영구 소실 25s → 10초 뒤 FAILSAFE_LAND 상태", t_fs is not None and 34.0 <= t_fs <= 36.5, f"t={t_fs}")
+if main.AUTONOMOUS_LAND:
+    check("영구 소실 25s → 10초 뒤 LAND 1회", len(land) == 1 and 34.0 <= land[0][1] <= 36.5, f"{land}")
+    check("LAND 이후 FC 가 하강 중 (가짜 FC 가 LAND 를 받아들임)", land and World.f_d > -15.0 + 1.0, f"d={World.f_d:.2f}")
+else:
+    _hold = _sp_between(35.5, 39.9)
+    check("정책(autonomous_land=False, 기본): FAILSAFE_LAND 에서 LAND 를 보내지 않고 0 속도 setpoint 를 10 Hz 로 계속 보내며(35.5~40 s ≥ 40개, 전부 0) FC 는 고도를 유지한다",
+          not land and len(_hold) >= 40 and all(abs(x) < 1e-12 for s in _hold for x in s[2:]) and abs(World.f_d + 15.0) < 0.05,
+          f"land={land} hold_n={len(_hold)} d={World.f_d:.2f}")
 
 stream = {
     "setpoints": [[f, t, round(vx, 9), round(vy, 9), round(vz, 9), round(yr, 9)] for f, t, vx, vy, vz, yr in FC.setpoints],

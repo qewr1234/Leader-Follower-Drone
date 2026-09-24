@@ -209,6 +209,8 @@ class RelativeHeadingEstimator:
             v = np.asarray(leader_vel_fru, dtype=float)
             if v.size >= 2 and math.hypot(float(v[0]), float(v[1])) >= self.min_speed:
                 dpsi, src = math.atan2(float(v[1]), float(v[0])), "velocity"
+        if dpsi is not None and not math.isfinite(dpsi):
+            dpsi = None          # 방송 yaw 가 NaN/inf 면 없는 것으로 (hold 로도 남기지 않는다)
         if dpsi is not None:
             self.last, self.last_t, self.source = dpsi, float(now), src
             return dpsi, src

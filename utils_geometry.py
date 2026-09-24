@@ -2,10 +2,19 @@
 utils_geometry.py — 좌표/ROI/기하 유틸
 """
 
+import math
+
 import numpy as np
 
 
 def clamp(x, lo, hi):
+    """[lo, hi] 로 자른다. NaN/inf 는 0 을 같은 범위로 자른 값을 돌려준다.
+
+    Python 의 max/min 은 NaN 비교가 False 라 `max(lo, min(hi, nan))` = hi — 속도 명령에서는 NaN 이 **상한 전진** 이 된다.
+    (docs/FLIGHT_SAFETY_CHECKLIST.md G1). 명령 축은 대칭 한계라 0 = 정지."""
+    x = float(x)
+    if not math.isfinite(x):
+        return max(lo, min(hi, 0.0))
     return max(lo, min(hi, x))
 
 

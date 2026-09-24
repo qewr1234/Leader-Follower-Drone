@@ -20,14 +20,26 @@
 | G4 | 고도를 모를 때(LOCAL_POSITION 없음) 하강 명령 허용 | 고도 미상 → 하강 차단 (`MIN_AGL_M` 분기 확장) | UT `안전: 상수` |
 | G5 | 트래커가 높은 물체를 물거나 리더 고도 오추정 → 끝없이 상승 | `MAX_CLIMB_ABOVE_ENTRY_M` 5 m — 인계 고도 + 5 m 천장 | CL `안전(climb)` |
 | G6 | 기체가 기울면(맞바람·가감속) 같은 고도 리더에 상하 명령 — pitch −10° 에 vz −0.092, 팔로워가 D·tan10° = 0.52 m 위로 올라가 정착 | `controller.level_by_attitude` 기본값 **True** 로 전환 | CL `안전(tilt, 수평화 OFF)` (결함 재현) / `안전(tilt, 수평화 ON)` (Δalt 0.005 m) |
+| G7 | **G1 의 구멍**: 제어기 입력(피드포워드·상대 상태·슬롯 오차)의 NaN 은 `compute_velocity_cmd_from_estimate` 안의 `clamp` 가 먼저 +0.35 로 바꿔 `sanitize_cmd` 가 볼 수 없었다 (재현: `ff=[nan,0,0] → [0.35, 0, 0, 0]`) | `utils_geometry.clamp` 가 NaN/inf 를 0 으로 자름 + 제어기 입력 검증(정지) + 카메라 뒤(front ≤ 0) 추정이면 정지 + `self_velocity_lpf`·heading 추정기 NaN 고정 방지 | UT `안전: clamp` / `안전: 제어기 입력 검증` / `안전: self_velocity_lpf` / `안전: 상대 heading` |
+| G8 | 리더 텔레메트리 JSON 의 `Infinity`/`NaN`/`1e999` 를 `json.loads` 가 받아들여 피드포워드가 NaN 으로 **영구 고정**(inf−inf) → 상한 전진 (`ff_source=broadcast` 설정에서). 단위 오류(cm/s) 속도 힌트가 IMM 을 끌고 가 카메라 관측이 게이트 밖으로 밀려 교정 불가 | 비유한·20 m/s 초과 패킷 폐기, 속도 힌트 20 m/s 상한 | UT `안전: parse_leader_json` / `안전: 속도 힌트 상한` |
+| G9 | 속이 빈 드론 기체를 옆에서 보면 bbox 안쪽 55 % 영역의 절반 이상이 배경 → 깊이 **중앙값이 배경(8 m)** → "멀다" → 전속 전진. MAD 는 최대 0.35 라 0.5 문턱을 못 넘고, χ² 게이트는 5.1 s 뒤 그 값을 받아들인다 | 가장 가까운 깊이 무리(0.10 m 빈, 시작 문턱 max(5 %, 30 px)) 의 중앙값. 단단한 표적은 동일 | UT `안전: nearest-mode 깊이` (15~45 % 기체에서 3.0 m; 단순 중앙값은 8 m) |
+| G10 | 추적과 무관한 충돌 방벽이 없었다 — 리더가 다가오거나 사람이 끼어들어도 추정에만 의존 | 원시 깊이 중앙 영역의 40 번째 근접 표본 < 1.2 m 면 전진 차단 (`FORWARD_STOP_M`) | UT `안전: 전방 여유` |
+| G11 | **자율 LAND 가 양성 상황에서도 엉뚱한 곳에 착륙**: 느린 리더(< 0.25 m/s 는 출발 확인이 안 돼 READY_HOVER 로 깊이창 밖으로 걸어 나감 → 60 s 에 LAND), 사람 리더가 앉음(z<0.65·하강·정지 → 16 s 에 착륙 판정), EKF 원점 1 m 오차(1.6 m 에서 리더가 0.45 m 내려오면 착륙 판정), 하늘 배경 깊이 10 s 소실 | `mission.autonomous_land` 정책, **기본 False** = 0 속도 유지 + STATUSTEXT. 조종사가 착륙한다 | CL `정책(autonomous_land=False` |
+| G12 | **조종사 탈환 경주**: heartbeat 는 1 Hz 고정이라 조종사가 LOITER 로 바꾼 뒤 최대 1 s 동안 컴패니언은 GUIDED 로 알고 LAND 를 보내 조종사를 덮어쓴다. 2 s 재시도는 조종사가 잠깐 되찾은 GUIDED 도 덮어썼다 | LAND 는 결정당 1회, **결정 뒤에 받은 heartbeat 가 GUIDED** 일 때만. 재시도 없음(먹지 않으면 FC 가 GUID_TIMEOUT 뒤 위치 유지) | CL `안전(takeover)` (1 Hz heartbeat, 34.6 s 탈환 → LAND 0회) |
+| G13 | 벽시계(`time.time()`) 로 dt·소실 타이머를 재서 NTP/chrony 가 +10 s 튀면 그 프레임에 FAILSAFE_LAND | 내부 시계 `time.monotonic()` (벽시계는 MAVLink time_boot_ms 와 로그에만) | UT `안전: 단조 시계` |
+| G14 | 검출기(TensorRT)·스케줄러 예외, 자세 inf(`math.cos(inf)`) 가 루프를 죽여 조종사 모르게 컴패니언이 사라짐. 'l' 키가 조종사 모드를 덮어씀. 종료 시 정지 1회가 유실되면 FC 가 마지막 속도를 3 s 유지 | 예외 격리(미검출·전체 프레임), 자세 유한성 검사, 'l' 은 GUIDED·모드 기지일 때만, 'v' 끄기 전 정지, 종료 시 정지 3회 + STATUSTEXT, 미션 상태 변화마다 STATUSTEXT | UT `안전: STATUSTEXT`, INSPECT |
+| G15 | ATTITUDE 10 Hz 라 25~30 fps 의 프레임 3개 중 2개가 같은 자세를 보고 계단식으로 튄다(돌풍 pitch ±10°/0.7 Hz: 0.15~0.39 m 위치·최대 0.58 m/s 가짜 리더 속도). 자세가 0.3 s 정체되면 그 사이 회전을 영영 안 보정 | `MAV_CMD_SET_MESSAGE_INTERVAL` 로 ATTITUDE 30 Hz, 정체 뒤 첫 신선한 자세에서 누적 회전 보정 | UT `안전: ATTITUDE 30 Hz` |
+| G16 | ESP32 상대위치를 오래된 yaw 로 회전; 원거리 깊이(8~10 m, σ 0.3~0.4 m) 를 σ 0.25 로 과신; bbox 가 프레임 가장자리에 잘리면 중심이 치우침; 한 프레임 놓친 사이 다른 거리의 사람이 트랙을 가져감; `set_region_of_interest` 가 초당 ~140 ms 스톨 가능 | yaw 0.3 s 신선도 게이트, σ_z = max(0.25, 0.006 z²), `truncated` 신뢰도 ×0.6, 회복 시 bbox 크기 비 1.3 게이트, `ae_roi_follow_track` 기본 False + 5 ms 초과 경고 | UT `안전: 팔로워 자세 신선도` / `안전: 스테레오 R` / `안전: 트래커 크기 게이트` |
 
-기존 폐루프 골든 스트림(`test_closed_loop.py --compare`)은 **바이트 단위로 동일**합니다 — 정상 비행 경로의 명령은 하나도
-바뀌지 않았고, 위 방벽은 비정상 상황에서만 작동합니다. 단위 155 개 · 폐루프 22 개 · 요구도 74 개(추적 0 오류).
+폐루프 골든 스트림(`test_closed_loop.py --compare`)은 35 s 의 착륙 결정까지 **351 개 setpoint 전부 바이트 단위로 동일**하고,
+그 뒤만 정책대로(LAND 대신 0 속도 유지) 달라집니다 — 정상 비행 경로의 명령은 바뀌지 않았고 방벽은 비정상 상황에서만 작동합니다.
+단위 169 개 · 폐루프 25 개(시나리오 8 종) · 요구도 86 개(추적 0 오류).
 
 ```bash
 python3 test_fixes.py
-python3 test_closed_loop.py                      # 골든 (기본 시나리오)
-for s in "tilt --level 0" tilt nan fc_stale "climb --frames 1900" lost_alt; do python3 test_closed_loop.py --scenario $s; done
+python3 test_closed_loop.py                      # 골든 (기본 시나리오, autonomous_land=False)
+python3 test_closed_loop.py --autonomous-land 1  # 예전 정책: 35 s 에 LAND 1회
+for s in "tilt --level 0" tilt nan fc_stale "climb --frames 1900" "lost_alt --autonomous-land 1" "takeover --autonomous-land 1"; do python3 test_closed_loop.py --scenario $s; done
 ```
 
 ---
@@ -107,8 +119,8 @@ for s in "tilt --level 0" tilt nan fc_stale "climb --frames 1900" lost_alt; do p
 | B-3 | **기울임 점검** (수평화 부호) | 정지 표적을 3 m 정면 같은 높이에 두고 기체 기수를 손으로 10° 내린다(앞으로 숙임). HUD `rel F/R/U` 의 U 가 **±0.1 m 안에 머물고** `cmd vz` 가 ±0.02 안. `level_by_attitude=False` 로 바꿔 다시 하면 U ≈ +0.5 m, vz ≈ −0.09 가 나와야 한다(부호 규약 확인). 우측으로 10° 기울여도 R 이 그대로 | 부호가 반대면(기울일수록 U 가 커짐) ATTITUDE pitch 부호 확인 — 기수 하향이 음수여야 한다(MAVLink 규약). 해결 전 비행 금지 |
 | B-4 | 명령 방향 | 표적을 앞뒤로 1 m 옮길 때 `cmd vx` 부호(멀어지면 +), 좌우로 옮길 때 `vy` 와 `yr` 부호(오른쪽이면 +), 위로 들면 `vz` 음수 | SITL 로 검증된 체인이지만 카메라 장착 방향이 바뀌면 깨진다 |
 | B-5 | 표적 신원 | 시야에 사람이 둘 있을 때 어느 쪽을 무는지(`_choose_initial` 은 면적×신뢰도 최대). **비행장에 리더 외 사람이 시야에 없게 운영** | 검출 클래스 `person` 인 동안은 운영으로 막는 수밖에 없다 (4절) |
-| B-6 | 깊이 상식 검사 | 표적 2 / 3 / 5 m 에서 HUD `raw=` 와 `est=` 가 줄자와 ±0.15 m. `rD`(깊이 신뢰도) > 0.5 | 하늘 배경·역광에서 `raw=N/A` 가 잦으면 4절의 깊이 소실 시간 참고 |
-| B-7 | FPS | `MARS_SHOW_WINDOW=0`, `sudo nvpmodel -m 0 && sudo jetson_clocks` 뒤 `[STAT] FPS=` ≥ 25 를 60 초. `[YOLO] backend=TensorRT device=cuda:0` | `.pt` 폴백·CPU 면 README 배포 절 |
+| B-6 | 깊이 상식 검사 | 표적 2 / 3 / 5 m 에서 HUD `raw=` 와 `est=` 가 줄자와 ±0.15 m. `rD`(깊이 신뢰도) > 0.5. **드론 표적이면** 3 / 5 / 8 m 를 하늘·나무 배경 각각에서 30 s 씩 기록해 로그 `measurement.depth_valid_count`·`depth_m` 분포 확인(4.2). `fwd=` 가 손을 1 m 앞에 대면 1.0 근처로 떨어지고 `[WARN] 전방 … 차단` 이 찍힘 | 하늘 배경·역광에서 `raw=N/A` 가 잦으면 4절의 깊이 소실 시간 참고 |
+| B-7 | FPS | `MARS_SHOW_WINDOW=0`, `sudo nvpmodel -m 0 && sudo jetson_clocks` 뒤 `[STAT] FPS=` ≥ 25 를 60 초. `[YOLO] backend=TensorRT device=cuda:0`. `rx[Hz] ATT=30` 확인(30 Hz 요청이 먹었는지). `ae_roi_follow_track` 을 켜 보고 `[CAM] AE ROI 설정 … ms` 경고가 나오면 끈 채로 비행 | `.pt` 폴백·CPU 면 README 배포 절 |
 | B-8 | 소실·착륙 로직 | 표적을 가리고 `mission=LOST_HOLD` → 10 s 뒤 `FAILSAFE_LAND` 와 `[FC] set mode: LAND` 가 **CMD=DRY 에서는 나가지 않음** 확인. 이후 CMD ON + 조종기 LOITER 상태에서 같은 시험 → LAND 가 **안 나감**(C2) | |
 | B-9 | 헤드리스·종료 | `q` 로 종료 시 `[SYS] shutdown` 뒤 hold 1회. SSH 끊김 시 프로세스가 죽지 않게 `nohup`/`systemd` 또는 `tmux` 로 실행 | SSH 세션이 죽으면 컴패니언도 죽는다 → 3 s 뒤 호버(1절) 이지만 그 뒤 추종은 없다 |
 | B-10 | RC failsafe 시험 | 위키 `radio-failsafe.rst` 의 Test #1~#3 (프롭 제거, 송신기 끔) — GCS HUD 에 "Radio Failsafe" 와 설정한 동작 | |
@@ -117,15 +129,92 @@ for s in "tilt --level 0" tilt nan fc_stale "climb --frames 1900" lost_alt; do p
 
 ---
 
-## 4. 인지·FPS·바람 (검토 결과 반영 — 아래 절은 검토 보고 뒤 채움)
+## 4. 인지 · FPS · 바람
 
-(작성 중)
+세 질문("25 FPS 가 나오나", "잘 탐지하나 — 특히 **멀다고 오판**하나", "바람에 흔들리면") 에 대한 답입니다. 수치는 이 저장소의
+실제 모듈을 돌린 합성 실험이고, Jetson 하드웨어 수치는 기억(표시)입니다.
+
+### 4.1 FPS — 25 는 Orin 급이면 창 끄고 가능, Xavier NX 급이면 딱 경계
+
+| 항목 | 값 | 근거 |
+|---|---|---|
+| 인지 제외 파이썬 전체(수신·EKF·스케줄러·측정·미션·제어·평활·로그) | **0.62 ms/프레임** (로그 끔) / **1.14 ms** (로그 켬), x86 2.1 GHz | 폐루프 하네스 1200 프레임 실측 |
+| `_depth_stats` 640×480, bbox 400×400 | 0.31 ms (서브샘플) | 마이크로벤치 |
+| 화면(그리기 + imshow + waitKey) | Jetson 4~8 ms, 2프레임마다 | 개발자 보고(README) |
+| `rs.align` CPU (pip 휠) | 6~10 ms Orin / 10~20 ms Xavier NX (기억) | librealsense 는 `BUILD_WITH_CUDA=true` 로 빌드하면 GPU |
+| YOLO11n TRT FP16 416 (전·후처리 포함) | 10~15 / 15~22 ms (기억) | |
+| `set_region_of_interest` (AE ROI) | **호출당 ~140 ms 보고** (librealsense #7130, Windows 측정) | 그래서 `ae_roi_follow_track` 기본 False, 5 ms 초과 시 경고 |
+
+루프가 33 ms 를 넘으면 카메라 프레임을 버리고(librealsense 파이프라인은 용량 1 큐라 **항상 최신 프레임** 을 준다 — `src/pipeline/aggregator.cpp`
+읽음 — 지연이 쌓이지는 않는다), 40 ms 를 넘으면 25 FPS 아래입니다. 개발자 실측 24~26 FPS 는 Xavier NX 급에 창을 켠 값으로
+보이며, **창 끄기(`MARS_SHOW_WINDOW=0`) + `jetson_clocks` + AE ROI 끔** 이면 여유가 생깁니다.
+
+**FPS 가 제어 안정성에 미치는 영향은 작습니다.** 외루프의 지연 여유는 6.3 s (`docs/stability_margins.json` `delay_margin_s`)라
+15 FPS 로 떨어져도 불안정해지지 않습니다. FPS 가 낮아서 생기는 문제는 **트래커** 쪽입니다: IoU 0.20 게이트는 3 m 에서 리더가
+1 m/s 로 가로지를 때 15 fps 까지 버티고(검출 2프레임마다), 2 m/s 는 25 fps 에서도 놓칩니다. 놓친 한 프레임이 표적 신원을
+잃는 창이므로(4.3), FPS 는 안정성이 아니라 **신원 유지** 를 위해 필요합니다.
+
+### 4.2 깊이 — "멀다" 오판이 진짜 위험이었다 (G9)
+
+사람은 단단해서 중앙값이 맞지만, 드론은 속이 비어 있어 bbox 안쪽 55 % 영역의 절반 이상이 배경입니다. 합성 실험(100×100 bbox,
+기체 3 m / 지면 8 m, D435 급 잡음):
+
+| 안쪽 영역 중 기체 비율 | 단순 중앙값 | MAD | 가장 가까운 무리 (지금) |
+|---|---|---|---|
+| 15 % | 8.0 m | 0.1 | **3.0 m** |
+| 30 % | 8.0 m | 0.2 | **3.0 m** |
+| 45 % | 8.0 m | 0.35 | **3.0 m** |
+| 60 % | 3.0 m | 0.35 | 3.0 m |
+| 100 % (사람) | 3.0 m | 0.03 | 3.0 m (동일) |
+
+MAD 0.5 문턱은 두 봉우리에서 절대 안 넘고, χ² 게이트는 8 m 를 5.1 s 동안 거부하다가 받아들입니다 — 그 사이 `range_coast` 2 s 로
+LOST_HOLD(정지) 가 먼저 걸리지만, 5.1 s 에 8 m 가 받아들여지면 `has_followed` 라 즉시 FOLLOW → 오차 4.8 m → **+0.35 m/s 전속 전진**,
+리더는 3 m 앞에 있습니다. 350 급 기체를 옆에서 3 m 에서 보면(fx≈615) bbox ≈ 72×31 px, 안쪽 40×17 px 중 100 mm 몸통이 ≈ 50 % —
+정확히 경계입니다. 반대 방향(1.2 m 의 잡동사니에 걸림)은 "가깝다" 쪽 오판이라 후퇴하므로 안전한 쪽입니다.
+
+실기에서 남는 것: 하늘 배경에서 작은 기체의 스테레오 매칭이 드물어 `depth_valid_count` 20 근처를 오가며 1~3 s 씩 끊길 수 있습니다.
+그때는 LOST_HOLD(정지) 이고, 10 s 넘으면 FAILSAFE_LAND 지만 **기본 정책은 호버 유지**입니다(G11). 비행 전 지상에서 리더 기체를
+3 / 5 / 8 m 에 두고 하늘·나무 배경 각각에서 로그의 `measurement.depth_valid_count` / `depth_m` 분포를 봐 두십시오(3절 B-6).
+
+### 4.3 표적 신원 — 사람 단계에서는 운영으로 막는다
+
+초기 획득은 면적×신뢰도 최대라 3 m 의 리더(0.7)보다 2 m 의 행인(0.5)이 이깁니다. 리더가 보이는 동안은 IoU 0.9 가 항상 이겨
+빼앗기지 않지만, **검출을 한 프레임 놓친 순간** 근접 반경(대각선 1.5 배 = 3 m 의 사람에게는 화면 전체) 안의 다른 사람이 트랙을
+가져갑니다. 지금은 회복 시 bbox 크기 비 1/1.3~1.3 을 요구해 **다른 거리의 사람** 은 막지만, 같은 거리에 나란히 선 사람은 못 막습니다.
+따라서 사람 리더 단계의 규칙은 하나입니다: **카메라 시야에 리더 외 사람이 없을 것.** 관찰자·조종사는 팔로워 뒤에 섭니다.
+드론 표적 단계에서는 다른 드론·새가 같은 역할입니다.
+
+### 4.4 바람 · 돌풍
+
+- **호버 품질은 FC 의 것입니다.** 0 속도 setpoint 는 위치 안정화를 포함한 Loiter 와 같은 제어기로 들어갑니다(1절). 컴패니언은
+  바람을 이기려 하지 않습니다.
+- **기울기 편향(G6).** 맞바람에 기울어 호버하면 카메라도 기웁니다. 수평화 없이는 리더가 D·tan θ 만큼 위/아래로 보여 그만큼
+  고도가 밀립니다(10° 에 0.52 m, 5° 에 0.26 m, GPS 단독 8 m 이격이면 1.4 m). 수평화가 기본이므로 남는 것은 ATTITUDE 지연에 의한
+  과도 오차뿐입니다.
+- **돌풍 응답(G15).** pitch ±10° / 0.7 Hz(최대 44°/s) 의 돌풍 응답을 10 Hz 자세로 보정하면 EKF 에 0.15~0.39 m 위치·최대 0.58 m/s
+  의 가짜 리더 속도가 들어가고(출발 확인 문턱 0.25 m/s 를 넘음), 30 Hz 면 0.07 m·0.02 m/s 입니다. 그래서 30 Hz 를 요청합니다.
+  카메라 영상이 자세보다 35~50 ms 늦다는 지연 정렬 문제는 남아 있습니다(남은 위험 7절).
+- **시야.** 640×480 컬러는 16:9 센서의 4:3 크롭이라 실제 FOV 는 약 55°×43° (fx≈615) 입니다 — README 의 "69°" 는 16:9 규격입니다.
+  3 m 의 사람은 세로 348/480 px 라 pitch 6° 만 넘어도 머리·발이 잘립니다(`truncated`, 신뢰도 ×0.6). 표적이 중앙에서 화면 밖으로
+  나가는 각은 yaw 27.5° / pitch 21.3° — 30°/s 돌풍이면 0.7~0.9 s 입니다. 시작 로그 `[CAM] fx=` 로 실제 값을 확인하십시오.
+- **첫 비행 풍속 상한: 5 m/s** (조종사 판단, 기억이 아니라 위 편향·시야 수치에서 나온 보수값).
 
 ---
 
-## 5. 미션·FC 상호작용 검토 (검토 보고 뒤 채움)
+## 5. 미션 · FC 상호작용 — 검토에서 나온 결정 사항
 
-(작성 중)
+| # | 발견 | 결정 |
+|---|---|---|
+| F1 | 자율 LAND 가 양성 상황(느린 리더, 사람이 앉음, EKF 원점 오차, 하늘 배경 깊이 소실)에서 엉뚱한 곳에 착륙한다. 하네스 재현: 리더 0.09~0.21 m/s → 60 s 에 LAND; 사람이 0.12 m/s 로 앉음 → 16 s 에 LAND; 원점 1 m 오차 + 리더 0.45 m 하강 → 14.7 s 에 LAND | **기본 정책 = 호버 유지 + STATUSTEXT** (`mission.autonomous_land=False`). 배터리·EKF failsafe 는 FC 가 맡는다(2절). 자율 LAND 가 필요한 무인 운용은 이 스위치와 아래 F2 규칙으로 켠다 |
+| F2 | heartbeat 1 Hz 라 조종사 탈환 뒤 ≤ 1 s 창에 LAND 가 나가 LOITER 를 덮어쓴다. 2 s 재시도는 조종사가 잠깐 되찾은 GUIDED 도 덮어쓴다(더블 플릭). ArduPilot 은 스위치 **변화** 에만 모드를 바꾸므로 조종사는 스위치를 옮겼다 되돌려야 한다 | LAND 는 결정당 1회, 결정 **뒤** 의 GUIDED heartbeat 요구, 재시도 없음. 조종사 절차: 반응 없으면 스위치를 다른 위치로 옮겼다 되돌린다. `PILOT_THR_BHV` 비트 1(=2) 로 스로틀만 올려도 LAND 를 취소할 수 있다(`mode.cpp` `land_run_horizontal_control`) |
+| F3 | (HEAD) 하트비트 끊김 뒤 마지막 모드 문자열로 LAND 5회 송신; LOCAL_POSITION 정체 시 1.5 m 바닥을 뚫고 0.51 m 까지 하강 | G2·G3·G4 로 닫힘 (하네스 `fc_stale`, `lost_alt`, `climb`) |
+| F4 | 'l' 키가 FC 모드와 무관하게 LAND 를 보냄; 'v' 끄기가 마지막 속도를 3 s 남김; 키는 창에 포커스가 있을 때만 읽힘 | 'l' 은 GUIDED·모드 기지일 때만, 'v' 끄기 전 정지 1회. **비행 중 조작은 조종기 스위치로만** — 키보드는 비상 수단이 아니다 |
+| F5 | 거리 코스팅 2 s 동안 예측·피드포워드로 눈 감고 비행(최대 0.35 m/s). 리더가 멈추면 3.60→2.98 m, 후진하면 2.41 m 까지 접근 | 전방 1.2 m 정지(G10) 가 마지막 방벽. 코스팅 중 피드포워드 감쇠는 골든 스트림을 바꾸므로 보류 — 7절 |
+| F6 | "AGL" 은 지형이 아니라 EKF 원점(전원 후 **첫 arm** 지점, `AP_Arming.cpp` `resetHeightDatum`) 기준. 착륙 뒤 다른 높이에서 재 arm 하면 z≠0. 경사 5° 에서 20 m 이동 = 1.7 m | `MIN_AGL_M` 2.0 m. 운용: **평지 이륙 지점에서 전원당 한 번 arm**. 하향 거리계(`RNGFND1_*`)를 달면 `DISTANCE_SENSOR` 로 대체 가능(미구현) |
+| F7 | 컴패니언 상태를 조종사가 볼 창구가 없고, 종료 시 정지 1회가 유실되면 FC 가 마지막 속도를 GUID_TIMEOUT 까지 유지(최대 1.05 m) | STATUSTEXT(미션 상태 변화·GUIDED 진입·정체·전방 정지·LAND·종료) + 종료 시 정지 3회. `GUID_TIMEOUT` 1.0~1.5 s 권장(2절) — 표류 0.35~0.5 m |
+| F8 | 컴패니언 MAVLink 신원이 sysid 255 / comp 0 (GCS 로 위장) | 유지. `SYSID_ENFORCE=0` 이면 문제 없고, 바꾸면(1/191) 실기 확인 없이 링크 신원을 건드리는 셈이라 첫 비행 뒤 검토 |
+| F9 | 출발 확인(0.25 m/s × 0.7 s)이 느린 리더를 영영 READY_HOVER 에 둔다 | 기본 정책이 호버 유지라 결과는 양성(리더가 시야를 벗어나면 호버). 리더는 **0.3 m/s 이상으로 분명히 출발** 한다 |
+| F10 | GUIDED 에서 지상 arm 시 setpoint 스트림이 있어도 이륙하지 않음(`is_disarmed_or_landed`) — 안전 | `GUID_OPTIONS` 비트 0(송신기 arm 허용) 은 끈 채로. 이륙은 수동, 인계는 공중에서 (README 운용 순서) |
 
 ---
 
@@ -154,9 +243,21 @@ FPS < 15 · HUD `est=` 가 줄자와 1 m 이상 차이 · 예상 못 한 `set mo
 
 ---
 
-## 7. 남은 위험 (지상에서 못 없앤 것)
+## 7. 남은 위험 (지상에서 못 없앤 것) — 우선순위 순
 
-(검토 보고 뒤 채움)
+1. **실비행 0회.** 모든 것이 하네스·SITL·소스 근거다. 6절의 단계를 건너뛰지 말 것.
+2. **ATTITUDE 부호 규약(수평화)** 은 3절 B-3 지상 기울임 점검으로만 확인된다. 반대면 기울일수록 편향이 2배가 된다.
+3. **드론 표적의 깊이 소실 통계** (하늘 배경, 8 m 너머) 를 모른다 — 3절 B-6 지상 측정 뒤 `depth_max_m`·`range_coast_max_sec` 재검토.
+4. **컬러 AE 노출 상한 8 ms 가 무효일 가능성.** librealsense 소스에서 `auto_exposure_limit` 은 깊이 센서에만 등록된다 — 시작 로그에
+   `[CAM] 컬러 AE 노출 상한` 이 없으면 33 ms 노출로 yaw 0.35 rad/s 에 7 px 블러가 생겨 검출을 한 프레임 놓치는 원인이 된다(4.3 의 창).
+   대안: 수동 노출(`enable_auto_exposure 0`, 8 ms, 게인 상향).
+5. **영상–자세 지연 정렬.** 30 Hz 자세도 영상보다 새것이라 돌풍 중 0.17 m·0.27 m/s 급 과도 오차는 남는다. `frame.get_timestamp()` 와
+   자세 링 버퍼로 보간하는 것이 다음 단계.
+6. **같은 거리의 두 사람** 은 트래커가 구분하지 못한다 — 운영 규칙(시야에 리더만).
+7. **코스팅 2 s 동안의 맹목 비행** (F5). 피드포워드를 코스팅 중 0.5 s 로 감쇠하는 변경은 골든 스트림이 바뀌므로 첫 비행 로그를 본 뒤 결정.
+8. **EKF 원점 기준 고도** (F6) — 평지, 전원당 한 번 arm. 거리계가 없으면 경사지 비행 금지.
+9. **STATUSTEXT 가 GCS 화면에 뜨는지** 는 실기 확인 항목(Mission Planner 는 선택 기체 sysid 로 거르고, 컴패니언은 255 라 "GCS:" 로 기록된다).
+10. **PX4 경로** 는 C6(set_mode) 외에 이번 검토 범위 밖이다. 이 점검서는 ArduCopter 기준이다.
 
 ---
 

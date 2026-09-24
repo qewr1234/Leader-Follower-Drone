@@ -99,16 +99,26 @@ LEADER_ID = str(FORMATION_CFG.get("leader_id", "") or "")
 FF_SOURCE = str(FORMATION_CFG.get("ff_source", "vision"))     # "vision" | "broadcast" | "auto"
 
 SETPOINT_PERIOD_SEC = 0.10
-# C2: LAND 가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
-LAND_RETRY_SEC = 2.0
+# 자율 착륙 정책 (config mission.autonomous_land). False(기본) 면 FAILSAFE_LAND / CONFIRMED_LANDING 에서도 모드를 바꾸지 않고
+# 0 속도(위치 유지) 를 계속 보내며 GCS 에 STATUSTEXT 로 알린다 — 조종사가 있는 시험에서는 "엉뚱한 곳에 LAND" 가
+# "호버 유지" 보다 위험하다 (docs/FLIGHT_SAFETY_CHECKLIST.md 5절 F1: 느린 리더·사람 리더가 앉음·EKF 원점 오차·하늘 배경 깊이 소실).
+# True 면 LAND 를 **한 번만** 보낸다 — 결정 이후에 받은 GUIDED heartbeat 가 있을 때만(조종사 탈환 창 최소화). 재시도 없음:
+# 먹지 않았으면 FC 는 GUID_TIMEOUT 뒤 위치 유지이고, 재시도는 조종사가 잠깐 되찾았다 돌아온 경우를 덮어쓴다 (F2).
+AUTONOMOUS_LAND = bool(CONFIG.get("mission", {}).get("autonomous_land", False))
+# 전방 정지 거리: 원시 깊이 영상의 중앙 영역에서 가장 가까운 유효 깊이 무리가 이보다 가까우면 전진(vx>0) 을 막는다.
+# 추적·추정과 무관한 독립 방벽 — 리더가 다가오거나, 깊이 중앙값이 배경을 잡아 "멀다" 고 오판하거나, 사람이 끼어들 때.
+FORWARD_STOP_M = 1.2
 CAM_FAIL_LIMIT = 30      # 카메라 연속 실패 한계. 스톨 1회 = camera 타임아웃 0.5s 라 약 15초 뒤 포기 (그동안 FC 의 GUID_TIMEOUT 이 먼저 든다)
 FC_FAIL_LIMIT = 30       # FC 링크(drain) 연속 예외 한계
-MIN_AGL_M = 1.5          # 이 고도(AGL) 아래에서는 하강 명령을 내지 않는다. 고도를 모르면(LOCAL_POSITION_NED 정체) 역시 막는다
+# 이 고도 아래에서는 하강 명령을 내지 않는다. 고도를 모르면(LOCAL_POSITION_NED 정체) 역시 막는다. LOCAL_POSITION_NED z 는
+# EKF 원점(전원 후 첫 arm 지점) 기준이지 지형 기준이 아니다 — 평지에서 이륙 지점에서 arm 할 것 (FLIGHT_SAFETY_CHECKLIST 5절 F6).
+MIN_AGL_M = 2.0
 # GUIDED 인계 고도보다 이만큼 위에서는 상승 명령을 내지 않는다. 트래커가 높은 물체를 물거나 리더 고도를 잘못 추정해도
 # 상승은 여기서 끝난다 (FC 의 FENCE_ALT_MAX 는 그 바깥의 2차 방벽).
 MAX_CLIMB_ABOVE_ENTRY_M = 5.0
 # FC HEARTBEAT 가 이보다 오래되면 모드를 모르는 것이다 → 모드 변경(LAND) 을 보내지 않는다. 링크가 돌아오면 GUIDED 진입과
-# 같이 미션을 리셋한다(그 사이 조종사가 무엇을 했는지 모르므로). 값은 ArduCopter GUID_TIMEOUT 기본 3 s 와 같다.
+# 같이 미션을 리셋한다(그 사이 조종사가 무엇을 했는지 모르므로). ArduCopter heartbeat 는 1 Hz 고정(스트림 요청으로 못 올림)이라
+# 1 회 유실은 봐주고 2 회 연속 유실이면 모른다고 본다. LAND 자체는 이와 별개로 "결정 뒤에 받은 GUIDED heartbeat" 를 요구한다.
 FC_MODE_MAX_AGE_SEC = 3.0
 # ATTITUDE / LOCAL_POSITION_NED 가 이보다 오래되면 추종 대신 정지(0 속도) 를 보낸다 — 자세 없이는 자세 보정·수평화·
 # 리더 속도·고도 바닥이 모두 꺼진 채 비전만으로 움직이게 된다. 10 Hz 스트림의 정상 지터(0.1~0.2 s) 보다 훨씬 길다.
@@ -236,6 +246,21 @@ def send_hold(master):
     send_body_velocity(master, 0.0, 0.0, 0.0, 0.0)
 
 
+_SEV_WARNING = getattr(mavutil.mavlink, "MAV_SEVERITY_WARNING", 4)
+_SEV_CRITICAL = getattr(mavutil.mavlink, "MAV_SEVERITY_CRITICAL", 2)
+
+
+def send_statustext(master, text, severity=None):
+    """GCS 화면에 한 줄 (STATUSTEXT). ArduPilot 은 대상 없는 메시지를 다른 링크로 중계하고 dataflash 에 남긴다
+    (libraries/GCS_MAVLink/MAVLink_routing.cpp). 조종사가 컴패니언 상태(리더 소실·정지·종료) 를 볼 유일한 창구.
+    실패해도 비행 로직과 무관하므로 삼킨다. 50 바이트 제한."""
+    try:
+        master.mav.statustext_send(_SEV_WARNING if severity is None else int(severity), text.encode("ascii", "replace")[:50])
+        return True
+    except Exception:
+        return False
+
+
 def set_mode(master, mode_name):
     mapping = master.mode_mapping()
     if mapping is None or mode_name not in mapping:
@@ -284,7 +309,10 @@ def self_velocity_lpf(prev, v_self_fru, dt):
     (docs/STABILITY_MARGINS.md 2절의 H_m − E_v/s 항). EKF 속도 추정의 63% 응답이 0.30s 로 실측되어 그 값에 맞춘다.
     """
     v = np.asarray(v_self_fru, dtype=float)
-    if prev is None or FF_SELF_TAU_SEC <= 0.0:
+    if not np.all(np.isfinite(v)):
+        # FC 가 NaN 속도를 주면(PX4 는 무효 시 NaN 을 낸다) 필터를 오염시키지 않는다 — 직전 값 유지
+        return np.zeros(3) if prev is None else np.asarray(prev, dtype=float)
+    if prev is None or FF_SELF_TAU_SEC <= 0.0 or not np.all(np.isfinite(np.asarray(prev, dtype=float))):
         return v
     a = 1.0 - math.exp(-max(float(dt), 0.0) / FF_SELF_TAU_SEC)
     return np.asarray(prev, dtype=float) + a * (v - np.asarray(prev, dtype=float))
@@ -305,9 +333,12 @@ def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
     if leader_vel_fru is not None:
         v = np.asarray(leader_vel_fru, dtype=float)
         speed = float(np.linalg.norm(v))
-        if speed > FF_DEADBAND_MPS:
+        # 비유한이거나 리더 속도 상한(20 m/s) 밖이면 없는 것으로 — inf 는 다음 프레임 inf−inf = NaN 으로 고정된다.
+        if np.all(np.isfinite(v)) and FF_DEADBAND_MPS < speed <= 20.0:
             target = v * (1.0 - FF_DEADBAND_MPS / speed)
     prev = np.asarray(prev_ff, dtype=float)
+    if not np.all(np.isfinite(prev)):
+        prev = np.zeros(3)
     a = 1.0 - math.exp(-max(float(dt), 0.0) / max(FF_TAU_SEC, 1e-3))
     return prev + a * (target - prev)
 
@@ -321,8 +352,20 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, targ
     (ArduPilot FOLL_YAW_BEHAVE=1, PX4 follow_me 와 같은 선택)."""
     if target_distance is None:
         target_distance = TARGET_DISTANCE_M
+    # 입력이 하나라도 비유한이면 정지. clamp 는 NaN 을 상한으로 바꾸므로(utils_geometry.clamp 주석) 여기서 먼저 막아야 한다 —
+    # 뒤의 sanitize_cmd 는 clamp 를 지난 뒤라 이 경우를 볼 수 없다.
+    _inputs = [np.asarray(rel_fru, dtype=float)[:3], np.asarray(rel_vel_fru, dtype=float)[:3]]
+    if leader_vel_ff is not None:
+        _inputs.append(np.asarray(leader_vel_ff, dtype=float)[:3])
+    if slot_error is not None:
+        _inputs.append(np.asarray(slot_error, dtype=float)[:3])
+    if not all(np.all(np.isfinite(a)) for a in _inputs) or not math.isfinite(float(target_distance)):
+        return np.zeros(4)
     front, right, up = (float(v) for v in np.asarray(rel_fru, dtype=float)[:3])
     v_front, v_right, v_up = (float(v) for v in np.asarray(rel_vel_fru, dtype=float)[:3])
+    if front <= 0.0:
+        # 추정이 "카메라 뒤" 를 가리키면(큰 yaw 를 코스팅으로 지난 경우) 근거 없이 후진하지 않는다 — 정지.
+        return np.zeros(4)
     if slot_error is None:
         e_front, e_right, e_up = front - float(target_distance), right, up
     else:
@@ -373,7 +416,7 @@ def _bearing_update(ekf, rel, bearing_meas, r_vis, ok_label, reject_label):
 def fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm):
     """RGB-D 3D 측정 → 게이트 통과면 위치 업데이트, 아니면 bearing 으로 강등. 반환 (update_used, gate_d2)."""
     if rgbd_meas is not None and r_vis > 0.0 and r_depth > 0.0:
-        R = rel.make_R_rgbd(r_vis, r_depth) if use_mars_imm else None
+        R = rel.make_R_rgbd(r_vis, r_depth, depth_m=rgbd_meas.get("depth_m")) if use_mars_imm else None
         if not ekf.initialized:
             ekf.init(rgbd_meas["z"])
             return "init_rgbd", None
@@ -471,7 +514,7 @@ def build_log_row(s):
     avail = lm.get("available", False)
     ekf = s["ekf"]
     return {
-        "time": s["now"], "dt": s["dt"], "fps": s["fps_display"],
+        "time": s.get("wall", s["now"]), "t_mono": s["now"], "dt": s["dt"], "fps": s["fps_display"],
         "mars": {"enabled": s["use_mars_imm"], "policy": s["policy"]},
         "mission": {"state": s["mission_state"], "mode": s["mission_policy"]["mode"],
                     "allow_follow": s["mission_policy"]["allow_follow"], "land": s["mission_policy"]["land"]},
@@ -541,16 +584,20 @@ def main():
     log = ExperimentLogger(CONFIG["logger"]["log_dir"]) if CONFIG["logger"]["enabled"] else None
 
     last_track = None
-    prev_time = time.time()
+    prev_time = time.monotonic()  # 내부 시계는 단조 — NTP/chrony 가 벽시계를 튀기면 소실 타이머·dt 가 한꺼번에 튄다
     last_stat_print = 0.0
     last_setpoint_time = 0.0
-    last_land_send = 0.0          # C2: LAND 재시도 타이머
+    land_decision_t = None        # 미션이 착륙 정책으로 넘어온 시각 (LAND 는 이 뒤의 GUIDED heartbeat 를 요구)
+    land_sent = False             # 이번 착륙 결정에 LAND 를 이미 보냈는가 (재시도 없음)
+    prev_mission_state = None     # STATUSTEXT 는 상태가 바뀔 때만
+    fwd_clear_m = None            # 전방 여유 거리 (원시 깊이)
+    prev_fwd_stop = False
     prev_fc_accepts = False       # GUIDED 진입 에지 검출용
     cam_fail_streak = fc_fail_streak = 0
     last_fused_rx_time = None     # 마지막으로 EKF 에 융합한 ESP32 패킷의 rx_time
     show_window = SHOW_WINDOW
     frame_idx = 0
-    fps_counter, fps_t0, fps_display = 0, time.time(), 0.0
+    fps_counter, fps_t0, fps_display = 0, time.monotonic(), 0.0
     prev_body_cmd = np.zeros(4)
     current_body_cmd = np.zeros(4)
     prev_rpy_for_comp = None      # 직전 프레임 팔로워 (roll, pitch, yaw)
@@ -569,7 +616,7 @@ def main():
 
     try:
         while True:
-            now = time.time()
+            now = time.monotonic()
             # prev_time 은 프레임 획득에 성공한 뒤에 갱신한다 — 카메라/FC 실패로 continue 한 반복의
             # 시간이 predict / range_coast 에서 사라지지 않게.
             dt = max(now - prev_time, 1e-4)
@@ -603,9 +650,10 @@ def main():
                 ff_fru = np.zeros(3)
                 v_self_lpf = None
                 heading_est.reset()
-                last_land_send = 0.0
+                land_decision_t, land_sent = None, False
                 entry_alt = None
                 print(f"[SYS] {fc_mode} 진입 — 미션/명령 리셋")
+                send_statustext(master, f"MARS: {fc_mode} entry, mission reset")
             prev_fc_accepts = fc_accepts_setpoints
 
             gps_fresh = is_fresh(vehicle_state.get("gps", {}), now, GPS_MAX_AGE_SEC)
@@ -617,7 +665,7 @@ def main():
             leader_meas = build_leader_measurement_from_packet(
                 packet=leader_packet, follower_vehicle_state=vehicle_state, now=now,
                 max_age_sec=LEADER_MAX_AGE_SEC, leader_velocity_frame=LEADER_VELOCITY_FRAME,
-                follower_gps_max_age_sec=GPS_MAX_AGE_SEC)
+                follower_gps_max_age_sec=GPS_MAX_AGE_SEC, follower_attitude_max_age_sec=ATTITUDE_MAX_AGE_SEC)
 
             if now - last_stat_print >= 1.0:
                 p_cv, p_ct = ekf.get_model_probs() if ekf.initialized else (0.0, 0.0)
@@ -628,6 +676,7 @@ def main():
                       f"mission={mission.state} "
                       f"vL={(float(np.linalg.norm(v_leader_fru)) if v_leader_fru is not None else float('nan')):.2f} "
                       f"ff={ff_fru[0]:+.2f}({ff_src}) slot={slot_label} hdg={heading_src} "
+                      f"fwd={(fwd_clear_m if fwd_clear_m is not None else float('nan')):.1f}m "
                       f"fresh=LP{int(local_pos_fresh)}/ATT{int(attitude_fresh)}/HB{int(fc_mode_known)} {stream_rates_text(now)}")
                 if SEND_MAVLINK_COMMANDS and not fc_accepts_setpoints:
                     print(f"[WARN] FC mode={fc_mode}: 송신 중단됨 (ArduPilot: GUIDED / PX4: OFFBOARD 필요)")
@@ -657,24 +706,40 @@ def main():
 
             # ---------------- IMM predict (팔로워 자세 변화만큼 상대상태를 역회전한 뒤) ----------------
             att = vehicle_state.get("attitude", {})
-            if attitude_fresh and att.get("yaw") is not None:
+            att_ok = attitude_fresh and att.get("yaw") is not None
+            if att_ok:
                 cur_rpy = (float(att.get("roll") or 0.0), float(att.get("pitch") or 0.0), float(att["yaw"]))
+                att_ok = all(math.isfinite(v) for v in cur_rpy)      # inf 면 math.cos 가 예외를 던져 루프가 죽는다
+            if att_ok:
                 if prev_rpy_for_comp is not None and ekf.initialized:
                     ekf.compensate_ego_rotation(ego_rotation_cam(prev_rpy_for_comp, cur_rpy))
                 prev_rpy_for_comp = cur_rpy
-            else:
-                prev_rpy_for_comp = None
+            # 자세가 잠시 정체돼도 prev 를 지우지 않는다 — 지우면 정체 동안 돈 각도가 영영 보정되지 않는다(0.4 s 정체·0.35 rad/s
+            # 에서 0.24 m·0.45 m/s 의 가짜 리더 속도). 1 s 이상 정체는 FC_STATE_HOLD 가 정지시키고, 그 뒤 첫 신선한 자세에서
+            # 누적 회전을 한 번에 보정한다.
             if ekf.initialized:
                 ekf.predict(dt)
+                if not ekf.is_finite():
+                    ekf.reset()
+                    print("[WARN] EKF 상태 비유한 (predict) — 추정기 리셋")
 
             # ---------------- 스케줄러 → 검출/추적 ----------------
+            policy = {"run_detector": True, "use_full_frame": True, "roi": None, "detect_every": 1, "reason": "baseline_full_frame"}
             if use_mars_imm:
-                policy = scheduler.decide(ekf.get_state_dict(), color_image.shape, intrinsics, last_track)
-            else:
-                policy = {"run_detector": True, "use_full_frame": True, "roi": None, "detect_every": 1, "reason": "baseline_full_frame"}
+                try:
+                    policy = scheduler.decide(ekf.get_state_dict(), color_image.shape, intrinsics, last_track)
+                except Exception as exc:          # 공분산 폭주 등으로 ROI 계산이 예외를 내면 전체 프레임 검출로
+                    print(f"[WARN] scheduler 예외 → 전체 프레임: {type(exc).__name__}: {exc}")
 
             if policy["run_detector"]:
-                track = tracker.update(detector.detect(color_image, roi=None if policy["use_full_frame"] else policy["roi"]))
+                # 검출기(TensorRT/CUDA) 예외는 미검출로 다룬다 — 잡지 않으면 루프가 죽어 hold 한 번 뒤 FC 가 GUID_TIMEOUT 으로
+                # 정지하지만 조종사는 컴패니언이 죽은 줄 모른다. 검출이 계속 실패하면 소실 경로(LOST_HOLD) 가 정지시킨다.
+                try:
+                    detections = detector.detect(color_image, roi=None if policy["use_full_frame"] else policy["roi"])
+                except Exception as exc:
+                    print(f"[WARN] 검출기 예외 → 미검출 처리: {type(exc).__name__}: {exc}")
+                    detections = []
+                track = tracker.update(detections)
             else:
                 track = tracker.predict_only()
             last_track = track
@@ -683,6 +748,7 @@ def main():
 
             # ---------------- 측정 → 융합 ----------------
             rgbd_meas = meas_builder.build_rgbd(track, depth_image)
+            fwd_clear_m = meas_builder.forward_clearance(depth_image)
             bearing_meas = meas_builder.build_bearing(track) if track is not None else None
             r_vis = rel.vision_reliability(rgbd_meas or bearing_meas or track)
             r_depth = rel.depth_reliability(rgbd_meas)
@@ -748,6 +814,10 @@ def main():
                 rel_est=rel_fru if ekf.initialized else None, rel_vel_est=rel_vel_fru if ekf.initialized else None,
                 leader_alt=leader_alt_est, leader_vel_world=leader_vel_world, pos_cov_trace=pos_cov_trace,
                 leader_vel_body=v_leader_fru)
+            if mission_state != prev_mission_state:
+                if mission_state in ("LOST_HOLD", "FAILSAFE_LAND", "CONFIRMED_LANDING", "LANDING_CANDIDATE"):
+                    send_statustext(master, f"MARS: {mission_state}" + ("" if AUTONOMOUS_LAND or not mission_policy["land"] else " (holding, no LAND)"))
+                prev_mission_state = mission_state
 
             # ---------------- 편대 슬롯 / 피드포워드 소스 ----------------
             # 슬롯: 리더 heading 을 알면 리더 기준 오프셋, 모르면 LOS(기존). 비전 거리 없이 GPS 뿐이면 이격을 GPS_ONLY 로.
@@ -773,16 +843,23 @@ def main():
                 ff_fru, ff_input if (mission_policy["allow_follow"] and ekf.has_range_fix()) else None, dt)
 
             desired_body_cmd = np.zeros(4)
-            if mission_policy["land"]:
-                # C2: 모드 게이트가 곧 latch 다 — LAND 가 먹으면 FC 가 GUIDED 를 벗어나 이 분기가 더 실행되지
-                # 않는다. 여전히 여기 있다는 건 명령이 먹지 않았다는 뜻이라 그때만 LAND_RETRY_SEC 간격으로 재시도
-                # (조종사 탈환 시엔 fc_accepts_setpoints=False 라 아예 보내지 않는다).
-                if SEND_MAVLINK_COMMANDS and fc_accepts_setpoints and now - last_land_send >= LAND_RETRY_SEC:
+            land_now = bool(mission_policy["land"]) and AUTONOMOUS_LAND
+            if not mission_policy["land"]:
+                land_decision_t, land_sent = None, False
+            elif land_decision_t is None:
+                land_decision_t = now
+            if land_now:
+                # LAND 는 결정당 한 번. 조건: (1) 결정 **뒤에** 받은 heartbeat 가 GUIDED — 링크가 죽었거나 조종사가 방금 탈환한
+                # 1 s 창을 닫는다, (2) 아직 안 보냈음. 먹지 않았으면 재시도하지 않는다(F2: 재시도는 조종사가 되찾은 GUIDED 를 덮어쓴다).
+                # 이 동안 setpoint 를 보내지 않으므로 FC 는 GUID_TIMEOUT 뒤 위치 유지다.
+                hb_after_decision = float(fc_mode_msg.get("timestamp", 0.0) or 0.0) > float(land_decision_t)
+                if SEND_MAVLINK_COMMANDS and fc_accepts_setpoints and hb_after_decision and not land_sent:
                     try:
                         send_land(master)
+                        send_statustext(master, f"MARS: LAND sent ({mission_state})", _SEV_CRITICAL)
                     except Exception as exc:
                         print(f"[WARN] FC link: LAND 송신 실패: {type(exc).__name__}: {exc}")
-                    last_land_send = now
+                    land_sent = True
                     last_setpoint_time = now
             elif mission_policy["allow_follow"] and ekf.initialized:
                 desired_body_cmd = compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance_m, ff_fru,
@@ -796,12 +873,24 @@ def main():
                 desired_body_cmd = np.zeros(4)
             if fc_state_ok != prev_fc_state_ok:
                 print(f"[{'SYS' if fc_state_ok else 'WARN'}] FC 상태 스트림 {'복구' if fc_state_ok else '정체 — 정지 명령'}")
+                if not fc_state_ok:
+                    send_statustext(master, "MARS: FC state stale, holding")
             prev_fc_state_ok = fc_state_ok
 
             # NaN/inf 는 clamp 를 지나며 상한 전진 명령이 된다 — 정지로 바꾼다.
             desired_body_cmd, cmd_finite = sanitize_cmd(desired_body_cmd)
             if not cmd_finite:
                 print("[WARN] 명령에 비유한 값 — 정지 명령으로 대체")
+
+            # 전방 정지: 원시 깊이의 중앙 영역에 FORWARD_STOP_M 보다 가까운 것이 있으면 전진을 막는다 (추적과 독립).
+            fwd_stop = fwd_clear_m is not None and fwd_clear_m < FORWARD_STOP_M
+            if fwd_stop and desired_body_cmd[0] > 0.0:
+                desired_body_cmd[0] = 0.0
+            if fwd_stop != prev_fwd_stop:
+                print(f"[{'WARN' if fwd_stop else 'SYS'}] 전방 {fwd_clear_m if fwd_clear_m is not None else float('nan'):.2f} m — 전진 {'차단' if fwd_stop else '허용'}")
+                if fwd_stop:
+                    send_statustext(master, f"MARS: obstacle {fwd_clear_m:.1f}m, fwd stop")
+            prev_fwd_stop = fwd_stop
 
             # 수직 축은 리더 상대 고도를 따라간다 — 트래커가 지면의 무언가를 물면 계속 하강한다. AGL 바닥.
             # 고도를 모르면(None) 하강도 막는다: "모름" 은 "충분히 높음" 이 아니다.
@@ -819,8 +908,7 @@ def main():
 
             # 속도 setpoint 에는 모드 게이트를 걸지 않는다: GUIDED/OFFBOARD 가 아니면 FC 가 조용히 버리고, PX4 는
             # OFFBOARD 진입 전에 이 스트림이 먼저 흐르고 있어야 한다. 조종사를 뺏는 건 모드 변경(LAND)이며 그쪽만 막는다.
-            if not mission_policy["land"]:
-                last_land_send = 0.0
+            if not land_now:
                 if now - last_setpoint_time >= SETPOINT_PERIOD_SEC:
                     if SEND_MAVLINK_COMMANDS:
                         try:
@@ -878,6 +966,11 @@ def main():
                     use_mars_imm = not use_mars_imm
                     print(f"[SYS] MARS-IMM -> {'ON' if use_mars_imm else 'OFF'}")
                 elif key == ord("v"):
+                    if SEND_MAVLINK_COMMANDS:
+                        try:
+                            send_hold(master)      # 끄기 전에 정지를 한 번 — 아니면 FC 가 마지막 속도를 GUID_TIMEOUT 까지 유지
+                        except Exception:
+                            pass
                     SEND_MAVLINK_COMMANDS = not SEND_MAVLINK_COMMANDS
                     print(f"[SYS] SEND_MAVLINK_COMMANDS -> {SEND_MAVLINK_COMMANDS}")
                 elif key == ord("h"):
@@ -887,15 +980,18 @@ def main():
                     else:
                         print("[SYS] manual HOLD 생략 — CMD=DRY")
                 elif key == ord("l"):
-                    if SEND_MAVLINK_COMMANDS:
-                        send_land(master)
-                        print("[SYS] manual LAND 송신")
-                    else:
+                    if not SEND_MAVLINK_COMMANDS:
                         print("[SYS] manual LAND 생략 — CMD=DRY ('v'로 켜야 나감)")
+                    elif not fc_accepts_setpoints:
+                        print(f"[SYS] manual LAND 생략 — FC 가 GUIDED 가 아니거나 모드 불명 (mode={fc_mode}, 조종사 우선)")
+                    else:
+                        send_land(master)
+                        send_statustext(master, "MARS: manual LAND key", _SEV_CRITICAL)
+                        print("[SYS] manual LAND 송신")
 
             # ---------------- 로그 ----------------
             if log is not None:
-                log.log(build_log_row(dict(ff_fru=ff_fru, 
+                log.log(build_log_row(dict(ff_fru=ff_fru, wall=time.time(),
                     now=now, dt=dt, fps_display=fps_display, use_mars_imm=use_mars_imm, policy=policy,
                     mission_state=mission_state, mission_policy=mission_policy, track=track, rgbd_meas=rgbd_meas,
                     r_vis=r_vis, r_depth=r_depth, gate_d2=gate_d2, update_used=update_used, leader_meas=leader_meas,
@@ -914,8 +1010,10 @@ def main():
         print("[SYS] shutdown")
         try:
             if SEND_MAVLINK_COMMANDS:
-                send_hold(master)
-                time.sleep(0.1)
+                send_statustext(master, "MARS: companion DOWN, holding", _SEV_CRITICAL)
+                for _ in range(3):            # 하나가 유실돼도 FC 가 마지막 속도를 GUID_TIMEOUT 까지 들고 가지 않게
+                    send_hold(master)
+                    time.sleep(0.05)
         except Exception as exc:
             print(f"[WARN] hold send failed: {exc}")
         # FC 소켓도 닫는다. 안 닫으면 udpin 포트를 계속 쥐고 있어 같은 프로세스에서 다시 연결할 때(SITL 하네스가

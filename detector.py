@@ -69,6 +69,8 @@ def _postprocess(data, offset_x, offset_y, W, H, names, target_class_name):
         name = names[cls_id] if names is not None else str(cls_id)
         if target_class_name is not None and name != target_class_name:
             continue
+        if x2 - x1 < 2.0 or y2 - y1 < 2.0:
+            continue                        # 퇴화 검출(폭·높이 < 2 px). clip_bbox 가 1 px 로 넓혀 살리기 전에 버린다
         bbox = clip_bbox((int(x1) + offset_x, int(y1) + offset_y, int(x2) + offset_x, int(y2) + offset_y), W, H)
         detections.append({"bbox": bbox, "conf": float(conf), "cls": cls_id, "name": name, "area": bbox_area(bbox)})
     detections.sort(key=lambda d: (d["conf"], d["area"]), reverse=True)

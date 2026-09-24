@@ -62,7 +62,7 @@ _rate_t0 = None
 def stream_rates_text(now=None):
     """마지막 호출 이후의 타입별 수신율 문자열. 1초마다 STAT 에서 부른다."""
     global _rate_t0
-    now = time.time() if now is None else float(now)
+    now = time.monotonic() if now is None else float(now)
     if _rate_t0 is None:
         _rate_t0 = now
         return "rx[Hz] -"
@@ -97,13 +97,25 @@ def connect_fc():
     return master
 
 
+ATTITUDE_RATE_HZ = 30      # ego-rotation 보정용. 10 Hz 면 25~30 fps 프레임 3 개 중 2 개가 같은 자세를 보고 계단식으로 튄다
+_MSG_ID_ATTITUDE = 30
+_CMD_SET_MESSAGE_INTERVAL = getattr(mavutil.mavlink, "MAV_CMD_SET_MESSAGE_INTERVAL", 511)
+
+
 def request_data_streams(master, rate_hz=10):
     """쓰는 스트림만 요청한다 (ArduPilot). ALL 을 요청하면 RAW_SENS/EXTRA2 까지 매 프레임 파싱하게 된다.
-    PX4 는 이 메시지를 무시하고 포트 프로파일 기본 rate 로 보낸다."""
+    PX4 는 이 메시지를 무시하고 포트 프로파일 기본 rate 로 보낸다.
+    ATTITUDE 만 따로 MAV_CMD_SET_MESSAGE_INTERVAL 로 30 Hz — 돌풍 pitch ±10°/0.7 Hz 에서 10 Hz 자세는 EKF 에 0.15~0.39 m
+    위치 오차·최대 0.58 m/s 의 가짜 리더 속도를 넣는다 (docs/FLIGHT_SAFETY_CHECKLIST.md 4절). 40 B × 30 Hz = 1.2 kB/s."""
     for stream_id in (mavutil.mavlink.MAV_DATA_STREAM_POSITION,
                       mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,
                       mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS):
         master.mav.request_data_stream_send(master.target_system, master.target_component, stream_id, rate_hz, 1)
+    try:
+        master.mav.command_long_send(master.target_system, master.target_component, _CMD_SET_MESSAGE_INTERVAL, 0,
+                                     _MSG_ID_ATTITUDE, 1e6 / ATTITUDE_RATE_HZ, 0, 0, 0, 0, 0)
+    except Exception as exc:
+        print(f"[FC] ATTITUDE {ATTITUDE_RATE_HZ} Hz 요청 실패(스트림 기본 rate 로 계속): {type(exc).__name__}: {exc}")
 
 
 def _set_battery(pct, mv):
@@ -121,7 +133,7 @@ def drain_messages(master):
         if msg is None:
             break
         mt = msg.get_type()
-        now = time.time()
+        now = time.monotonic()      # main 의 is_fresh 와 같은 단조 시계
         _vehicle_state["timestamp"] = now
         if mt in _RATE_TYPES:
             _rate_counts[mt] = _rate_counts.get(mt, 0) + 1

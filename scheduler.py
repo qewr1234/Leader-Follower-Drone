@@ -44,6 +44,8 @@ class PerceptionScheduler:
         uv = camera_to_pixel(x[:3], intrinsics)
         if uv is None or not np.all(np.isfinite(uv)):
             return self._full_frame("bad_projection")
+        if not (0.0 <= uv[0] < W and 0.0 <= uv[1] < H):
+            return self._full_frame("off_image")      # 추정이 화면 밖 → 1 px 폭 ROI 가 아니라 전체 프레임
 
         p_cv = float(mu[0]) if len(mu) > 0 else 1.0
         p_ct = float(mu[1]) if len(mu) > 1 else 0.0

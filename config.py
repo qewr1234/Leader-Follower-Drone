@@ -37,7 +37,10 @@ CONFIG = {
         # 하늘 배경 역광에서 어두운 피사체 쪽으로 노출 보정.
         "color_backlight_compensation": True,
         # AE 측광 영역을 추적 bbox(1.5배)로 옮긴다(≤1Hz). 하늘 평균이 아니라 리더에 노출을 맞춘다. 소실 시 전체로 복귀.
-        "ae_roi_follow_track": True,
+        # 기본 False (2026-09-24): set_region_of_interest 는 hwmon USB 왕복이라 호출당 ~140 ms 가 보고된 적이 있다
+        # (librealsense #7130, Windows 측정). 제어 루프 안에서 초당 한 번 100 ms 스톨이면 프레임 3~4 개가 빠진다.
+        # 지상에서 재 본 뒤(camera.py 가 5 ms 초과 시 경고를 찍는다) 켤 것.
+        "ae_roi_follow_track": False,
     },
     "measurement": {
         "bbox_inner_ratio": 0.55,
@@ -122,5 +125,14 @@ CONFIG = {
     "logger": {
         "enabled": True,
         "log_dir": "logs",
+    },
+    # ---- 미션 정책 ----
+    "mission": {
+        # 자율 착륙(FAILSAFE_LAND / CONFIRMED_LANDING 에서 LAND 모드 송신). False(기본) 면 그 상태에서도 0 속도(위치 유지)를
+        # 계속 보내고 GCS 에 STATUSTEXT 로 알린다 — 조종사가 있는 시험에서는 "엉뚱한 곳에 LAND" 가 더 위험하다:
+        # 느린 리더(< 0.25 m/s) 가 깊이창 밖으로 걸어 나감, 사람 리더가 앉음(z<0.65·하강·정지 → 착륙 판정), EKF 원점 1 m 오차,
+        # 하늘 배경에서 깊이만 10 s 끊김 — 전부 리더가 멀쩡히 보이는데 착륙한다 (docs/FLIGHT_SAFETY_CHECKLIST.md 5절 F1).
+        # True 면 LAND 를 결정당 한 번만, 결정 뒤에 받은 GUIDED heartbeat 가 있을 때만 보낸다.
+        "autonomous_land": False,
     },
 }
