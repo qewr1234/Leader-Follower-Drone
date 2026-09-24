@@ -1318,6 +1318,66 @@ check(f"회피 경계: 추격형 접근도 상한 hypot(MAX_VX,MAX_VY)={_ev_boun
 check("회피 경계 골든: 추격형 0.7 m/s 는 상한 위라 접촉한다 — 제어 결함이 아니라 속도 한계 (MAX_V* 인상 또는 운용 절차)",
       _ev_p07["contact"] and _ev_p07["max_cmd_lat"] >= 0.2, f"min={_ev_p07['min_dist']:.2f}m lat={_ev_p07['max_cmd_lat']:.2f}")
 
+# ------------------------------------------------- NaN 방어 (SAF-16): 비유한 추정은 '정지' 여야지 '최대 속도' 가 아니다
+from utils_geometry import clamp as _clamp  # noqa: E402
+_nan = float("nan")
+check("NaN: clamp(nan) 은 상한이 아니라 0 이다 — max(lo, min(hi, nan)) 은 hi 를 돌려주던 결함",
+      _clamp(_nan, -0.35, 0.35) == 0.0 and _clamp(_nan, 0.0, 639.0) == 0.0 and _clamp(0.5, 0.0, 1.0) == 0.5, f"{_clamp(_nan, -0.35, 0.35)}")
+
+
+class _NanMaster:
+    target_system = 1
+    target_component = 1
+
+    def __init__(self):
+        self.sent = []
+        self.mav = self
+
+    def set_position_target_local_ned_send(self, *a):
+        self.sent.append(a)
+
+
+_nm = _NanMaster()
+main.send_body_velocity(_nm, _nan, 0.1, 0.0, yaw_rate=0.2)
+_vel_sent = _nm.sent[-1][8:11]
+_yr_sent = _nm.sent[-1][-1]
+check("NaN: send_body_velocity 는 비유한 성분이 하나라도 있으면 전부 0 (HOLD) 으로 보낸다 — 와이어 직전 최후 방어",
+      _vel_sent == (0.0, 0.0, 0.0) and _yr_sent == 0.0, f"vel={_vel_sent} yr={_yr_sent}")
+_c_nan = main.compute_velocity_cmd_from_estimate([_nan, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0, None, np3.zeros(3))
+check("NaN: 제어기는 비유한 추정을 받으면 0 명령을 돌려준다 (예전: [0.35, 0.22, -0.12, 0.35] 전 축 최대)",
+      np3.allclose(_c_nan, 0.0), f"{_c_nan}")
+_c_covnan = main.compute_velocity_cmd_from_estimate([3.5, 0.0, 0.0], [0.0, 0.0, 0.0], _nan, None, np3.zeros(3))   # e=0.5m → 0.15 (포화 밖)
+_c_covok = main.compute_velocity_cmd_from_estimate([3.5, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0, None, np3.zeros(3))
+check("NaN: 공분산 trace 가 NaN 이면 최대 불확실(0.55배 감속)로 취급 — 'nan > 4.0 은 False' 로 감속이 열리던 결함",
+      abs(_c_covnan[0] - 0.55 * _c_covok[0]) < 1e-9 and abs(_c_covok[0] - 0.15) < 1e-9, f"nan→{_c_covnan[0]:.3f} ok→{_c_covok[0]:.3f}")
+# 끝까지: 자세 NaN 한 프레임 → EKF 는 보정을 건너뛰고, 상태가 NaN 이 되더라도 다음 측정에서 재초기화된다
+_ekn = ImmEkf()
+_ekn.init([0.0, 0.0, 3.0])
+for _ in range(10):
+    _ekn.set_ego_velocity_cam([0.0, 0.0, 0.3])
+    _ekn.predict(1 / 30)
+    _ekn.update_position3d([0.0, 0.0, 3.0])
+_ekn.compensate_ego_rotation(main.ego_rotation_cam((0.0, 0.0, 0.0), (0.0, 0.0, _nan)))
+_x_after, _ = _ekn.get_state()
+check("NaN: ATTITUDE 한 프레임의 NaN 은 자세 보정에서 걸러져 EKF 상태가 유한하게 남는다",
+      _ekn.initialized and np3.all(np3.isfinite(_x_after)), f"x={_x_after}")
+_ekn.filters[0].x[:] = _nan                                    # 다른 경로로 NaN 이 들어왔다고 가정
+_ekn.filters[1]._omega = _nan
+_x_reset, _P_reset = _ekn.get_state()
+check("NaN: 상태가 어떤 경로로든 비유한이 되면 get_state 가 미초기화로 되돌리고 (0, 999·I) 를 준다 → 미션 LOST_HOLD, 명령 0",
+      not _ekn.initialized and np3.allclose(_x_reset, 0.0) and _P_reset[0, 0] == 999.0)
+_ekn.update_position3d([0.0, 0.0, 3.1])                       # 미초기화 상태의 첫 측정 = init()
+_x_re, _ = _ekn.get_state()
+_omega_re = _ekn.filters[1]._omega
+for _ in range(5):
+    _ekn.set_ego_velocity_cam([0.0, 0.0, 0.3])
+    _ekn.predict(1 / 30)
+    _ekn.update_position3d([0.0, 0.0, 3.1])
+_x_re2, _ = _ekn.get_state()
+check("NaN: 다음 유효 측정으로 재초기화되어(CT omega 0 으로 정리) 추종이 재개되고 이후 프레임도 유한하다 (예전: 영구 NaN)",
+      _ekn.initialized and np3.all(np3.isfinite(_x_re)) and abs(_x_re[2] - 3.1) < 1e-9 and _omega_re == 0.0
+      and np3.all(np3.isfinite(_x_re2)) and np3.isfinite(_ekn.filters[1]._omega), f"x={_x_re.round(3)} ω={_omega_re}")
+
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "
       f"({len(failures)} 실패)")

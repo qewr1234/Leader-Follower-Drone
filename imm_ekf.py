@@ -239,6 +239,9 @@ class ImmEkf:
         P0 = _make_P0()
         for f in self.filters:
             f.reset(x0, P0)
+            f._omega = 0.0                # 재초기화가 NaN 회전율을 물려받으면 첫 predict 에서 다시 NaN 이 된다
+            f._prev_heading = None
+            f._dt_since_update = 0.0
         self.mu = MU0.copy()
         self.initialized = True
         self.coast_time = 0.0
@@ -380,6 +383,10 @@ class ImmEkf:
         if not self.initialized:
             return
         T = np.asarray(T, dtype=float)
+        if not np.all(np.isfinite(T)):
+            # ATTITUDE 한 프레임의 NaN 이 G@x 로 상태 전체를 NaN 으로 만들고 영원히 회복되지 않는다 (2026-09-24 재현).
+            print("[ERR] 비유한 자세 회전 — 이번 프레임 보정 생략")
+            return
         if np.abs(T - np.eye(3)).max() < 1e-9:
             return
         G = np.zeros((6, 6))
@@ -407,7 +414,24 @@ class ImmEkf:
         c, s = np.cos(dpsi), np.sin(dpsi)
         self.compensate_ego_rotation([[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]])
 
+    def _finite_or_reset(self):
+        """상태·공분산·회전율에 비유한 값이 생기면 필터를 미초기화로 되돌린다 — 다음 유효 측정이 init() 으로 다시 시작한다.
+
+        NaN 은 스스로 회복되지 않고(카이제곱 게이트가 이후 측정을 전부 거부한다), 그대로 두면 제어기·미션이
+        'NaN 비교는 False' 규칙 때문에 가장 공격적인 분기로 빠진다. 회복 비용은 한 프레임이다.
+        """
+        for f in self.filters:
+            if not (np.all(np.isfinite(f.x)) and np.all(np.isfinite(f.P)) and np.isfinite(f._omega)):
+                print("[ERR] IMM-EKF 상태가 비유한 — 재초기화 대기")
+                self.initialized = False
+                self.mu = MU0.copy()
+                self._fused = None
+                return False
+        return True
+
     def get_state(self):
+        if self.initialized:
+            self._finite_or_reset()
         if not self.initialized:
             return np.zeros(6), np.eye(6) * 999
         if self._fused is None:

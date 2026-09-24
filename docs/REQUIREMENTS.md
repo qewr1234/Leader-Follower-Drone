@@ -79,6 +79,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | SAF-13 | 공분산 폭주 중에는 LOST_HOLD 이고 회복 첫 프레임에 착륙 명령이 나가지 않는다 | mission_manager.py | T | UT[타이머: 공분산] | 검증됨 |
 | SAF-14 | LAND 는 FC 가 GUIDED 안에 있을 때만 2 s 간격으로 재시도하고, 먹으면 FC 가 하강한다 | main.py `LAND_RETRY_SEC` | T | SITL[pilot_takeover]; CL[LAND 이후] | 검증됨 |
 | SAF-15 | 위 안전 동작이 폐루프 실비행(실제 공력·바람·프롭워시)에서 유지된다 | VERIFICATION 미검증 | D | — | 미검증 |
+| SAF-16 | 추정·명령 경로의 비유한 값(NaN/inf)은 '최대 속도' 가 아니라 '정지' 로 귀결된다: 송신부는 0 으로 치환하고, 제어기는 0 명령을 내며, NaN 공분산은 최대 불확실로 취급하고, EKF 는 재초기화 대기로 돌아간다 | 외부 레퍼런스 감사 2026-09-24 (clamp(nan)=hi 재현) | T, I | UT[NaN:]; INSPECT[utils_geometry.py:if x != x]; INSPECT[main.py:비유한 속도 명령] | 검증됨 (단위 6개: 와이어·제어기·공분산 게이트·자세 보정·재초기화) |
 
 ### IF — 인터페이스
 

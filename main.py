@@ -200,7 +200,14 @@ _VEL_YAWRATE_MASK = (
 
 
 def send_body_velocity(master, vx, vy, vz, yaw_rate=0.0):
-    """BODY_NED 속도 setpoint. vx forward+, vy right+, vz down+ [m/s], yaw_rate 우회전+ [rad/s]."""
+    """BODY_NED 속도 setpoint. vx forward+, vy right+, vz down+ [m/s], yaw_rate 우회전+ [rad/s].
+
+    비유한 값(NaN/inf)은 여기서 0 으로 바꾼다 — 상류 어디서 새든 와이어에 닿기 전 마지막 방어다. 이 검사가
+    없으면 NaN 추정이 clamp 를 지나 전 축 최대 속도로 나갔다(2026-09-24). 정상 경로에서는 절대 걸리지 않는다.
+    """
+    if not all(math.isfinite(float(v)) for v in (vx, vy, vz, yaw_rate)):
+        print(f"[ERR] 비유한 속도 명령 ({vx}, {vy}, {vz}, {yaw_rate}) — HOLD(0) 로 대체")
+        vx = vy = vz = yaw_rate = 0.0
     master.mav.set_position_target_local_ned_send(
         int(time.time() * 1000) & 0xFFFFFFFF,
         master.target_system, master.target_component,
@@ -348,6 +355,12 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, targ
     front, right, up = (float(v) for v in np.asarray(rel_fru, dtype=float)[:3])
     v_front, v_right, v_up = (float(v) for v in np.asarray(rel_vel_fru, dtype=float)[:3])
     vs_f, vs_r, vs_u = (0.0, 0.0, 0.0) if v_self_fru is None else (float(v) for v in np.asarray(v_self_fru, dtype=float)[:3])
+    # 추정이 비유한이면 '모른다' 이고, 모르면 정지다. clamp 가 NaN 을 상한으로 바꾸기 전에 여기서 끊는다.
+    if not all(math.isfinite(v) for v in (front, right, up, v_front, v_right, v_up, vs_f, vs_r, vs_u, float(target_distance))):
+        return np.zeros(4)
+    # 공분산 trace 가 NaN 이면 'NaN > 임계' 가 False 라 감속 게이트가 열린 채 지나간다 — 비유한은 최대 불확실로 본다.
+    if not math.isfinite(float(pos_cov_trace)):
+        pos_cov_trace = float("inf")
 
     if pos_cov_trace > UNCERTAINTY_SLOWDOWN_TRACE:
         scale = 0.55
@@ -710,6 +723,8 @@ def main():
             # ---------------- 추정 상태 → 미션 ----------------
             x_est, P_est = ekf.get_state()
             pos_cov_trace = float(np.trace(P_est[:3, :3])) if ekf.initialized else 999.0
+            if not math.isfinite(pos_cov_trace):        # NaN 공분산 = 최대 불확실 (미션 게이트 > 8.0 이 LOST_HOLD 로 보낸다)
+                pos_cov_trace = 999.0
             mu = ekf.get_model_probs() if ekf.initialized else np.array([0.0, 0.0])
             rel_fru = camera_xyz_to_fru(x_est[:3])
             # 상태의 속도는 리더 '절대' 속도. 제어 D 항·미션 폴백은 상대 속도(절대 − 자기)를 쓴다.

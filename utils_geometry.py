@@ -6,6 +6,14 @@ import numpy as np
 
 
 def clamp(x, lo, hi):
+    """[lo, hi] 로 자른다. NaN 은 0 으로 본 뒤 자른다.
+
+    max(lo, min(hi, nan)) 은 Python 비교 규칙상 hi 를 돌려준다 — 속도 명령에 쓰면 NaN 추정이 '정지' 가 아니라
+    '전 축 최대 속도' 로 나간다 (2026-09-24 재현: [0.35, 0.22, -0.12, 0.35]). 0 은 속도·비율·화소 어느 용도에서도
+    안전한 쪽이다.
+    """
+    if x != x:          # NaN
+        x = 0.0
     return max(lo, min(hi, x))
 
 
