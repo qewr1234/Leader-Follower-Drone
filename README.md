@@ -290,6 +290,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 
 - [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
 - [docs/MULTI_FOLLOWER_FOUNDATION.md](docs/MULTI_FOLLOWER_FOUNDATION.md) — 코드 정밀 분석(데이터 흐름·발견 결함), 문헌·ArduPilot/PX4 소스 기준의 제어 판단, 선두 1 : 후미 N 확장 토대
+- [docs/FORMATION_THEORY.md](docs/FORMATION_THEORY.md) — 편대 이론(이론 우선 트랙): 선두 방송 토폴로지의 스트링 안정성 정리, 시간간격 정책의 최소 h, 포화·이득 전환에 대한 원판 판별법 절대안정성, 실제 코드 체인 시뮬 검증, 졸업 논문 구성 제안 (`analysis/formation_theory.py`)
 - [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) — 바깥 루프 선형 모델, 위상·이득 여유, 스트링 안정성, 체인 시뮬레이션, 개선안
 - [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 57개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법

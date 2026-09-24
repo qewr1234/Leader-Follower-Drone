@@ -41,6 +41,9 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | FCR-17 | 리더 상대 heading 은 방송 yaw > 리더 속도 방향(≥ `heading_min_speed_mps`) > 최근값 유지(`heading_hold_sec`) > 없음 순으로 정하고, 없으면 슬롯을 같은 거리의 LOS 후방으로 강등하며 그 사실을 알린다 | formation.py | T | UT[편대: 상대 heading 소스]; UT[편대: 상대 heading 0] | 검증됨 |
 | FCR-18 | 선두 속도 방송 토폴로지(`ff_source="broadcast"`)에서 리더→n 단 누적 속도 이득이 단 수에 따라 커지지 않고(3단 ≤ 1.15), 선행기 추종보다 작으며, KFF 1.0 도 안정하다 | MULTI_FOLLOWER_FOUNDATION 3.2·4.3 (Seiler 2004, Zheng 2016) | A | UT[편대: 체인 토폴로지]; UT[편대: 선두 속도 방송이면] | 검증됨 (실제 코드 체인 시뮬 — SITL 다기체 시나리오 없음) |
 | FCR-19 | 제어 오차는 FC 의 BODY_NED 해석(yaw 만 회전, z 불변)과 같은 수평 프레임이어야 한다 — 기체 기울기(roll/pitch)가 같은 고도 리더에 상하·좌우 명령을 만들지 않는다 | MULTI_FOLLOWER_FOUNDATION 2.2 A1 | T | UT[수평화:] | **미충족 (기본값)** — pitch 10° 에서 vz 0.094 m/s 편향. `controller.level_by_attitude=True` 로 해소되나 SITL 자세 기울기 시나리오 뒤 기본값 전환 필요 |
+| FCR-20 | 선두 방송 토폴로지에서 인접 단 교란 전달 ‖T‖∞ ≤ 1 (L2 스트링 안정)이고 리더→i 단 속도 이득 ‖Γ_i‖∞ 가 i 에 대해 균일 유계이며 꼬리가 ‖P·B_d‖∞ ≤ KFF 로 수렴한다 (정리 1). 선행기 추종은 Γ_1^i 로 발산 | FORMATION_THEORY 2절 | A | UT[이론: 정리 1] | 검증됨 (선형 모델 + 실제 코드 4단 체인 시뮬 ≤ 10 %; 실기 미검증) |
+| FCR-21 | 방송이 없을 때 시간간격 정책 D0 + h·v_F 로 스트링 안정을 회복하는 최소 h 가 계산되어 있다 (KFF 0.8: 1.22 s, 추가 이격 0.37 m @0.3 m/s; KFF 1.0: 2.12 s) (정리 2) | FORMATION_THEORY 3절 | A | UT[이론: 정리 2] | 검증됨 (분석; 코드에는 미구현 — 정책 선택은 운용 결정) |
+| FCR-22 | 명령 포화·불확실성 감속(0.55/0.75)·추종 이득 전환(섹터 [δ,1], δ>0)에 대해 외루프가 절대안정하다 — 원판 판별법 min Re L(jω) > −1, 현재 설계 여유 0.76 (정리 3). 소프트 데드존은 유계 외란(정상상태 KFF·DB/Kp = 0.18 m) | FORMATION_THEORY 4절 | A | UT[이론: 정리 3]; UT[이론: 대신호] | 부분 (SISO 축별·수치 인증서; 추종/정지(이득 0) 전환은 dwell-time 논거 미완) |
 
 ### EST — 인지 / 추정
 
@@ -145,6 +148,8 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | FCR-19 | 미충족 (기본값) | 폐루프 FakeFC 에 가속도 비례 pitch 를 넣은 자세 기울기 시나리오 추가 → `controller.level_by_attitude` 기본값 True |
 | FCR-18 | 검증됨 (시뮬) | SITL 다기체(리더 1 + 후미 2~3, `-I0/-I1/-I2`) V 자 편대 + `leader_sine` 시나리오로 실측 |
 | SAF-17 | 미검증 | 후미 상태 방송(`LeaderState` 스키마 재사용) + 이웃 간 최소 이격 반발항 |
+| FCR-22 | 부분 | 추종/정지 전환(이득 0 포함)을 스위칭 시스템으로 두고 dwell-time 또는 공통 Lyapunov 논거; 측면·기수 2×2 결합 포함 |
+| FCR-10 | 부분 | 단일 후미 \|Γ\| 1.13 은 남지만 다중 후미 체인의 누적 문제는 FCR-20(선두 방송)으로 해소. 방송 없는 운용이면 FCR-21 의 h 적용 |
 
 ## 4. 검사 방법
 

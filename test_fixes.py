@@ -1197,6 +1197,34 @@ check("ESP32 GPS 신선도: 팔로워 GLOBAL_POSITION_INT 가 0.7 s 보다 오�
       _m_fresh["available"] and not _m_stale["available"] and _m_stale["reason"] == "stale_follower_gps" and _m_nogate["available"],
       f"fresh={_m_fresh['available']} stale={_m_stale.get('reason')} nogate={_m_nogate['available']}")
 
+# ------------------------------------------------- 이론: 편대 스트링 안정성 · 시간간격 · 절대안정성 (analysis/formation_theory.py, docs/FORMATION_THEORY.md)
+from analysis import formation_theory as _ft  # noqa: E402
+_th = _ft.compute_all(_frf)
+_t1 = _th["theorem1"]
+check("이론: 정리 1 — 선두 방송 토폴로지: 인접 단 교란 전달 ‖T‖∞ ≤ 1 (L2 스트링 안정), 리더→i 단 |Γ_i| 피크가 i 에 대해 유계(6단까지 ≤ Γ_1+0.01, 6단 ≤ 1.0)이고 꼬리 ‖P·B_d‖∞ ≤ KFF; 선행기 추종은 Γ_1^i 로 발산(6단 ≥ 2.0)",
+      _t1["T_inf_norm"] <= 1.0 + 1e-6 and max(_t1["peaks_broadcast"]) <= _t1["peaks_broadcast"][0] + 0.01
+      and _t1["peaks_broadcast"][-1] <= 1.0 + 1e-3 and _t1["PBd_inf_norm"] <= main.KFF_LEADER_VEL + 1e-6
+      and _t1["peaks_predecessor"][-1] >= 2.0 and all(b < a for a, b in zip(_t1["peaks_predecessor"], _t1["peaks_broadcast"])),
+      f"T∞={_t1['T_inf_norm']:.4f} 방송={[round(v, 3) for v in _t1['peaks_broadcast']]} 선행기={[round(v, 3) for v in _t1['peaks_predecessor']]}")
+_vb = [v for v in _th["validation"] if v["topology"] == "leader_broadcast"]; _vp = [v for v in _th["validation"] if v["topology"] == "predecessor"]
+check("이론: 정리 1 검증 — 실제 코드 4단 체인 시뮬의 리더→i 단 진폭비가 선형 Γ_i 와 방송 토폴로지 ≤ 10 %, 선행기 추종 ≤ 25 %(단마다 4 % 안팎 누적) 안에서 맞음",
+      all(v["max_rel_err"] <= 0.10 for v in _vb) and all(v["max_rel_err"] <= 0.25 for v in _vp),
+      f"방송 {[round(100 * v['max_rel_err'], 1) for v in _vb]} % 선행기 {[round(100 * v['max_rel_err'], 1) for v in _vp]} %")
+_t2 = _th["theorem2"]
+check("이론: 정리 2 — 시간간격 정책 D0 + h·v_F: vision FF(KFF 0.8) 은 h_min 1.22 s(±0.1) 에서 ‖Γ_h‖∞ = 1, 추가 이격 0.37 m @0.3 m/s, 여유 개선(PM ≥ 90°, GM ≥ 18 dB); KFF 1.0 은 h_min 2.1 s(±0.15)",
+      abs(_t2["kff0.8"]["h_min_s"] - 1.22) <= 0.1 and abs(_t2["kff0.8"]["peak"] - 1.0) <= 0.01 and _t2["kff0.8"]["pm_deg"] >= 90 and _t2["kff0.8"]["gm_db"] >= 18
+      and abs(_t2["kff1.0"]["h_min_s"] - 2.12) <= 0.15,
+      f"h_min={_t2['kff0.8']['h_min_s']:.2f}/{_t2['kff1.0']['h_min_s']:.2f} s PM={_t2['kff0.8']['pm_deg']:.0f}° GM={_t2['kff0.8']['gm_db']:.1f} dB")
+_t3 = _th["theorem3"]
+check("이론: 정리 3 — 원판 판별법: 현재 설계 min Re L(jω) ≈ −0.24 (여유 ≥ 0.7 > 0), 수정 전 설계·Kp ≤ 0.8 스윕도 모두 −1 위 → 명령 포화·불확실성 감속·추종 이득 전환(섹터 [δ,1]) 에 절대안정. 2026-09-18 스트링 결함은 대신호 문제가 아니었음",
+      _t3["current"]["certified"] and _t3["current"]["disk_margin"] >= 0.7 and abs(_t3["current"]["min_re_L"] + 0.237) < 0.03
+      and all(v["certified"] for v in _t3.values()) and _t3["before_2026-09-18"]["disk_margin"] >= 0.4,
+      " ".join(f"{k}:{v['min_re_L']:+.3f}" for k, v in _t3.items()))
+_ls = _th["large_signal"]
+check("이론: 대신호 확인(실제 코드) — 초기 오차 +4 m 계단에서 명령이 0.35 로 오래 포화해도 언더슈트 없이(최소 간격 ≥ 2.9 m) 수렴(최종 |오차| < 0.05 m); 리더 0.3±0.5 m/s 로 포화가 상시 활성인 정현파에서도 오차 진폭이 커지지 않음",
+      _ls["step"]["min_spacing_m"] >= 2.9 and abs(_ls["step"]["final_err_m"]) < 0.05 and _ls["sine"]["bounded"],
+      f"min_spacing={_ls['step']['min_spacing_m']:.2f} final={_ls['step']['final_err_m']:+.3f} sine {_ls['sine']['max_abs_err_first_half_m']:.2f}→{_ls['sine']['max_abs_err_second_half_m']:.2f} m")
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "

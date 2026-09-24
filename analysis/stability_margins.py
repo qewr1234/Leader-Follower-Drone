@@ -320,7 +320,8 @@ class _Follower:
         self.p = p
 
 
-def chain_sim(n_followers=4, v_leader=0.3, T=50.0, p=None, profile="step", omega=None, amp=None, topology="predecessor"):
+def chain_sim(n_followers=4, v_leader=0.3, T=50.0, p=None, profile="step", omega=None, amp=None, topology="predecessor",
+              initial_err=0.0):
     """리더 + n 팔로워 체인. 각 팔로워는 앞 기체와의 거리만 카메라 z 축 측정으로 받는다(잡음 없음).
     profile: 'step' = 2s 뒤 1s 램프로 v_leader, 30s 에 정지 / 'sine' = v_leader + amp·sin ωt (amp 기본 = v_leader).
     topology: 'predecessor' = 피드포워드 입력이 자기 속도 + 앞 기체 상대속도(기존, 각 단이 앞 단만 안다) /
@@ -336,7 +337,8 @@ def chain_sim(n_followers=4, v_leader=0.3, T=50.0, p=None, profile="step", omega
     dt = 1.0 / FPS
     send_every = int(round(FPS / SETPOINT_HZ))
     xs = [0.0]
-    fols = [_Follower(-3.0 * (i + 1), p) for i in range(n_followers)]
+    # initial_err: 각 단의 초기 간격을 목표 3 m 에서 이만큼 벌린다(대신호·포화 시험용, 기본 0 = 기존).
+    fols = [_Follower(-(3.0 + float(initial_err)) * (i + 1), p) for i in range(n_followers)]
     hist = {"t": [], "leader_v": [], "err": [[] for _ in fols], "v": [[] for _ in fols]}
     xl, vl = 0.0, 0.0
     try:
