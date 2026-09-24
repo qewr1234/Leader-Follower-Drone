@@ -1184,8 +1184,8 @@ _rel_t2 = main.camera_xyz_to_fru(main._CAM_FROM_BODY @ (main.rot_body_to_ned(*_r
 check("수평화: 우측 롤 10° 에 우측 2 m 리더는 카메라 프레임에서 위로 0.35 m 떠 보이지만 수평화하면 (3, 2, 0); 수평 기체면 항등",
       abs(_rel_t2[2] - 2 * _math.sin(_math.radians(10))) < 1e-6 and np3.allclose(main.level_fru_by_roll_pitch(_rel_t2, *_rpy2[:2]), [3.0, 2.0, 0.0], atol=1e-9)
       and np3.allclose(main.level_fru_by_roll_pitch([1.0, 2.0, 3.0], 0.0, 0.0), [1.0, 2.0, 3.0]), f"{np3.round(_rel_t2, 3)}")
-check("수평화: 기본값은 꺼짐(config controller.level_by_attitude=False) — 기존 동작 보존, SITL 자세 시나리오 뒤 켤 것",
-      main.LEVEL_BY_ATTITUDE is False and CONFIG["controller"]["level_by_attitude"] is False)
+check("수평화: 기본값은 켜짐(config controller.level_by_attitude=True) — 폐루프 tilt 시나리오가 결함 재현·해소를 모두 확인 (test_closed_loop.py --scenario tilt)",
+      main.LEVEL_BY_ATTITUDE is True and CONFIG["controller"]["level_by_attitude"] is True)
 
 # ------------------------------------------------- ESP32 GPS 신선도: 팔로워 GLOBAL_POSITION_INT 가 오래되면 상대위치를 만들지 않는다
 _stale_fs = {"global_position": {"lat": 358300000, "lon": 1287500000, "alt": 35000, "timestamp": 1.0}, "attitude": {"yaw": 0.0, "timestamp": 5.0}}
@@ -1224,6 +1224,37 @@ _ls = _th["large_signal"]
 check("이론: 대신호 확인(실제 코드) — 초기 오차 +4 m 계단에서 명령이 0.35 로 오래 포화해도 언더슈트 없이(최소 간격 ≥ 2.9 m) 수렴(최종 |오차| < 0.05 m); 리더 0.3±0.5 m/s 로 포화가 상시 활성인 정현파에서도 오차 진폭이 커지지 않음",
       _ls["step"]["min_spacing_m"] >= 2.9 and abs(_ls["step"]["final_err_m"]) < 0.05 and _ls["sine"]["bounded"],
       f"min_spacing={_ls['step']['min_spacing_m']:.2f} final={_ls['step']['final_err_m']:+.3f} sine {_ls['sine']['max_abs_err_first_half_m']:.2f}→{_ls['sine']['max_abs_err_second_half_m']:.2f} m")
+
+# ------------------------------------------------- 안전: NaN 명령 방벽 (docs/FLIGHT_SAFETY_CHECKLIST.md)
+from utils_geometry import clamp as _clamp  # noqa: E402
+_nan = float("nan")
+check("안전: utils_geometry.clamp 는 max/min 이라 clamp(nan, −0.35, 0.35) = +0.35 (NaN 이 상한 전진 명령이 됨) — 방벽이 필요한 이유",
+      _clamp(_nan, -main.MAX_VX, main.MAX_VX) == main.MAX_VX and _clamp(float("inf"), -1, 1) == 1, f"{_clamp(_nan, -0.35, 0.35)}")
+_ok_cmd, _ok = main.sanitize_cmd(np3.array([0.1, -0.2, 0.05, 0.3]))
+_bad_cmd, _bad = main.sanitize_cmd(np3.array([_nan, 0.0, 0.0, 0.0]))
+_inf_cmd, _inf = main.sanitize_cmd([0.0, 0.0, float("-inf"), 0.0])
+check("안전: sanitize_cmd 는 유한 명령은 그대로, NaN/inf 가 한 성분이라도 있으면 네 축 전부 0(정지) + False",
+      _ok and np3.allclose(_ok_cmd, [0.1, -0.2, 0.05, 0.3]) and not _bad and not _inf and not _bad_cmd.any() and not _inf_cmd.any())
+
+
+class _SendRec:
+    def __init__(self):
+        self.sent = []
+        self.mav = self
+        self.target_system = self.target_component = 1
+
+    def set_position_target_local_ned_send(self, *a):
+        self.sent.append(a)
+
+
+_sr = _SendRec()
+main.send_body_velocity(_sr, _nan, 0.1, float("inf"), 0.2)
+main.send_body_velocity(_sr, 0.11, -0.05, 0.02, -0.1)
+check("안전: send_body_velocity 최종 방벽 — 비유한 성분이 있으면 (0,0,0,yaw 0) 을 보내고, 유한 명령은 그대로 보낸다",
+      _sr.sent[0][8:11] == (0.0, 0.0, 0.0) and _sr.sent[0][15] == 0.0 and _sr.sent[1][8:11] == (0.11, -0.05, 0.02) and _sr.sent[1][15] == -0.1,
+      f"{_sr.sent[0][8:11]} {_sr.sent[1][8:11]}")
+check("안전: 상수 — 인계 고도 위 천장 5 m, FC 모드 불명 3 s(GUID_TIMEOUT 과 동일), FC 상태 정체 정지 1 s, AGL 바닥 1.5 m",
+      main.MAX_CLIMB_ABOVE_ENTRY_M == 5.0 and main.FC_MODE_MAX_AGE_SEC == 3.0 and main.FC_STATE_HOLD_AGE_SEC == 1.0 and main.MIN_AGL_M == 1.5)
 
 # ---------------------------------------------------------------- 
 print()

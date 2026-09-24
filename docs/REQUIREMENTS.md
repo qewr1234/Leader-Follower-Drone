@@ -40,7 +40,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | FCR-16 | 편대 슬롯: 슬롯 미설정이면 위치 오차가 기존 (front−TARGET, right, up) 과 비트 단위로 같고, 리더 heading 기준 / NED 슬롯은 후미 FRU 로 회전되며, 비전 거리 없이 GPS 뿐이면 슬롯 방향을 유지한 채 이격을 `TARGET_DISTANCE_GPS_ONLY_M` 으로 늘린다 | MULTI_FOLLOWER_FOUNDATION 4절 | T | UT[편대: 기본 LOS]; UT[편대: 리더 heading 기준]; UT[편대: 상대 heading 0]; UT[편대: NED]; UT[편대: 비전 거리]; CL[main.main()] | 검증됨 (단위; 폐루프 스트림은 변경 전 `--dump` 와 `--compare` 로 동일 확인) |
 | FCR-17 | 리더 상대 heading 은 방송 yaw > 리더 속도 방향(≥ `heading_min_speed_mps`) > 최근값 유지(`heading_hold_sec`) > 없음 순으로 정하고, 없으면 슬롯을 같은 거리의 LOS 후방으로 강등하며 그 사실을 알린다 | formation.py | T | UT[편대: 상대 heading 소스]; UT[편대: 상대 heading 0] | 검증됨 |
 | FCR-18 | 선두 속도 방송 토폴로지(`ff_source="broadcast"`)에서 리더→n 단 누적 속도 이득이 단 수에 따라 커지지 않고(3단 ≤ 1.15), 선행기 추종보다 작으며, KFF 1.0 도 안정하다 | MULTI_FOLLOWER_FOUNDATION 3.2·4.3 (Seiler 2004, Zheng 2016) | A | UT[편대: 체인 토폴로지]; UT[편대: 선두 속도 방송이면] | 검증됨 (실제 코드 체인 시뮬 — SITL 다기체 시나리오 없음) |
-| FCR-19 | 제어 오차는 FC 의 BODY_NED 해석(yaw 만 회전, z 불변)과 같은 수평 프레임이어야 한다 — 기체 기울기(roll/pitch)가 같은 고도 리더에 상하·좌우 명령을 만들지 않는다 | MULTI_FOLLOWER_FOUNDATION 2.2 A1 | T | UT[수평화:] | **미충족 (기본값)** — pitch 10° 에서 vz 0.094 m/s 편향. `controller.level_by_attitude=True` 로 해소되나 SITL 자세 기울기 시나리오 뒤 기본값 전환 필요 |
+| FCR-19 | 제어 오차는 FC 의 BODY_NED 해석(yaw 만 회전, z 불변)과 같은 수평 프레임이어야 한다 — 기체 기울기(roll/pitch)가 같은 고도 리더에 상하·좌우 명령을 만들지 않는다 | MULTI_FOLLOWER_FOUNDATION 2.2 A1, FLIGHT_SAFETY_CHECKLIST 3절 | T | UT[수평화:]; CL[안전(tilt, 수평화 ON)]; CL[안전(tilt, 수평화 OFF] | 검증됨 (2026-09-24 기본값 True. 폐루프 tilt 시나리오: OFF 면 pitch −10° 에 vz −0.092, 팔로워가 D·tan10° = 0.52 m 위로 올라가 정착 / ON 이면 \|vz\| < 0.01, Δalt 0.005 m. 실기 지상 기울임 점검 필요) |
 | FCR-20 | 선두 방송 토폴로지에서 인접 단 교란 전달 ‖T‖∞ ≤ 1 (L2 스트링 안정)이고 리더→i 단 속도 이득 ‖Γ_i‖∞ 가 i 에 대해 균일 유계이며 꼬리가 ‖P·B_d‖∞ ≤ KFF 로 수렴한다 (정리 1). 선행기 추종은 Γ_1^i 로 발산 | FORMATION_THEORY 2절 | A | UT[이론: 정리 1] | 검증됨 (선형 모델 + 실제 코드 4단 체인 시뮬 ≤ 10 %; 실기 미검증) |
 | FCR-21 | 방송이 없을 때 시간간격 정책 D0 + h·v_F 로 스트링 안정을 회복하는 최소 h 가 계산되어 있다 (KFF 0.8: 1.22 s, 추가 이격 0.37 m @0.3 m/s; KFF 1.0: 2.12 s) (정리 2) | FORMATION_THEORY 3절 | A | UT[이론: 정리 2] | 검증됨 (분석; 코드에는 미구현 — 정책 선택은 운용 결정) |
 | FCR-22 | 명령 포화·불확실성 감속(0.55/0.75)·추종 이득 전환(섹터 [δ,1], δ>0)에 대해 외루프가 절대안정하다 — 원판 판별법 min Re L(jω) > −1, 현재 설계 여유 0.76 (정리 3). 소프트 데드존은 유계 외란(정상상태 KFF·DB/Kp = 0.18 m) | FORMATION_THEORY 4절 | A | UT[이론: 정리 3]; UT[이론: 대신호] | 부분 (SISO 축별·수치 인증서; 추종/정지(이득 0) 전환은 dwell-time 논거 미완) |
@@ -83,6 +83,10 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | SAF-15 | 위 안전 동작이 폐루프 실비행(실제 공력·바람·프롭워시)에서 유지된다 | VERIFICATION 미검증 | D | — | 미검증 |
 | SAF-16 | 편대 슬롯은 비행 전 정적 검사로 슬롯 간 최소 이격(`min_separation_m`), 리더까지 거리의 깊이창 여유(`depth_reserve_m`), slot_id / follower_id 중복을 거른다 | formation.py `validate_formation` | T | UT[편대: 유효성]; UT[편대: config] | 검증됨 (정적 검사만) |
 | SAF-17 | 후미 간 동적 충돌 회피와 리더 유실 시 편대 전체의 일관된 행동이 있다 | MULTI_FOLLOWER_FOUNDATION 4.5 | D | — | 미검증 (미구현 — 후미 상태 방송 뒤 반발항) |
+| SAF-18 | 비유한(NaN/inf) 명령은 어느 단계에서도 속도 setpoint 가 되지 않는다 — `clamp(nan)` 이 +MAX_VX 로 둔갑하는 것을 `sanitize_cmd`(정지) 와 `send_body_velocity` 최종 방벽이 막고, EKF 상태가 비유한이면 추정기를 리셋해 다음 측정에서 다시 시작한다 | FLIGHT_SAFETY_CHECKLIST 2절 (ArduCopter `sane_vel_or_acc_vector` 는 clamp 뒤라 발동 불가) | T | UT[안전: utils_geometry.clamp]; UT[안전: sanitize_cmd]; UT[안전: send_body_velocity]; CL[안전(nan)] | 검증됨 |
+| SAF-19 | FC HEARTBEAT 가 `FC_MODE_MAX_AGE_SEC`(3 s) 보다 오래되면 모드를 모르는 것으로 보아 모드 변경(LAND) 을 보내지 않고, 링크가 돌아오면 GUIDED 진입과 같이 미션을 리셋한다 | main.py `FC_MODE_MAX_AGE_SEC` | T | CL[안전(lost_alt)]; CL[안전(fc_stale): 3 s] | 검증됨 |
+| SAF-20 | ATTITUDE / LOCAL_POSITION_NED 가 `FC_STATE_HOLD_AGE_SEC`(1 s) 보다 오래되면 추종 대신 정지(0 속도) 를 보낸다 — 자세 없이 비전만으로 움직이지 않는다 | main.py `FC_STATE_HOLD_AGE_SEC` | T | CL[안전(fc_stale): FC 텔레메트리] | 검증됨 |
+| SAF-21 | 고도를 모르면(LOCAL_POSITION_NED 정체) 하강 명령을 막고(SAF-06 확장), GUIDED 인계 고도 + `MAX_CLIMB_ABOVE_ENTRY_M`(5 m) 위에서는 상승 명령을 막는다 | main.py `MAX_CLIMB_ABOVE_ENTRY_M` | T | CL[안전(climb)]; UT[안전: 상수] | 검증됨 (천장; 고도 미상 하강 차단은 SAF-20 의 정지가 먼저 걸림) |
 
 ### IF — 인터페이스
 
@@ -139,13 +143,13 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | EST-02 | 부분 | 카이제곱 임계 경계값 단위 검사 추가 |
 | EST-10 | 부분 | 실외 역광·강한 빛 조건에서 노출 옵션 실기 확인 |
 | EST-11 | 부분 | Jetson FPS 로그를 저장소에 남기기 |
-| SAF-06 | 부분 | AGL 바닥 차단 SITL 시나리오(저고도에서 하강 명령) |
+| SAF-06 | 부분 | AGL 바닥 차단 SITL 시나리오(저고도에서 하강 명령). 고도 미상 시 하강 차단·천장은 SAF-21 로 폐루프 검증 |
 | SAF-10 | 부분 | 카메라 스톨 30 회 → HOLD → 종료 폐루프 시나리오 |
 | SAF-15 | 미검증 | 폐루프 실비행(안전줄·저고도부터) |
 | SAF-05 | 부분 | 하네스 조종사 링크에 RC override 를 넣어 LOITER 중 고도를 유지하게 고치고 `handover` 재실행 (sitl/README 6절) |
 | FCR-02 | 확인 필요 | `depth_range` 를 `--duration 60` 이상으로 재실행해 평형 거리 3.45 m 수렴 확인 |
 | IF-11 | 미검증 | ESP32 펌웨어 작성, 패킷 포맷 고정 — 필드 규약은 `formation.LeaderState.to_follow_target()` (leader_id, yaw 추가) |
-| FCR-19 | 미충족 (기본값) | 폐루프 FakeFC 에 가속도 비례 pitch 를 넣은 자세 기울기 시나리오 추가 → `controller.level_by_attitude` 기본값 True |
+| FCR-19 | 검증됨 (하네스) | 실기 지상 기울임 점검(FLIGHT_SAFETY_CHECKLIST 3절 B-3) 으로 ATTITUDE 부호 규약 확인 |
 | FCR-18 | 검증됨 (시뮬) | SITL 다기체(리더 1 + 후미 2~3, `-I0/-I1/-I2`) V 자 편대 + `leader_sine` 시나리오로 실측 |
 | SAF-17 | 미검증 | 후미 상태 방송(`LeaderState` 스키마 재사용) + 이웃 간 최소 이격 반발항 |
 | FCR-22 | 부분 | 추종/정지 전환(이득 0 포함)을 스위칭 시스템으로 두고 dwell-time 또는 공통 Lyapunov 논거; 측면·기수 2×2 결합 포함 |

@@ -36,6 +36,15 @@ _P = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDe
 _P.add_argument("--dump", help="setpoint/상태 스트림을 JSON 으로 저장")
 _P.add_argument("--compare", help="저장된 JSON 과 비교해 첫 차이를 보고")
 _P.add_argument("--frames", type=int, default=1200)
+# 안전 시나리오 (docs/FLIGHT_SAFETY_CHECKLIST.md). default 만 --dump/--compare 골든 스트림의 대상이다.
+# 모두 리더가 3 s 에 출발해 미션이 FOLLOW 에 들어간 뒤의 일이다(출발 확인 전에는 명령이 나가지 않는다).
+#   tilt     : 리더 3~6 s 전진 후 정지, 8 s 부터 기체가 pitch −10° 로 기운 채(맞바람) 정지 리더를 본다 — 수평화(--level) 유무에 따른 vz 편향
+#   nan      : 6 s 에 EKF 상태가 NaN 이 된다 — setpoint 가 +0.35 전진으로 둔갑하지 않고, 추정기가 리셋돼 추종이 재개된다
+#   fc_stale : 리더 3~16 s 전진, 8~12 s FC 텔레메트리(HEARTBEAT 포함) 가 끊긴다 — 1 s 뒤 정지 명령, 3 s 뒤 모드 불명(LAND 금지), 복구 시 미션 리셋
+#   climb    : 리더 3~5 s 전진 후 0.1 m/s 로 계속 상승(--frames 1900) — 인계 고도 + MAX_CLIMB_ABOVE_ENTRY_M 에서 상승 명령이 멈춘다
+#   lost_alt : 25 s 영구 소실 뒤 30 s 부터 HEARTBEAT 만 끊긴다 — 35 s 의 FAILSAFE_LAND 에서 LAND 를 보내지 않는다
+_P.add_argument("--scenario", default="default", choices=["default", "tilt", "nan", "fc_stale", "climb", "lost_alt"])
+_P.add_argument("--level", type=int, default=None, help="controller.level_by_attitude 강제 (0/1). 없으면 config 값")
 ARGS = _P.parse_args()
 
 import numpy as np  # noqa: E402
@@ -116,8 +125,10 @@ CX, CY = W / 2.0, H / 2.0
 class World:
     """팔로워(NED, m/rad)와 리더의 월드 상태. 가짜 FC가 팔로워를 움직이고, 시나리오가 리더를 움직인다."""
     f_n = 0.0; f_e = 0.0; f_d = -15.0; f_yaw = 0.0
+    f_roll = 0.0; f_pitch = 0.0        # tilt 시나리오: 맞바람에 기운 자세 (이동 없이 자세만)
     l_n = 3.0; l_e = 0.0; l_d = -15.0
     visible = True
+    alt_hist = []        # (sim_t, 팔로워 고도)
     frames = 0
     dist = []            # (sim_t, front) — 추종 거리 이력
 
@@ -128,8 +139,21 @@ class World:
         return dn * c + de * s, -dn * s + de * c, -dd
 
 
+def _rot_body_to_ned(roll, pitch, yaw):
+    cr, sr, cp, sp, cy, sy = math.cos(roll), math.sin(roll), math.cos(pitch), math.sin(pitch), math.cos(yaw), math.sin(yaw)
+    return np.array([[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                     [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                     [-sp, cp * sr, cp * cr]])
+
+
 def _bbox_px():
-    front, right, up = World.relative_fru()
+    """리더를 기체 고정 카메라로 투영. roll/pitch 가 0 이면 예전 식(yaw 만) 과 같다."""
+    if World.f_roll == 0.0 and World.f_pitch == 0.0:
+        front, right, up = World.relative_fru()
+    else:
+        rel_ned = np.array([World.l_n - World.f_n, World.l_e - World.f_e, World.l_d - World.f_d])
+        frd = _rot_body_to_ned(World.f_roll, World.f_pitch, World.f_yaw).T @ rel_ned
+        front, right, up = float(frd[0]), float(frd[1]), float(-frd[2])
     front = max(front, 0.2)
     u = int(CX + FX * (right / front))
     v = int(CY - FY * (up / front))
@@ -169,6 +193,8 @@ class FakeFC:
         self.setpoints = []               # (frame, sim_t, vx, vy, vz, yr)
         self.mode_calls = []              # (frame, sim_t, mode)
         self._pending = []
+        self.mute = False                 # True 면 텔레메트리를 전혀 내지 않는다 (링크 정체)
+        self.mute_heartbeat = False       # True 면 HEARTBEAT 만 내지 않는다
 
     # --- main / mavlink_io 가 부르는 것
     def set_position_target_local_ned_send(self, tbm, sysid, compid, frame, mask, x, y, z, vx, vy, vz, ax, ay, az, yaw, yaw_rate):
@@ -210,27 +236,81 @@ class FakeFC:
             self.armed = False
 
         base_mode = 128 if self.armed else 0
+        World.alt_hist.append((CLOCK.sim, -World.f_d))
+        if self.mute:
+            self._pending = []
+            return
         self._pending = [
             _Msg("HEARTBEAT", type=2, base_mode=base_mode, mode_name=self.mode),
             _Msg("LOCAL_POSITION_NED", x=World.f_n, y=World.f_e, z=World.f_d,
                  vx=vx * c - vy * s, vy=vx * s + vy * c, vz=vz),
-            _Msg("ATTITUDE", roll=0.0, pitch=0.0, yaw=World.f_yaw, rollspeed=0.0, pitchspeed=0.0, yawspeed=yr),
+            _Msg("ATTITUDE", roll=World.f_roll, pitch=World.f_pitch, yaw=World.f_yaw, rollspeed=0.0, pitchspeed=0.0, yawspeed=yr),
             _Msg("GLOBAL_POSITION_INT", lat=358300000, lon=1287500000, alt=int((50 - World.f_d) * 1000),
                  relative_alt=int(-World.f_d * 1000), vx=0, vy=0, vz=0, hdg=int(math.degrees(World.f_yaw) % 360 * 100)),
         ]
+        if self.mute_heartbeat:
+            self._pending = [m for m in self._pending if m.get_type() != "HEARTBEAT"]
 
 
 FC = FakeFC()
 
 
 # ----------------------------------------------------------------- 시나리오
-def scenario(t):
+def scenario_default(t):
     """sim 시간 t 에서 리더/조종사가 하는 일. 프레임마다 get_frames() 에서 호출."""
     if 1.0 <= t < 1.0 + CLOCK.DT and FC.mode == "ALT_HOLD":
         FC.set_mode("GUIDED")                       # 조종사가 스위치를 넘김
     if 3.0 <= t < 11.0:
         World.l_n += 0.3 * CLOCK.DT                 # 리더 전진
     World.visible = not (16.0 <= t < 20.0) and t < 25.0
+
+
+def _handover(t):
+    if 1.0 <= t < 1.0 + CLOCK.DT and FC.mode == "ALT_HOLD":
+        FC.set_mode("GUIDED")
+
+
+def scenario_tilt(t):
+    """리더 3~6 s 전진 후 정지(LEADER_HOVER, 명령 허용). 8 s 부터 맞바람으로 pitch −10°(기수 하향) — 이동 없이 자세만,
+    FC 가 위치를 잡고 있는 상태의 자세 편향."""
+    _handover(t)
+    if 3.0 <= t < 6.0:
+        World.l_n += 0.3 * CLOCK.DT
+    World.f_pitch = math.radians(-10.0) if t >= 8.0 else 0.0
+
+
+def scenario_nan(t):
+    _handover(t)
+    if 3.0 <= t < 11.0:
+        World.l_n += 0.3 * CLOCK.DT
+
+
+def scenario_fc_stale(t):
+    _handover(t)
+    if 3.0 <= t < 16.0:
+        World.l_n += 0.3 * CLOCK.DT
+    FC.mute = 8.0 <= t < 12.0
+
+
+def scenario_climb(t):
+    _handover(t)
+    if 3.0 <= t < 5.0:
+        World.l_n += 0.3 * CLOCK.DT
+    if t >= 5.0:
+        World.l_d -= 0.1 * CLOCK.DT                 # 리더 상승 0.1 m/s (NED 라 d 감소). 팔로워 MAX_VZ 0.12 라 따라갈 수 있다
+
+
+def scenario_lost_alt(t):
+    scenario_default(t)
+    FC.mute_heartbeat = t >= 30.0
+
+
+_SCENARIOS = {"default": scenario_default, "tilt": scenario_tilt, "nan": scenario_nan,
+              "fc_stale": scenario_fc_stale, "climb": scenario_climb, "lost_alt": scenario_lost_alt}
+
+
+def scenario(t):
+    _SCENARIOS[ARGS.scenario](t)
 
 
 # ----------------------------------------------------------------- 인지 스텁
@@ -289,6 +369,21 @@ main.USE_LEADER_ESP32 = False
 main.SEND_MAVLINK_COMMANDS = True
 main.CONFIG["logger"]["enabled"] = False
 main.connect_fc = lambda: FC
+if ARGS.level is not None:
+    main.LEVEL_BY_ATTITUDE = bool(ARGS.level)
+if ARGS.scenario == "nan":
+    _nan_fired = []
+
+    class _NanEkf(main.ImmEkf):
+        """6 s 에 상태 벡터를 NaN 으로 오염시킨다 (특이 S / 극단 dt 가 일으킬 수 있는 종류)."""
+        def predict(self, dt):
+            super().predict(dt)
+            if not _nan_fired and CLOCK.sim >= 6.0 and self.initialized:
+                _nan_fired.append(CLOCK.sim)
+                for f in self.filters:
+                    f.x[:] = float("nan")
+                self.mark_dirty()
+    main.ImmEkf = _NanEkf
 
 STATES = []          # (frame, sim_t, state)
 
@@ -341,6 +436,61 @@ def first_time(state, after=0.0):
 check("main.main() 이 예외 없이 끝남", err is None, err or "")
 print(f"프레임 {World.frames}, setpoint {len(FC.setpoints)}개, 모드 변경 {FC.mode_calls}")
 print("상태 이력:", [f"{t:.1f}s:{s}" for _, t, s in STATES])
+
+
+def _sp_between(t0, t1):
+    return [s for s in FC.setpoints if t0 <= s[1] <= t1]
+
+
+def _alt_at(t):
+    return min(World.alt_hist, key=lambda a: abs(a[0] - t))[1]
+
+
+if ARGS.scenario == "tilt":
+    _vz = [s[4] for s in _sp_between(8.0, 12.0)]
+    _dalt = _alt_at(39.0) - _alt_at(2.0)
+    if main.LEVEL_BY_ATTITUDE:
+        check("안전(tilt, 수평화 ON): pitch −10° 로 기운 채 같은 고도 정지 리더를 봐도 vz 명령 |vz| < 0.01 m/s, 고도 변화 < 0.05 m",
+              _vz and max(abs(v) for v in _vz) < 0.01 and abs(_dalt) < 0.05, f"max|vz|={max(abs(v) for v in _vz) if _vz else float('nan'):.3f} Δalt={_dalt:+.3f} m")
+    else:
+        check("안전(tilt, 수평화 OFF — 결함 재현): pitch −10° 에 vz 명령 −0.05 m/s 이하(상승) 가 나가고 팔로워가 D·tan10° ≈ 0.5 m 위로 올라가 정착",
+              _vz and min(_vz) < -0.05 and 0.3 < _dalt < 0.8, f"min vz={min(_vz) if _vz else float('nan'):+.3f} Δalt={_dalt:+.3f} m")
+elif ARGS.scenario == "nan":
+    _pre = _sp_between(5.7, 6.0)
+    _post = _sp_between(6.0, 6.5)
+    _vx_pre = _pre[-1][2] if _pre else float("nan")
+    check("안전(nan): EKF 상태가 NaN 이 돼도 setpoint 는 전부 유한하고 한계 안이며, NaN 직후 전진 명령은 일단 감쇠한다(+0.35 로 둔갑 없음), 루프 생존",
+          err is None and _post and all(math.isfinite(x) for s in FC.setpoints for x in s[2:]) and all(abs(s[2]) <= main.MAX_VX + 1e-9 for s in _post)
+          and min(s[2] for s in _post) < _vx_pre - 0.02,
+          f"vx 직전={_vx_pre:.3f} 직후={[round(s[2], 3) for s in _post]}")
+    check("안전(nan): 추정기가 리셋돼 다음 측정에서 다시 시작하고 추종이 재개된다 (t=8~10 s 전진 명령 > 0.05)",
+          _nan_fired and any(s[2] > 0.05 for s in _sp_between(8.0, 10.0)), f"nan@{_nan_fired} n={len(_sp_between(8.0, 10.0))}")
+elif ARGS.scenario == "fc_stale":
+    _hold = _sp_between(9.5, 12.0)
+    _before = _sp_between(7.0, 8.0)
+    check("안전(fc_stale): FC 텔레메트리가 8.0 s 에 끊기면 1 s 뒤부터 정지 명령이 나가 평활 감쇠 후 9.5 s 부터 |v| < 0.02 — 직전에는 추종 중(vx>0)",
+          _before and any(s[2] > 0.05 for s in _before) and _hold and all(abs(s[2]) < 0.02 and abs(s[4]) < 0.02 for s in _hold),
+          f"7~8s max vx={max(s[2] for s in _before) if _before else float('nan'):.2f}, 9.5~12s max|vx|={max(abs(s[2]) for s in _hold) if _hold else float('nan'):.3f}")
+    check("안전(fc_stale): 3 s 이상 끊겨 모드 불명이 된 뒤 복구(12 s) 하면 GUIDED 진입과 같이 미션 리셋(WAIT_LEADER) → 출발 확인 뒤 FOLLOW 재개, LAND 없음",
+          any(st_t >= 12.0 and st == "READY_HOVER" for _, st_t, st in STATES) and first_time("FOLLOW", 12.0) is not None and not FC.mode_calls[1:],
+          f"states={[f'{t:.1f}:{s}' for _, t, s in STATES if t >= 11.0]} modes={FC.mode_calls}")
+elif ARGS.scenario == "climb":
+    _entry = _alt_at(1.1)
+    _mid = _alt_at(45.0)
+    _max = max(a for t, a in World.alt_hist if t <= 62.0)
+    _end = _alt_at(62.0)
+    check("안전(climb): 리더 0.1 m/s 상승을 따라 올라가다가(45 s 에 +3 m 이상) 인계 고도 + MAX_CLIMB_ABOVE_ENTRY_M(5 m) 천장에 붙어 멈춘다(최대 +5.3 m 이하, 62 s 에 +4.7~5.3 m)",
+          _mid > _entry + 3.0 and _max <= _entry + main.MAX_CLIMB_ABOVE_ENTRY_M + 0.3 and abs(_end - _entry - main.MAX_CLIMB_ABOVE_ENTRY_M) <= 0.3,
+          f"entry={_entry:.2f} 45s=+{_mid - _entry:.2f} max=+{_max - _entry:.2f} 62s=+{_end - _entry:.2f} m")
+elif ARGS.scenario == "lost_alt":
+    check("안전(lost_alt): 영구 소실 뒤 HEARTBEAT 가 끊기면(30 s~) 모드를 모르므로 FAILSAFE_LAND 에서도 LAND 를 보내지 않는다",
+          not [c for c in FC.mode_calls if c[2] == "LAND"] and state_at(36.0) in ("FAILSAFE_LAND", "WAIT_LEADER"),
+          f"modes={FC.mode_calls} state@36={state_at(36.0)}")
+
+if ARGS.scenario != "default":
+    print()
+    print(f"{'FAILED: ' + ', '.join(failures) if failures else '폐루프 검사 전부 통과'} ({len(failures)} 실패)")
+    sys.exit(1 if failures else 0)
 
 hz = len([s for s in FC.setpoints if 5.0 <= s[1] <= 15.0]) / 10.0
 # 위상 고정 송신이라 프레임 간격(1/30)과 무관하게 평균 10Hz 여야 한다 (프레임 경계 정렬 방식이면 7.5Hz 였다).

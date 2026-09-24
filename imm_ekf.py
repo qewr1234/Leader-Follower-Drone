@@ -185,6 +185,21 @@ class ImmEkf:
         """filters[i].x / P / mu 를 바깥에서 직접 고쳤으면 호출 (leader_telemetry 의 속도 힌트)."""
         self._fused = None
 
+    def reset(self):
+        """미초기화 상태로 되돌린다 — 다음 거리 측정에서 init() 으로 다시 시작. 상태에 NaN/inf 가 생기면 predict 가 그것을
+        영원히 유지하므로(NaN 은 NaN 으로 전파) main 이 매 프레임 유한성을 검사해 여기로 온다."""
+        self.filters = [_SingleEKF(i) for i in range(self.N_MODELS)]
+        self.mu = MU0.copy()
+        self.initialized = False
+        self.coast_time = 0.0
+        self.range_coast_time = 0.0
+        self.vision_range_coast_time = 0.0
+        self._fused = None
+
+    def is_finite(self):
+        x, P = self.get_state()
+        return bool(np.all(np.isfinite(x)) and np.all(np.isfinite(P)))
+
     def init(self, z, source="rgbd"):
         x0 = np.array([z[0], z[1], z[2], 0.0, 0.0, 0.0], dtype=float)
         P0 = _make_P0()

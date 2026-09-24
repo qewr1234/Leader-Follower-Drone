@@ -103,7 +103,16 @@ SETPOINT_PERIOD_SEC = 0.10
 LAND_RETRY_SEC = 2.0
 CAM_FAIL_LIMIT = 30      # 카메라 연속 실패 한계. 스톨 1회 = camera 타임아웃 0.5s 라 약 15초 뒤 포기 (그동안 FC 의 GUID_TIMEOUT 이 먼저 든다)
 FC_FAIL_LIMIT = 30       # FC 링크(drain) 연속 예외 한계
-MIN_AGL_M = 1.5          # 이 고도(AGL) 아래에서는 하강 명령을 내지 않는다
+MIN_AGL_M = 1.5          # 이 고도(AGL) 아래에서는 하강 명령을 내지 않는다. 고도를 모르면(LOCAL_POSITION_NED 정체) 역시 막는다
+# GUIDED 인계 고도보다 이만큼 위에서는 상승 명령을 내지 않는다. 트래커가 높은 물체를 물거나 리더 고도를 잘못 추정해도
+# 상승은 여기서 끝난다 (FC 의 FENCE_ALT_MAX 는 그 바깥의 2차 방벽).
+MAX_CLIMB_ABOVE_ENTRY_M = 5.0
+# FC HEARTBEAT 가 이보다 오래되면 모드를 모르는 것이다 → 모드 변경(LAND) 을 보내지 않는다. 링크가 돌아오면 GUIDED 진입과
+# 같이 미션을 리셋한다(그 사이 조종사가 무엇을 했는지 모르므로). 값은 ArduCopter GUID_TIMEOUT 기본 3 s 와 같다.
+FC_MODE_MAX_AGE_SEC = 3.0
+# ATTITUDE / LOCAL_POSITION_NED 가 이보다 오래되면 추종 대신 정지(0 속도) 를 보낸다 — 자세 없이는 자세 보정·수평화·
+# 리더 속도·고도 바닥이 모두 꺼진 채 비전만으로 움직이게 된다. 10 Hz 스트림의 정상 지터(0.1~0.2 s) 보다 훨씬 길다.
+FC_STATE_HOLD_AGE_SEC = 1.0
 
 GPS_MAX_AGE_SEC = 0.70
 LOCAL_POS_MAX_AGE_SEC = 0.40
@@ -176,6 +185,19 @@ def is_fresh(msg, now, max_age):
     return ts > 0.0 and (now - ts) <= max_age
 
 
+def sanitize_cmd(cmd):
+    """(명령, 유한했는가). NaN/inf 가 한 성분이라도 있으면 네 축 모두 0(정지).
+
+    utils_geometry.clamp 는 Python max/min 이라 clamp(nan, -0.35, 0.35) = +0.35 — NaN 이 상한 전진 명령으로 둔갑한다.
+    ArduCopter 는 NaN 속도를 거부하고 정지하지만(GCS_Mavlink.cpp sane_vel_or_acc_vector → mode_guided.init) 그 방벽은
+    clamp 뒤에서는 절대 발동하지 않으므로 여기서 막는다. 0 명령은 FC 가 위치 유지로 수행한다.
+    """
+    v = np.asarray(cmd, dtype=float)
+    if v.shape == (4,) and np.all(np.isfinite(v)):
+        return v, True
+    return np.zeros(4), False
+
+
 # ============================================================
 # MAVLink 송신
 # ============================================================
@@ -194,15 +216,19 @@ _VEL_YAWRATE_MASK = (
 
 
 def send_body_velocity(master, vx, vy, vz, yaw_rate=0.0):
-    """BODY_NED 속도 setpoint. vx forward+, vy right+, vz down+ [m/s], yaw_rate 우회전+ [rad/s]."""
+    """BODY_NED 속도 setpoint. vx forward+, vy right+, vz down+ [m/s], yaw_rate 우회전+ [rad/s].
+    마지막 방벽: 비유한 값은 전부 0(정지) 으로 보낸다 (sanitize_cmd 참조)."""
+    vals = [float(vx), float(vy), float(vz), float(yaw_rate)]
+    if not all(math.isfinite(v) for v in vals):
+        vals = [0.0, 0.0, 0.0, 0.0]
     master.mav.set_position_target_local_ned_send(
         int(time.time() * 1000) & 0xFFFFFFFF,
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_FRAME_BODY_NED, _VEL_YAWRATE_MASK,
         0.0, 0.0, 0.0,
-        float(vx), float(vy), float(vz),
+        vals[0], vals[1], vals[2],
         0.0, 0.0, 0.0,
-        0.0, float(yaw_rate),
+        0.0, vals[3],
     )
 
 
@@ -532,6 +558,8 @@ def main():
     v_self_lpf = None             # 자기 속도 정합 저역통과 상태 (FRU)
     v_leader_fru = None           # 리더 절대 속도 추정 (FRU). STAT 진단용으로 루프 밖에서도 참조
     slot_label, heading_src, ff_src = "-", "none", "-"     # 편대 진단 (STAT 은 직전 프레임 값을 찍는다)
+    entry_alt = None              # GUIDED 인계 시점의 고도 (천장 MAX_CLIMB_ABOVE_ENTRY_M 의 기준)
+    prev_fc_state_ok = True       # FC 상태 정체 경고를 에지에서만 찍기 위해
 
     print("=" * 90)
     print("[INFO] q/ESC 종료 | m: MARS-IMM on/off | v: MAVLink velocity 송신 on/off | l: LAND | h: HOLD")
@@ -560,9 +588,12 @@ def main():
             vehicle_state = get_vehicle_state()
 
             # C2: FC 모드를 매 루프 읽는다. GUIDED/OFFBOARD 를 벗어났다 = 조종사가 탈환했다 → LAND 를 보내지 않는다.
-            fc_mode = vehicle_state.get("mode", {}).get("name", "?")
-            fc_armed = vehicle_state.get("mode", {}).get("armed", False)
-            fc_accepts_setpoints = fc_mode in ("GUIDED", "OFFBOARD")
+            fc_mode_msg = vehicle_state.get("mode", {})
+            fc_mode = fc_mode_msg.get("name", "?")
+            fc_armed = fc_mode_msg.get("armed", False)
+            # HEARTBEAT 가 FC_MODE_MAX_AGE_SEC 보다 오래됐으면 모드를 모른다 — 마지막 문자열이 GUIDED 였다고 LAND 를 보내면 안 된다.
+            fc_mode_known = is_fresh(fc_mode_msg, now, FC_MODE_MAX_AGE_SEC)
+            fc_accepts_setpoints = fc_mode_known and fc_mode in ("GUIDED", "OFFBOARD")
 
             # GUIDED 진입 = 조종사가 방금 자동에게 넘긴 순간. 그 전까지 FC 는 우리 명령을 버렸으므로 그동안 쌓인
             # 상태(수동 상승 중 FAILSAFE_LAND 로 래치된 미션, 포화된 평활 버퍼)를 들고 들어가면 안 된다.
@@ -573,6 +604,7 @@ def main():
                 v_self_lpf = None
                 heading_est.reset()
                 last_land_send = 0.0
+                entry_alt = None
                 print(f"[SYS] {fc_mode} 진입 — 미션/명령 리셋")
             prev_fc_accepts = fc_accepts_setpoints
 
@@ -596,7 +628,7 @@ def main():
                       f"mission={mission.state} "
                       f"vL={(float(np.linalg.norm(v_leader_fru)) if v_leader_fru is not None else float('nan')):.2f} "
                       f"ff={ff_fru[0]:+.2f}({ff_src}) slot={slot_label} hdg={heading_src} "
-                      f"fresh=LP{int(local_pos_fresh)}/ATT{int(attitude_fresh)} {stream_rates_text(now)}")
+                      f"fresh=LP{int(local_pos_fresh)}/ATT{int(attitude_fresh)}/HB{int(fc_mode_known)} {stream_rates_text(now)}")
                 if SEND_MAVLINK_COMMANDS and not fc_accepts_setpoints:
                     print(f"[WARN] FC mode={fc_mode}: 송신 중단됨 (ArduPilot: GUIDED / PX4: OFFBOARD 필요)")
                 last_stat_print = now
@@ -669,6 +701,11 @@ def main():
                 ekf.on_lost(dt)
 
             # ---------------- 추정 상태 → 미션 ----------------
+            # 상태에 NaN/inf 가 생기면(특이 S, 극단 dt 등) predict 가 영원히 유지한다 → 미초기화로 되돌려 다음 측정에서 다시 시작.
+            # 그 프레임은 초기화 전과 같이 취급된다(거리 없음 → 미션은 소실 경로, 명령 0).
+            if ekf.initialized and not ekf.is_finite():
+                ekf.reset()
+                print("[WARN] EKF 상태 비유한 — 추정기 리셋")
             x_est, P_est = ekf.get_state()
             pos_cov_trace = float(np.trace(P_est[:3, :3])) if ekf.initialized else 999.0
             mu = ekf.get_model_probs() if ekf.initialized else np.array([0.0, 0.0])
@@ -751,8 +788,30 @@ def main():
                 desired_body_cmd = compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance_m, ff_fru,
                                                                       slot_error=slot_err)
 
+            # FC 상태(자세·위치) 스트림이 정체되면 추종하지 않고 정지한다 — 자세 없이는 자세 보정·수평화·리더 속도가 꺼진 채
+            # 비전만으로 움직이고 고도도 모른다. FC 는 0 속도를 위치 유지로 수행한다 (ArduCopter velaccel_control_run).
+            fc_state_ok = is_fresh(att, now, FC_STATE_HOLD_AGE_SEC) and \
+                is_fresh(vehicle_state.get("local_position", {}), now, FC_STATE_HOLD_AGE_SEC)
+            if not fc_state_ok:
+                desired_body_cmd = np.zeros(4)
+            if fc_state_ok != prev_fc_state_ok:
+                print(f"[{'SYS' if fc_state_ok else 'WARN'}] FC 상태 스트림 {'복구' if fc_state_ok else '정체 — 정지 명령'}")
+            prev_fc_state_ok = fc_state_ok
+
+            # NaN/inf 는 clamp 를 지나며 상한 전진 명령이 된다 — 정지로 바꾼다.
+            desired_body_cmd, cmd_finite = sanitize_cmd(desired_body_cmd)
+            if not cmd_finite:
+                print("[WARN] 명령에 비유한 값 — 정지 명령으로 대체")
+
             # 수직 축은 리더 상대 고도를 따라간다 — 트래커가 지면의 무언가를 물면 계속 하강한다. AGL 바닥.
-            if follower_alt is not None and follower_alt < MIN_AGL_M and desired_body_cmd[2] > 0.0:
+            # 고도를 모르면(None) 하강도 막는다: "모름" 은 "충분히 높음" 이 아니다.
+            if desired_body_cmd[2] > 0.0 and (follower_alt is None or follower_alt < MIN_AGL_M):
+                desired_body_cmd[2] = 0.0
+            # 천장: 인계 고도 + MAX_CLIMB_ABOVE_ENTRY_M 위에서는 상승(vz<0) 을 막는다.
+            if entry_alt is None and follower_alt is not None:
+                entry_alt = follower_alt
+            if desired_body_cmd[2] < 0.0 and entry_alt is not None and follower_alt is not None \
+                    and follower_alt > entry_alt + MAX_CLIMB_ABOVE_ENTRY_M:
                 desired_body_cmd[2] = 0.0
 
             current_body_cmd = smooth_velocity_cmd(prev_body_cmd, desired_body_cmd, alpha=0.28, dt=dt)

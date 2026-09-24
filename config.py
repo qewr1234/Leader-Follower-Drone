@@ -91,8 +91,10 @@ CONFIG = {
         # 제어 오차 수평화. EKF 상대위치는 기체 고정 카메라 프레임(roll/pitch 포함)인데 FC 는 BODY_NED 속도를 yaw 만으로
         # 회전한다(ArduCopter body_to_earth2D, PX4 mavlink_receiver — z 는 그대로). 그래서 pitch 10° 로 기운 채 같은 고도
         # 리더를 보면 vz 0.094 m/s(상한 0.12) 가 나간다. True 면 제어 직전에 roll/pitch 를 되돌린다(main.level_fru_by_roll_pitch).
-        # 기본 False = 기존 동작 — SITL 에 자세 기울기 시나리오가 없어 실기/SITL 확인 뒤 켤 것.
-        "level_by_attitude": False,
+        # 기본 True (2026-09-24). 폐루프 하네스 tilt 시나리오(test_closed_loop.py --scenario tilt --level 0/1)가 꺼진 상태의
+        # 결함(pitch −10° 에 vz −0.092, 팔로워가 D·tan10° = 0.52 m 위로 올라가 정착)과 켠 상태의 해소(|vz| < 0.01)를 재현한다.
+        # 맞바람에 기운 채 호버하면 이 편향이 상시 걸린다. 실기 전 지상 기울임 점검은 docs/FLIGHT_SAFETY_CHECKLIST.md.
+        "level_by_attitude": True,
     },
     # ---- 편대 (선두 1 : 후미 N 토대, formation.py) ----
     # 기본값은 슬롯 미설정 = 후미 자신의 시선 기준 리더 뒤 TARGET_DISTANCE_M (기존 동작과 동일).
