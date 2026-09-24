@@ -166,6 +166,14 @@ Makerfabs 저장소의 DW3000 TWR 예제(initiator/responder)에서 `Serial.prin
 | 분석 | 고도(`vehicle_state.local_position.z`)·거리 RMS, `vehicle_state.attitude.pitch` 평균(맞바람 기울기) |
 | 원고 | "pitch 5° 기울기에서 수평화가 없었다면 D·tan θ = 0.26 m 의 고도 편향" 을 실측 pitch 로 계산해 넣는다 |
 
+### E8 — 측정 지연 주입 (관련 논문 P1 의 "지연 허용" 형식, docs/RELATED_WORK_EXPERIMENTS.md 6절)
+
+| | |
+|---|---|
+| 절차 | 컴패니언에 RGB-D 측정 지연 주입 스위치를 구현한 뒤(미구현), SITL `leader_sine` 로 0 → 3 s 스윕해 \|Γ\| > 1 이 되는 지연을 찾고 실비행은 0.1 / 0.2 / 0.3 s 만 (MAX_VX 0.15) |
+| 분석 | 지연별 \|Γ\| (E3 도구) 와 선형 모델 지연 여유 6.3 s 비교 |
+| 합격 | 실비행 0.3 s 까지 \|Γ\| 변화 < 10 % (예측과 일치) |
+
 ---
 
 ## 6. 분석 순서 (비행 당일 저녁)
