@@ -315,13 +315,19 @@ class _Follower:
         self.sent = 0.0                                  # FC 가 현재 들고 있는 setpoint
         self.delay = [0.0] * max(1, int(round(p.Td * FPS)))     # 검출·전송 지연 버퍼
         self.vmeas = [0.0] * max(1, int(round(p.Tm * FPS)))     # 자기 속도 수신 지연 버퍼
+        self.bcast = [0.0] * max(1, int(round(p.Tm * FPS)))     # 선두 속도 방송 수신 지연 버퍼 (topology="leader_broadcast")
         self.v_self_f = 0.0                                      # [제안] 정합 저역통과 상태
         self.p = p
 
 
-def chain_sim(n_followers=4, v_leader=0.3, T=50.0, p=None, profile="step", omega=None, amp=None):
+def chain_sim(n_followers=4, v_leader=0.3, T=50.0, p=None, profile="step", omega=None, amp=None, topology="predecessor"):
     """리더 + n 팔로워 체인. 각 팔로워는 앞 기체와의 거리만 카메라 z 축 측정으로 받는다(잡음 없음).
-    profile: 'step' = 2s 뒤 1s 램프로 v_leader, 30s 에 정지 / 'sine' = v_leader + amp·sin ωt (amp 기본 = v_leader)."""
+    profile: 'step' = 2s 뒤 1s 램프로 v_leader, 30s 에 정지 / 'sine' = v_leader + amp·sin ωt (amp 기본 = v_leader).
+    topology: 'predecessor' = 피드포워드 입력이 자기 속도 + 앞 기체 상대속도(기존, 각 단이 앞 단만 안다) /
+              'leader_broadcast' = 선두 절대 속도를 모든 단이 Tm 지연으로 받는다(formation.py 의 ff_source="broadcast").
+              P+D 는 두 경우 모두 앞 기체와의 거리에 건다(leader-predecessor 토폴로지, Zheng 등 2016)."""
+    if topology not in ("predecessor", "leader_broadcast"):
+        raise ValueError(f"unknown topology {topology!r}")
     p = p or Params()
     saved = (main.KFF_LEADER_VEL, main.FF_TAU_SEC, main.FF_DEADBAND_MPS)
     main.KFF_LEADER_VEL, main.FF_TAU_SEC = p.kff, p.tau_ff
@@ -357,7 +363,11 @@ def chain_sim(n_followers=4, v_leader=0.3, T=50.0, p=None, profile="step", omega
                 if p.tau_m > 0:
                     f.v_self_f += (v_self - f.v_self_f) * (1.0 - math.exp(-dt / p.tau_m)); v_self = f.v_self_f
                 ff_fn = _legacy_leader_velocity_ff if p.legacy_ff else main.leader_velocity_ff
-                f.ff = ff_fn(f.ff, [v_self + relv[0], 0.0, 0.0], dt)
+                if topology == "leader_broadcast":
+                    f.bcast.append(vl); v_ff_src = f.bcast.pop(0)       # 선두 절대 속도, 링크 지연 Tm
+                else:
+                    v_ff_src = v_self + relv[0]
+                f.ff = ff_fn(f.ff, [v_ff_src, 0.0, 0.0], dt)
                 u = main.compute_velocity_cmd_from_estimate(rel, relv, 1.0, None, f.ff)
                 f.cmd = main.smooth_velocity_cmd(f.cmd, u, alpha=SMOOTH_ALPHA, dt=dt)
                 if k % send_every == 0:

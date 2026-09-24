@@ -83,6 +83,12 @@ EKF 상대 속도의 합입니다.
 
 추정 불확실성(`pos_cov_trace`)이 크면 전체 명령에 0.55 / 0.75배 감속이 걸립니다.
 
+위치 오차 `(front − TARGET, right, up)` 은 **편대 슬롯 오차**의 특수형입니다 — 슬롯을 설정하지 않으면 후미 자신의 시선 기준
+"리더 뒤 TARGET_DISTANCE_M" 슬롯이 되어 위 식과 비트 단위로 같은 명령이 나옵니다. 슬롯을 리더 heading 기준으로 주면
+(`config.formation.slots`, ArduPilot `FOLL_OFS_TYPE=1` 과 같은 개념) 후미 여럿이 선두 하나를 V 자 등으로 따라갈 수 있는 토대가
+됩니다. 체인이 아니라 **선두 속도 방송**(`ff_source="broadcast"|"auto"`) 을 쓰는 이유, 기체 기울기가 제어 오차로 새는 결함
+(`controller.level_by_attitude`, 기본 꺼짐)과 문헌 근거는 [docs/MULTI_FOLLOWER_FOUNDATION.md](docs/MULTI_FOLLOWER_FOUNDATION.md) 에 있습니다.
+
 **피드포워드가 없으면 정상상태 거리 오차가 `v/KP_FORWARD` 로 남습니다** — 리더 0.3 m/s 에 1.4 m,
 1 m/s 에 4.5 m 로 깊이창(10 m) 밖으로 밀려 소실됩니다. 초기 SITL 실측 평형 거리 4.3 m 가 이론값
 `3.0 + 0.3/0.22 = 4.36 m` 와 일치한 것이 이 오차입니다. 피드포워드(`KFF = 0.8`)를 넣으면 오차는
@@ -264,6 +270,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 |---|---|
 | `main.py` | 제어 루프 전체 — 상수, 명령 생성, MAVLink 송신, 상태 표시 |
 | `mission_manager.py` | 미션 상태머신 (WAIT_LEADER / READY_HOVER / FOLLOW / LOST_HOLD / FAILSAFE_LAND …) |
+| `formation.py` | 선두 1 : 후미 N 토대 — 편대 슬롯(리더 heading / NED / 시선 기준), 리더 상대 heading 추정, `FOLLOW_TARGET` 호환 리더 상태 방송 스키마, 슬롯 정적 유효성 |
 | `imm_ekf.py` | 2모델 IMM-EKF (CV + Coordinated-Turn) |
 | `scheduler.py` | 검출기 on/off와 ROI 크기 스케줄링 |
 | `reliability.py` | 신뢰도 기반 R 팽창 + Mahalanobis 게이팅 |
@@ -282,6 +289,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 ## 문서
 
 - [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
+- [docs/MULTI_FOLLOWER_FOUNDATION.md](docs/MULTI_FOLLOWER_FOUNDATION.md) — 코드 정밀 분석(데이터 흐름·발견 결함), 문헌·ArduPilot/PX4 소스 기준의 제어 판단, 선두 1 : 후미 N 확장 토대
 - [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) — 바깥 루프 선형 모델, 위상·이득 여유, 스트링 안정성, 체인 시뮬레이션, 개선안
 - [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 57개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법

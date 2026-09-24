@@ -37,6 +37,10 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | FCR-13 | 출발·정지·착륙 판단은 리더 절대 속도(ESP32 > 자기+상대 > 상대 폴백) 로 한다 | README 안전 설계 | T | UT[미션:]; CL[리더 출발 후]; CL[추종 중(t=8s)]; SITL[depth_range] | 검증됨 |
 | FCR-14 | 피드포워드를 뺀 P+D 기준선은 PM ≥ 45°, GM ≥ 6 dB, Ms ≤ 1.5, 스트링 안정을 만족한다 | STABILITY_MARGINS 1절 | A | AN[kff_sweep.kff0.gm_db]; UT[분석: P+D] | 검증됨 (분석) |
 | FCR-15 | 리더 속도가 0.25 ± 0.05 m/s, 1.15 rad/s 정현파일 때 팔로워 속도 진폭비가 1 이하다 (실제 FC 에서의 스트링 안정성) | STABILITY_MARGINS 6절, sitl/README | T | SITL[leader_sine]; AN[sitl_like.current] | 검증됨 (SITL 실측 0.43 / 0.72, 예측 0.70. 수정 전 코드 대조군 1.95 FAIL — 차등 검증) |
+| FCR-16 | 편대 슬롯: 슬롯 미설정이면 위치 오차가 기존 (front−TARGET, right, up) 과 비트 단위로 같고, 리더 heading 기준 / NED 슬롯은 후미 FRU 로 회전되며, 비전 거리 없이 GPS 뿐이면 슬롯 방향을 유지한 채 이격을 `TARGET_DISTANCE_GPS_ONLY_M` 으로 늘린다 | MULTI_FOLLOWER_FOUNDATION 4절 | T | UT[편대: 기본 LOS]; UT[편대: 리더 heading 기준]; UT[편대: 상대 heading 0]; UT[편대: NED]; UT[편대: 비전 거리]; CL[main.main()] | 검증됨 (단위; 폐루프 스트림은 변경 전 `--dump` 와 `--compare` 로 동일 확인) |
+| FCR-17 | 리더 상대 heading 은 방송 yaw > 리더 속도 방향(≥ `heading_min_speed_mps`) > 최근값 유지(`heading_hold_sec`) > 없음 순으로 정하고, 없으면 슬롯을 같은 거리의 LOS 후방으로 강등하며 그 사실을 알린다 | formation.py | T | UT[편대: 상대 heading 소스]; UT[편대: 상대 heading 0] | 검증됨 |
+| FCR-18 | 선두 속도 방송 토폴로지(`ff_source="broadcast"`)에서 리더→n 단 누적 속도 이득이 단 수에 따라 커지지 않고(3단 ≤ 1.15), 선행기 추종보다 작으며, KFF 1.0 도 안정하다 | MULTI_FOLLOWER_FOUNDATION 3.2·4.3 (Seiler 2004, Zheng 2016) | A | UT[편대: 체인 토폴로지]; UT[편대: 선두 속도 방송이면] | 검증됨 (실제 코드 체인 시뮬 — SITL 다기체 시나리오 없음) |
+| FCR-19 | 제어 오차는 FC 의 BODY_NED 해석(yaw 만 회전, z 불변)과 같은 수평 프레임이어야 한다 — 기체 기울기(roll/pitch)가 같은 고도 리더에 상하·좌우 명령을 만들지 않는다 | MULTI_FOLLOWER_FOUNDATION 2.2 A1 | T | UT[수평화:] | **미충족 (기본값)** — pitch 10° 에서 vz 0.094 m/s 편향. `controller.level_by_attitude=True` 로 해소되나 SITL 자세 기울기 시나리오 뒤 기본값 전환 필요 |
 
 ### EST — 인지 / 추정
 
@@ -74,6 +78,8 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | SAF-13 | 공분산 폭주 중에는 LOST_HOLD 이고 회복 첫 프레임에 착륙 명령이 나가지 않는다 | mission_manager.py | T | UT[타이머: 공분산] | 검증됨 |
 | SAF-14 | LAND 는 FC 가 GUIDED 안에 있을 때만 2 s 간격으로 재시도하고, 먹으면 FC 가 하강한다 | main.py `LAND_RETRY_SEC` | T | SITL[pilot_takeover]; CL[LAND 이후] | 검증됨 |
 | SAF-15 | 위 안전 동작이 폐루프 실비행(실제 공력·바람·프롭워시)에서 유지된다 | VERIFICATION 미검증 | D | — | 미검증 |
+| SAF-16 | 편대 슬롯은 비행 전 정적 검사로 슬롯 간 최소 이격(`min_separation_m`), 리더까지 거리의 깊이창 여유(`depth_reserve_m`), slot_id / follower_id 중복을 거른다 | formation.py `validate_formation` | T | UT[편대: 유효성]; UT[편대: config] | 검증됨 (정적 검사만) |
+| SAF-17 | 후미 간 동적 충돌 회피와 리더 유실 시 편대 전체의 일관된 행동이 있다 | MULTI_FOLLOWER_FOUNDATION 4.5 | D | — | 미검증 (미구현 — 후미 상태 방송 뒤 반발항) |
 
 ### IF — 인터페이스
 
@@ -90,6 +96,10 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | IF-09 | 배터리 전압 미보고(65535)는 전압으로 쓰지 않는다 | mavlink_io `battery_text` | T | UT[BAT:] | 검증됨 |
 | IF-10 | 실험 로그는 평탄화된 행으로 기록된다 | logger.py | T | UT[logger:] | 검증됨 |
 | IF-11 | ESP32(ESP-NOW) 송신 펌웨어가 리더 절대 위치·속도를 방송한다 | README 시스템 개요 | D | — | 미검증 (펌웨어 미존재) |
+| IF-12 | 리더 텔레메트리 수신기는 기대 리더 ID(`formation.leader_id`, ArduPilot FOLL_SYSID 역할)와 다른 ID 의 패킷을 버리고 세며, ID 없는 패킷은 호환을 위해 통과시킨다(`require_leader_id` 면 거부) | formation.py, leader_telemetry.py | T | UT[편대: 리더 ID] | 검증됨 |
+| IF-13 | 리더 상태 방송 스키마 `LeaderState` 는 MAVLink `FOLLOW_TARGET`(#144) 과 왕복 변환된다 (lat/lon degE7, timestamp ms, vel ENU↔NED, yaw↔attitude_q, est_capabilities) | formation.py | T | UT[편대: LeaderState] | 검증됨 |
+| IF-14 | ESP32 상대위치는 팔로워 GLOBAL_POSITION_INT 가 `GPS_MAX_AGE_SEC`(0.7 s) 보다 오래되면 만들지 않는다(`stale_follower_gps`) | MULTI_FOLLOWER_FOUNDATION 2.2 A2 | T | UT[ESP32 GPS 신선도] | 검증됨 |
+| IF-15 | 리더 패킷에 yaw 가 없으면 None 으로 구분한다 (0 = 북쪽으로 오해하지 않음) | leader_telemetry.py | T | UT[편대: 패킷에 yaw] | 검증됨 |
 
 ### OPS — 운용 / 유지
 
@@ -114,6 +124,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | `depth_loss` | SAF-03 | 깊이만 죽었을 때 10 s 뒤 착륙 안 함 |
 | `handover` | SAF-05 | GUIDED 인계 순간 LAND |
 | `leader_sine` | FCR-15, FCR-10 | 1.15 rad/s 리더 속도 변동이 팔로워에서 1배 초과로 증폭 |
+| (없음 — 4.5 항목 1) | FCR-16~18, SAF-16 | 다기체 SITL 시나리오는 아직 없다. 단위·시뮬 근거만 있다 |
 
 ## 3. 미충족 · 미검증 · 부분 요구도
 
@@ -130,7 +141,10 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | SAF-15 | 미검증 | 폐루프 실비행(안전줄·저고도부터) |
 | SAF-05 | 부분 | 하네스 조종사 링크에 RC override 를 넣어 LOITER 중 고도를 유지하게 고치고 `handover` 재실행 (sitl/README 6절) |
 | FCR-02 | 확인 필요 | `depth_range` 를 `--duration 60` 이상으로 재실행해 평형 거리 3.45 m 수렴 확인 |
-| IF-11 | 미검증 | ESP32 펌웨어 작성, 패킷 포맷 고정 |
+| IF-11 | 미검증 | ESP32 펌웨어 작성, 패킷 포맷 고정 — 필드 규약은 `formation.LeaderState.to_follow_target()` (leader_id, yaw 추가) |
+| FCR-19 | 미충족 (기본값) | 폐루프 FakeFC 에 가속도 비례 pitch 를 넣은 자세 기울기 시나리오 추가 → `controller.level_by_attitude` 기본값 True |
+| FCR-18 | 검증됨 (시뮬) | SITL 다기체(리더 1 + 후미 2~3, `-I0/-I1/-I2`) V 자 편대 + `leader_sine` 시나리오로 실측 |
+| SAF-17 | 미검증 | 후미 상태 방송(`LeaderState` 스키마 재사용) + 이웃 간 최소 이격 반발항 |
 
 ## 4. 검사 방법
 

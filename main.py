@@ -22,8 +22,9 @@ from camera import D435i
 from config import CONFIG
 from detector import YoloDetector
 from imm_ekf import ImmEkf
+from formation import RelativeHeadingEstimator, los_slot, slot_error_fru, slot_from_config
 from leader_telemetry import (LeaderTelemetryReceiver, apply_leader_velocity_hint_to_imm,
-                              build_leader_measurement_from_packet)
+                              build_leader_measurement_from_packet, enu_to_body_fru)
 from logger import ExperimentLogger
 from mavlink_io import battery_text, connect_fc, drain_messages, get_vehicle_state, stream_rates_text
 from measurement import MeasurementBuilder
@@ -88,6 +89,14 @@ KFF_LEADER_VEL = float(CONFIG["controller"].get("leader_vel_ff_gain", 0.8))
 FF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_tau_sec", 2.0))
 FF_SELF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_self_tau_sec", 0.3))
 FF_DEADBAND_MPS = float(CONFIG["controller"].get("leader_vel_ff_deadband_mps", 0.05))
+# 제어 오차 수평화 (config controller.level_by_attitude). 기본 False = 기존 동작. 근거는 level_fru_by_roll_pitch 주석.
+LEVEL_BY_ATTITUDE = bool(CONFIG["controller"].get("level_by_attitude", False))
+
+# 편대 (config formation.*, formation.py). 슬롯 미설정이면 매 프레임 los_slot(TARGET_DISTANCE_M) = 기존 동작.
+FORMATION_CFG = CONFIG.get("formation", {})
+FOLLOWER_ID = str(FORMATION_CFG.get("follower_id", "F1"))
+LEADER_ID = str(FORMATION_CFG.get("leader_id", "") or "")
+FF_SOURCE = str(FORMATION_CFG.get("ff_source", "vision"))     # "vision" | "broadcast" | "auto"
 
 SETPOINT_PERIOD_SEC = 0.10
 # C2: LAND 가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
@@ -140,6 +149,20 @@ def fru_to_body_ned_velocity(v_fru):
     """FRU [forward, right, up] → BODY_NED [forward, right, down]."""
     v = np.asarray(v_fru, dtype=float)
     return np.array([v[0], v[1], -v[2]], dtype=float)
+
+
+def level_fru_by_roll_pitch(v_fru, roll, pitch):
+    """기체 고정 카메라에서 나온 FRU 벡터의 roll/pitch 를 되돌려 수평(heading) 프레임의 FRU 로.
+
+    EKF 상태는 카메라(기체 고정) 프레임이라 기체가 기울면 같은 고도의 리더도 위/아래로 보인다(pitch −10°, 3 m → up +0.52 m).
+    FC 는 BODY_NED 속도를 yaw 만으로 회전하고 z 는 그대로 쓴다(ArduCopter GCS_MAVLink_Copter.cpp `body_to_earth2D`, PX4
+    mavlink_receiver.cpp `cos(yaw)/sin(yaw)`, z 복사). 그러므로 제어 오차도 수평 프레임이어야 한다 — 아니면 pitch 10° 에
+    KP_UP·0.52 = 0.094 m/s(상한 0.12) 의 상하 명령이 리더 이동 없이 나간다. config controller.level_by_attitude 로 켠다.
+    """
+    v = np.asarray(v_fru, dtype=float)
+    frd = np.array([v[0], v[1], -v[2]], dtype=float)
+    lv = rot_body_to_ned(float(roll), float(pitch), 0.0) @ frd
+    return np.array([lv[0], lv[1], -lv[2]], dtype=float)
 
 
 def get_follower_altitude_m(vehicle_state):
@@ -263,12 +286,21 @@ def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
     return prev + a * (target - prev)
 
 
-def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance=None, leader_vel_ff=None):
-    """IMM 추정(FRU 상대 위치·속도) → BODY_NED [vx, vy, vz, yaw_rate]. 네 축 모두 P+D + 리더 속도 피드포워드, 불확실하면 감속."""
+def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance=None, leader_vel_ff=None,
+                                       slot_error=None):
+    """IMM 추정(FRU 상대 위치·속도) → BODY_NED [vx, vy, vz, yaw_rate]. 네 축 모두 P+D + 리더 속도 피드포워드, 불확실하면 감속.
+
+    slot_error: 편대 슬롯 오차(후미 → 슬롯 점, FRU, formation.slot_error_fru). 주면 위치 오차로 이것을 쓰고, 없으면 기존
+    (front − target_distance, right, up). 기수(yaw)는 슬롯이 아니라 리더 방위를 0 으로 — 측면 슬롯에서도 카메라는 리더를 본다
+    (ArduPilot FOLL_YAW_BEHAVE=1, PX4 follow_me 와 같은 선택)."""
     if target_distance is None:
         target_distance = TARGET_DISTANCE_M
     front, right, up = (float(v) for v in np.asarray(rel_fru, dtype=float)[:3])
     v_front, v_right, v_up = (float(v) for v in np.asarray(rel_vel_fru, dtype=float)[:3])
+    if slot_error is None:
+        e_front, e_right, e_up = front - float(target_distance), right, up
+    else:
+        e_front, e_right, e_up = (float(v) for v in np.asarray(slot_error, dtype=float)[:3])
 
     if pos_cov_trace > UNCERTAINTY_SLOWDOWN_TRACE:
         scale = 0.55
@@ -278,9 +310,9 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, targ
         scale = 1.0
 
     ff_f, ff_r, ff_u = (0.0, 0.0, 0.0) if leader_vel_ff is None else (float(v) for v in np.asarray(leader_vel_ff, dtype=float)[:3])
-    cmd_forward = clamp((KFF_LEADER_VEL * ff_f + KP_FORWARD * (front - float(target_distance)) + KD_FORWARD * v_front) * scale, -MAX_VX, MAX_VX)
-    cmd_right = clamp((KFF_LEADER_VEL * ff_r + KP_RIGHT * right + KD_RIGHT * v_right) * scale, -MAX_VY, MAX_VY)
-    cmd_up = clamp((KFF_LEADER_VEL * ff_u + KP_UP * up + KD_UP * v_up) * scale, -MAX_VZ, MAX_VZ)
+    cmd_forward = clamp((KFF_LEADER_VEL * ff_f + KP_FORWARD * e_front + KD_FORWARD * v_front) * scale, -MAX_VX, MAX_VX)
+    cmd_right = clamp((KFF_LEADER_VEL * ff_r + KP_RIGHT * e_right + KD_RIGHT * v_right) * scale, -MAX_VY, MAX_VY)
+    cmd_up = clamp((KFF_LEADER_VEL * ff_u + KP_UP * e_up + KD_UP * v_up) * scale, -MAX_VZ, MAX_VZ)
     # yaw: 선두 방위각을 0 으로 (시야 이탈 방지). BODY_NED yaw_rate 우회전 +, 타겟이 오른쪽이면 bearing + → 부호 일치.
     cmd_yaw_rate = clamp(KP_YAW * math.atan2(right, max(front, 0.5)) * scale, -MAX_YAW_RATE, MAX_YAW_RATE)
 
@@ -365,7 +397,8 @@ def open_leader_receiver():
     if not USE_LEADER_ESP32:
         return None
     rx = LeaderTelemetryReceiver(kind=LEADER_TELEMETRY_KIND, port=LEADER_SERIAL_PORT, baud=LEADER_SERIAL_BAUD,
-                                 udp_ip=LEADER_UDP_IP, udp_port=LEADER_UDP_PORT, default_alt_frame=LEADER_ALT_FRAME)
+                                 udp_ip=LEADER_UDP_IP, udp_port=LEADER_UDP_PORT, default_alt_frame=LEADER_ALT_FRAME,
+                                 expected_leader_id=LEADER_ID or None)
     try:
         rx.start()
     except Exception as exc:
@@ -438,6 +471,7 @@ def build_log_row(s):
         "control": {"send_enabled": SEND_MAVLINK_COMMANDS, "body_vx": cmd[0], "body_vy": cmd[1], "body_vz": cmd[2],
                     "yaw_rate": cmd[3], "target_distance_m": s["target_distance_m"], "vision_range_ok": s["vision_range_ok"],
                     "ff_front": s["ff_fru"][0], "ff_right": s["ff_fru"][1], "ff_up": s["ff_fru"][2]},
+        "formation": s.get("formation", {}),
     }
 
 
@@ -470,6 +504,13 @@ def main():
     tracker = LeaderTracker()
     ekf = ImmEkf()
     mission = MissionManager()
+    # 편대: 내 슬롯(없으면 None → 매 프레임 LOS 기본 슬롯)과 리더 상대 heading 추정기
+    formation_slot = slot_from_config(FORMATION_CFG, FOLLOWER_ID)
+    heading_est = RelativeHeadingEstimator(min_speed_mps=float(FORMATION_CFG.get("heading_min_speed_mps", 0.5)),
+                                           hold_sec=float(FORMATION_CFG.get("heading_hold_sec", 2.0)))
+    print(f"[FORM] follower_id={FOLLOWER_ID} leader_id={LEADER_ID or '(any)'} "
+          f"slot={(f'{formation_slot.slot_id} {formation_slot.frame} {formation_slot.offset}' if formation_slot else 'LOS(default)')} "
+          f"ff_source={FF_SOURCE} level_by_attitude={LEVEL_BY_ATTITUDE}")
     leader_rx = open_leader_receiver()
     log = ExperimentLogger(CONFIG["logger"]["log_dir"]) if CONFIG["logger"]["enabled"] else None
 
@@ -490,6 +531,7 @@ def main():
     ff_fru = np.zeros(3)          # 리더 속도 피드포워드 (FRU, 저역통과 상태)
     v_self_lpf = None             # 자기 속도 정합 저역통과 상태 (FRU)
     v_leader_fru = None           # 리더 절대 속도 추정 (FRU). STAT 진단용으로 루프 밖에서도 참조
+    slot_label, heading_src, ff_src = "-", "none", "-"     # 편대 진단 (STAT 은 직전 프레임 값을 찍는다)
 
     print("=" * 90)
     print("[INFO] q/ESC 종료 | m: MARS-IMM on/off | v: MAVLink velocity 송신 on/off | l: LAND | h: HOLD")
@@ -529,6 +571,7 @@ def main():
                 prev_body_cmd = np.zeros(4)
                 ff_fru = np.zeros(3)
                 v_self_lpf = None
+                heading_est.reset()
                 last_land_send = 0.0
                 print(f"[SYS] {fc_mode} 진입 — 미션/명령 리셋")
             prev_fc_accepts = fc_accepts_setpoints
@@ -541,7 +584,8 @@ def main():
             leader_packet = leader_rx.read_latest() if leader_rx is not None else None
             leader_meas = build_leader_measurement_from_packet(
                 packet=leader_packet, follower_vehicle_state=vehicle_state, now=now,
-                max_age_sec=LEADER_MAX_AGE_SEC, leader_velocity_frame=LEADER_VELOCITY_FRAME)
+                max_age_sec=LEADER_MAX_AGE_SEC, leader_velocity_frame=LEADER_VELOCITY_FRAME,
+                follower_gps_max_age_sec=GPS_MAX_AGE_SEC)
 
             if now - last_stat_print >= 1.0:
                 p_cv, p_ct = ekf.get_model_probs() if ekf.initialized else (0.0, 0.0)
@@ -551,7 +595,8 @@ def main():
                       f"CV={p_cv:.2f} CT={p_ct:.2f} coast={ekf.coast_time:.1f}s rcoast={ekf.range_coast_time:.1f}s "
                       f"mission={mission.state} "
                       f"vL={(float(np.linalg.norm(v_leader_fru)) if v_leader_fru is not None else float('nan')):.2f} "
-                      f"ff={ff_fru[0]:+.2f} fresh=LP{int(local_pos_fresh)}/ATT{int(attitude_fresh)} {stream_rates_text(now)}")
+                      f"ff={ff_fru[0]:+.2f}({ff_src}) slot={slot_label} hdg={heading_src} "
+                      f"fresh=LP{int(local_pos_fresh)}/ATT{int(attitude_fresh)} {stream_rates_text(now)}")
                 if SEND_MAVLINK_COMMANDS and not fc_accepts_setpoints:
                     print(f"[WARN] FC mode={fc_mode}: 송신 중단됨 (ArduPilot: GUIDED / PX4: OFFBOARD 필요)")
                 last_stat_print = now
@@ -629,6 +674,12 @@ def main():
             mu = ekf.get_model_probs() if ekf.initialized else np.array([0.0, 0.0])
             rel_fru = camera_xyz_to_fru(x_est[:3])
             rel_vel_fru = camera_xyz_to_fru(x_est[3:6])
+            # 제어 오차 수평화(옵션, 기본 꺼짐): FC 는 BODY_NED 속도를 yaw 만으로 회전하므로 카메라(기체 고정) 프레임의
+            # roll/pitch 를 되돌려야 같은 고도 리더에 기울기만큼 상하 명령이 나가지 않는다 (level_fru_by_roll_pitch 주석).
+            if LEVEL_BY_ATTITUDE and attitude_fresh and att.get("yaw") is not None:
+                _roll, _pitch = float(att.get("roll") or 0.0), float(att.get("pitch") or 0.0)
+                rel_fru = level_fru_by_roll_pitch(rel_fru, _roll, _pitch)
+                rel_vel_fru = level_fru_by_roll_pitch(rel_vel_fru, _roll, _pitch)
 
             follower_alt = get_follower_altitude_m(vehicle_state) if local_pos_fresh else None
             # 착륙 판정용 선두 고도는 AGL 근사여야 한다 (ESP32 alt 는 절대고도라 landing_z_thresh 와 비교 불가)
@@ -661,10 +712,28 @@ def main():
                 leader_alt=leader_alt_est, leader_vel_world=leader_vel_world, pos_cov_trace=pos_cov_trace,
                 leader_vel_body=v_leader_fru)
 
+            # ---------------- 편대 슬롯 / 피드포워드 소스 ----------------
+            # 슬롯: 리더 heading 을 알면 리더 기준 오프셋, 모르면 LOS(기존). 비전 거리 없이 GPS 뿐이면 이격을 GPS_ONLY 로.
+            follower_yaw = float(att["yaw"]) if (attitude_fresh and att.get("yaw") is not None) else None
+            rel_heading, heading_src = heading_est.update(
+                now, leader_yaw_ned=(leader_meas.get("yaw") if esp_visible else None),
+                follower_yaw_ned=follower_yaw, leader_vel_fru=v_leader_fru)
+            active_slot = formation_slot if formation_slot is not None else los_slot(TARGET_DISTANCE_M)
+            slot_err, slot_degraded = slot_error_fru(rel_fru, active_slot, rel_heading, follower_yaw,
+                                                     min_distance=0.0 if vision_range_ok else TARGET_DISTANCE_GPS_ONLY_M)
+            slot_label = active_slot.slot_id + ("~LOS" if slot_degraded else "")
+            # 피드포워드 소스: "vision" = 자기 속도 + EKF 상대 속도(기존), "broadcast" = 선두가 방송한 절대 속도(있을 때만),
+            # "auto" = 방송이 있으면 방송, 없으면 vision. 방송이면 자기 속도 양성 되먹임 경로 자체가 없다 (STABILITY_MARGINS 7.2).
+            ff_input, ff_src = v_leader_fru, "vision"
+            if FF_SOURCE in ("broadcast", "auto") and esp_visible and follower_yaw is not None:
+                ff_input, ff_src = enu_to_body_fru(leader_vel_world, follower_yaw), "broadcast"
+            elif FF_SOURCE == "broadcast":
+                ff_input, ff_src = None, "none"
+
             # ---------------- 명령 ----------------
             # 리더 속도 피드포워드: 거리를 아는 추종 상태에서만. 아니면 0 으로 감쇠.
             ff_fru = leader_velocity_ff(
-                ff_fru, v_leader_fru if (mission_policy["allow_follow"] and ekf.has_range_fix()) else None, dt)
+                ff_fru, ff_input if (mission_policy["allow_follow"] and ekf.has_range_fix()) else None, dt)
 
             desired_body_cmd = np.zeros(4)
             if mission_policy["land"]:
@@ -679,7 +748,8 @@ def main():
                     last_land_send = now
                     last_setpoint_time = now
             elif mission_policy["allow_follow"] and ekf.initialized:
-                desired_body_cmd = compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance_m, ff_fru)
+                desired_body_cmd = compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance_m, ff_fru,
+                                                                      slot_error=slot_err)
 
             # 수직 축은 리더 상대 고도를 따라간다 — 트래커가 지면의 무언가를 물면 계속 하강한다. AGL 바닥.
             if follower_alt is not None and follower_alt < MIN_AGL_M and desired_body_cmd[2] > 0.0:
@@ -728,7 +798,7 @@ def main():
                     (f"rV={r_vis:.2f} rD={r_depth:.2f} gate={gate_d2 if gate_d2 is not None else -1:.1f}", (180, 180, 255), 0.50),
                     (f"ESP={int(esp_visible)} {leader_meas.get('reason', 'none')} upd={esp['esp_update_used']}", (180, 220, 255), 0.48),
                     (f"rel F/R/U=({rel_fru[0]:+.2f},{rel_fru[1]:+.2f},{rel_fru[2]:+.2f}) cov={pos_cov_trace:.2f} "
-                     f"tgt={target_distance_m:.1f}m{'' if vision_range_ok else '(GPS)'}", (220, 220, 220), 0.48),
+                     f"tgt={target_distance_m:.1f}m{'' if vision_range_ok else '(GPS)'} slot={slot_label}", (220, 220, 220), 0.48),
                     (f"cmd BODY_NED vx={current_body_cmd[0]:+.2f} vy={current_body_cmd[1]:+.2f} "
                      f"vz={current_body_cmd[2]:+.2f} yr={current_body_cmd[3]:+.2f} ffF={ff_fru[0]:+.2f}", (100, 255, 100), 0.48),
                     (f"fresh GPS/LP/ATT={int(gps_fresh)}/{int(local_pos_fresh)}/{int(attitude_fresh)}", (180, 180, 255), 0.48),
@@ -773,7 +843,10 @@ def main():
                     esp=esp, x_est=x_est, pos_cov_trace=pos_cov_trace, mu=mu, ekf=ekf, rel_fru=rel_fru,
                     rel_vel_fru=rel_vel_fru, vehicle_state=vehicle_state, gps_fresh=gps_fresh,
                     local_pos_fresh=local_pos_fresh, attitude_fresh=attitude_fresh, current_body_cmd=current_body_cmd,
-                    target_distance_m=target_distance_m, vision_range_ok=vision_range_ok)))
+                    target_distance_m=target_distance_m, vision_range_ok=vision_range_ok,
+                    formation=dict(slot_id=active_slot.slot_id, frame=active_slot.frame, degraded_to_los=slot_degraded,
+                                   rel_heading=rel_heading, heading_source=heading_src, slot_err_fru=slot_err,
+                                   ff_source=ff_src))))
 
     except KeyboardInterrupt:
         print("\n[SYS] KeyboardInterrupt")

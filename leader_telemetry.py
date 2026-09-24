@@ -58,11 +58,13 @@ class LeaderPacket:
     vz: float
     roll: float
     pitch: float
-    yaw: float
+    yaw: Optional[float]          # rad, 북 기준 우회전 +. 필드가 없으면 None (0 으로 두면 '북쪽' 으로 오해된다)
     rx_time: float
     seq: int = -1
     alt_frame: str = "AMSL"       # "AMSL" | "ELLIPSOID"
     raw: Optional[Dict[str, Any]] = None
+    leader_id: str = ""           # 편대: 어느 리더의 패킷인가 (ArduPilot FOLL_SYSID 역할). 없으면 ""
+    acc: Optional[tuple] = None   # 편대: 선두 가속도 (vx/vy/vz 와 같은 프레임). FOLLOW_TARGET.acc 대응. 없으면 None
 
 
 # ============================================================
@@ -89,6 +91,8 @@ class LeaderTelemetryReceiver:
         udp_port=5005,
         timeout=0.001,
         default_alt_frame="AMSL",
+        expected_leader_id=None,
+        require_leader_id=False,
     ):
         self.kind = kind
         self.port = port
@@ -98,6 +102,11 @@ class LeaderTelemetryReceiver:
         self.timeout = timeout
         self.default_alt_frame = default_alt_frame
 
+        # 편대: 기대 리더 ID. 주면 다른 ID 의 패킷은 버린다(같은 채널에 리더가 둘일 때). require_leader_id 면 ID 없는
+        # 패킷도 버린다 — 기본은 호환을 위해 통과.
+        self.expected_leader_id = str(expected_leader_id) if expected_leader_id else None
+        self.require_leader_id = bool(require_leader_id)
+        self.dropped_other_leader = 0
         self.ser = None
         self.sock = None
         self._rx_buf = b""
@@ -137,6 +146,21 @@ class LeaderTelemetryReceiver:
         if msg != self._last_err:
             print(f"[LEADER] {msg}")
             self._last_err = msg
+
+    def _accept(self, pkt: Optional[LeaderPacket]) -> bool:
+        """파싱된 패킷을 latest_packet 으로 채택할지. 리더 ID 필터."""
+        if pkt is None:
+            return False
+        if self.expected_leader_id is not None:
+            if pkt.leader_id:
+                if pkt.leader_id != self.expected_leader_id:
+                    self.dropped_other_leader += 1
+                    return False
+            elif self.require_leader_id:
+                self.dropped_other_leader += 1
+                return False
+        self.latest_packet = pkt
+        return True
 
     def read_latest(self) -> Optional[LeaderPacket]:
         """
@@ -179,9 +203,7 @@ class LeaderTelemetryReceiver:
             text = line.decode("utf-8", errors="ignore").strip()
             if not text:
                 continue
-            pkt = parse_leader_json(text, default_alt_frame=self.default_alt_frame)
-            if pkt is not None:
-                self.latest_packet = pkt
+            self._accept(parse_leader_json(text, default_alt_frame=self.default_alt_frame))
 
         if len(self._rx_buf) > self._RX_BUF_LIMIT:
             self._rx_buf = self._rx_buf[-4096:]
@@ -197,9 +219,7 @@ class LeaderTelemetryReceiver:
                     break
 
                 text = data.decode("utf-8", errors="ignore").strip()
-                pkt = parse_leader_json(text, default_alt_frame=self.default_alt_frame)
-                if pkt is not None:
-                    self.latest_packet = pkt
+                self._accept(parse_leader_json(text, default_alt_frame=self.default_alt_frame))
 
             except BlockingIOError:
                 break
@@ -257,9 +277,14 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
 
         roll = float(_get_any(d, ["roll", "r"], 0.0))
         pitch = float(_get_any(d, ["pitch", "p"], 0.0))
-        yaw = float(_get_any(d, ["yaw", "y"], 0.0))
+        _yaw = _get_any(d, ["yaw", "y", "heading"], None)
+        yaw = None if _yaw is None else float(_yaw)
 
         seq = int(_get_any(d, ["seq", "packet_seq"], -1))
+        leader_id = _get_any(d, ["leader_id", "id", "sysid", "system_id"], "")
+        leader_id = "" if leader_id is None else str(leader_id)
+        _acc = [_get_any(d, keys, None) for keys in (("ax", "acc_x"), ("ay", "acc_y"), ("az", "acc_z"))]
+        acc = None if any(a is None for a in _acc) else tuple(float(a) for a in _acc)
 
         return LeaderPacket(
             timestamp=timestamp,
@@ -276,6 +301,8 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
             seq=seq,
             alt_frame=alt_frame,
             raw=d,
+            leader_id=leader_id,
+            acc=acc,
         )
 
     except Exception:
@@ -435,6 +462,7 @@ def build_leader_measurement_from_packet(
     now: Optional[float] = None,
     max_age_sec=0.7,
     leader_velocity_frame="ENU",
+    follower_gps_max_age_sec=None,
 ):
     """
     ESP32 leader packet과 follower Pixhawk state를 이용해
@@ -465,17 +493,22 @@ def build_leader_measurement_from_packet(
         return _unavailable("stale_leader_packet", age, fresh=False)
 
     # follower GPS는 GPS_RAW_INT보다 GLOBAL_POSITION_INT를 우선 사용
-    follower_lla = normalize_lat_lon_alt_from_mavlink(
-        follower_vehicle_state.get("global_position", {})
-    )
+    follower_src = follower_vehicle_state.get("global_position", {})
+    follower_lla = normalize_lat_lon_alt_from_mavlink(follower_src)
 
     if follower_lla is None:
-        follower_lla = normalize_lat_lon_alt_from_mavlink(
-            follower_vehicle_state.get("gps", {})
-        )
+        follower_src = follower_vehicle_state.get("gps", {})
+        follower_lla = normalize_lat_lon_alt_from_mavlink(follower_src)
 
     if follower_lla is None:
         return _unavailable("no_follower_gps", age)
+
+    # 팔로워 위치가 오래됐으면 상대위치도 그만큼 틀린다(팔로워가 그 사이 움직인 만큼). 스트림이 죽었을 때 조용히
+    # 틀린 값을 쓰지 않도록 게이트. None 이면 검사하지 않는다(기존 동작).
+    if follower_gps_max_age_sec is not None:
+        _ts = follower_src.get("timestamp", None)
+        if _ts is not None and (now - float(_ts)) > float(follower_gps_max_age_sec):
+            return _unavailable("stale_follower_gps", age)
 
     # 리더가 타원체고를 보내면 팔로워도 타원체고(GPS_RAW_INT.alt_ellipsoid)로 뺀다.
     # 해발과 타원체고를 섞으면 지오이드 차이가 그대로 상대 고도가 된다.
@@ -557,7 +590,8 @@ def build_leader_measurement_from_packet(
 
         "roll": float(packet.roll),
         "pitch": float(packet.pitch),
-        "yaw": float(packet.yaw),
+        "yaw": (None if packet.yaw is None else float(packet.yaw)),   # 편대: 리더 heading (없으면 None)
+        "leader_id": str(getattr(packet, "leader_id", "") or ""),
         "timestamp": float(packet.timestamp),
         "rx_time": float(packet.rx_time),
         "seq": int(packet.seq),

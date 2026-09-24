@@ -88,6 +88,34 @@ CONFIG = {
         # 3 이라 리더 0.1~0.2 m/s 에서 실효 KFF 가 2.4 가 됐다. 빼는 만큼 정상상태 오차가 KFF·DB/Kp 늘므로(0.10 → +0.36m)
         # 폭을 0.05 로 줄였다. 호버 잡음은 위의 2.0s 저역통과가 평균내므로 데드존은 바이어스만 막으면 된다.
         "leader_vel_ff_deadband_mps": 0.05,
+        # 제어 오차 수평화. EKF 상대위치는 기체 고정 카메라 프레임(roll/pitch 포함)인데 FC 는 BODY_NED 속도를 yaw 만으로
+        # 회전한다(ArduCopter body_to_earth2D, PX4 mavlink_receiver — z 는 그대로). 그래서 pitch 10° 로 기운 채 같은 고도
+        # 리더를 보면 vz 0.094 m/s(상한 0.12) 가 나간다. True 면 제어 직전에 roll/pitch 를 되돌린다(main.level_fru_by_roll_pitch).
+        # 기본 False = 기존 동작 — SITL 에 자세 기울기 시나리오가 없어 실기/SITL 확인 뒤 켤 것.
+        "level_by_attitude": False,
+    },
+    # ---- 편대 (선두 1 : 후미 N 토대, formation.py) ----
+    # 기본값은 슬롯 미설정 = 후미 자신의 시선 기준 리더 뒤 TARGET_DISTANCE_M (기존 동작과 동일).
+    "formation": {
+        "follower_id": os.environ.get("MARS_FOLLOWER_ID", "F1"),
+        # 기대하는 리더 ID (ArduPilot FOLL_SYSID 역할). "" 이면 검사하지 않는다. 패킷의 leader_id/id/sysid 와 비교.
+        "leader_id": os.environ.get("MARS_LEADER_ID", ""),
+        # follower_id → 슬롯. offset 은 리더 → 슬롯 벡터. frame: "leader" = 리더 heading 기준 [front, right, up]
+        # (ArduPilot FOLL_OFS_TYPE=1) / "ned" = [north, east, down] (FOLL_OFS_TYPE=0) / "los" = 후미 시선 기준(기존).
+        # 예)  "F1": {"offset": [-3.0, 0.0, 0.0], "frame": "leader", "slot_id": "tail"},
+        #      "F2": {"offset": [-3.0, 2.5, 0.0], "frame": "leader", "slot_id": "right_wing"},
+        #      "F3": {"offset": [-3.0, -2.5, 0.0], "frame": "leader", "slot_id": "left_wing"},
+        "slots": {},
+        # 슬롯 정적 검사(formation.validate_formation): 슬롯 간 최소 이격, 깊이창 여유(C4 의 목표+v/Kp 여유).
+        "min_separation_m": 2.0,
+        "depth_reserve_m": 3.0,
+        # 리더 heading 을 속도 방향에서 얻을 때의 최소 수평 속도(PX4 follow_me 는 1.0 m/s). 그 아래는 최근값을 hold_sec 유지.
+        "heading_min_speed_mps": 0.5,
+        "heading_hold_sec": 2.0,
+        # 피드포워드 소스. "vision" = 자기 속도 + EKF 상대 속도(기존, 자기 속도 양성 되먹임 경로 있음 → KFF<1 필요),
+        # "broadcast" = 선두가 방송한 절대 속도만(없으면 P+D 만), "auto" = 방송이 있으면 방송, 없으면 vision.
+        # 체인·다중 후미에서는 broadcast/auto 가 맞다 (docs/MULTI_FOLLOWER_FOUNDATION.md, Seiler 2004 / Zheng 2016).
+        "ff_source": "vision",
     },
     "logger": {
         "enabled": True,

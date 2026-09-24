@@ -1069,6 +1069,134 @@ check("추적성: REQUIREMENTS.md 의 검증 근거(UT/CL/SITL/AN/INSPECT)가 �
       not _ts["errors"] and _ts["requirements"] >= 50 and not _ts["cl_orphans"],
       "; ".join(_ts["errors"][:3]) or f"{_ts['requirements']}개, UT {_ts['ut_traced']}/{_ts['ut_total']}, CL {_ts['cl_traced']}/{_ts['cl_total']}")
 
+# ------------------------------------------------- 편대 토대 (formation.py) — 선두 1 : 후미 N (docs/MULTI_FOLLOWER_FOUNDATION.md)
+import math as _math  # noqa: E402
+import formation as _fm  # noqa: E402
+from leader_telemetry import LeaderTelemetryReceiver as _LTR  # noqa: E402
+
+_rng = np3.random.default_rng(7)
+_same = True
+for _ in range(50):
+    _rel = _rng.uniform(-5, 5, 3)
+    _e, _deg = _fm.slot_error_fru(_rel, _fm.los_slot(main.TARGET_DISTANCE_M))
+    _old = [_rel[0] - main.TARGET_DISTANCE_M, _rel[1], _rel[2]]
+    _same &= (not _deg) and all(float(a) == float(b) for a, b in zip(_e, _old))
+_c_old = main.compute_velocity_cmd_from_estimate([3.7, -0.4, 0.2], [0.1, 0.0, 0.0], 1.0, main.TARGET_DISTANCE_M, [0.3, 0.0, 0.0])
+_c_new = main.compute_velocity_cmd_from_estimate([3.7, -0.4, 0.2], [0.1, 0.0, 0.0], 1.0, None, [0.3, 0.0, 0.0],
+                                                 slot_error=_fm.slot_error_fru([3.7, -0.4, 0.2], _fm.los_slot(main.TARGET_DISTANCE_M))[0])
+check("편대: 기본 LOS 슬롯 (−TARGET, 0, 0) 은 기존 오차 (front−TARGET, right, up) 와 비트 단위로 같고 명령도 같다 (기존 동작 보존)",
+      _same and all(float(a) == float(b) for a, b in zip(_c_old, _c_new)), f"cmd={np3.round(_c_new, 4)}")
+
+_slot = _fm.FormationSlot("right_wing", (-3.0, 2.0, 0.0), _fm.FRAME_LEADER, follower_id="F2")
+_e, _deg = _fm.slot_error_fru([5.0, 0.0, 0.0], _slot, rel_heading=_math.pi / 2)
+check("편대: 리더 heading 기준 슬롯 — 리더가 내 기준 +90°(동쪽)를 볼 때 '리더 뒤 3 m·우측 2 m' 는 내 FRU 로 (−2, −3) → 오차 (3, −3, 0)",
+      np3.allclose(_e, [3.0, -3.0, 0.0]) and not _deg, f"e={np3.round(_e, 3)}")
+_e0, _ = _fm.slot_error_fru([5.0, 0.0, 0.0], _slot, rel_heading=0.0)
+_ed, _deg = _fm.slot_error_fru([5.0, 0.0, 0.0], _slot, rel_heading=None)
+check("편대: 상대 heading 0 이면 리더 프레임 슬롯은 LOS 와 같은 기하(오차 (2, 2, 0)); heading 을 모르면 같은 거리(3.61 m)의 LOS 후방으로 강등하고 알린다",
+      np3.allclose(_e0, [2.0, 2.0, 0.0]) and _deg and np3.allclose(_ed, [5.0 - _math.hypot(3, 2), 0.0, 0.0]), f"e0={np3.round(_e0, 3)} ed={np3.round(_ed, 3)}")
+_en, _ = _fm.slot_error_fru([0.0, 0.0, 0.0], _fm.FormationSlot("west3", (0.0, -3.0, 0.0), _fm.FRAME_NED), follower_yaw=_math.pi / 2)
+check("편대: NED 슬롯 (북 0, 동 −3, 하 0) 은 동쪽을 보는 후미의 FRU 로 (−3, 0, 0) — ArduPilot FOLL_OFS_TYPE=0 대응",
+      np3.allclose(_en, [-3.0, 0.0, 0.0]), f"e={np3.round(_en, 3)}")
+_eg, _ = _fm.slot_error_fru([0.0, 0.0, 0.0], _fm.los_slot(3.0), min_distance=8.0)
+_eg2, _ = _fm.slot_error_fru([0.0, 0.0, 0.0], _fm.FormationSlot("s", (-3.0, 4.0, 0.0), _fm.FRAME_LEADER), rel_heading=0.0, min_distance=10.0)
+check("편대: 비전 거리 없이 GPS 뿐이면 슬롯 방향을 유지한 채 이격을 최소치로 늘린다 ((−3,0,0)→(−8,0,0) 정확히, (−3,4,0)→(−6,8,0)) — 기존 TARGET_DISTANCE_GPS_ONLY_M 규칙의 일반형",
+      float(_eg[0]) == -8.0 and np3.allclose(_eg, [-8.0, 0.0, 0.0]) and np3.allclose(_eg2, [-6.0, 8.0, 0.0]), f"{_eg} {_eg2}")
+
+_he = _fm.RelativeHeadingEstimator(min_speed_mps=0.5, hold_sec=2.0)
+_h1 = _he.update(0.0, leader_yaw_ned=1.0, follower_yaw_ned=0.2, leader_vel_fru=[0.0, 1.0, 0.0])
+_h2 = _he.update(1.0, leader_vel_fru=[0.0, 1.0, 0.0])
+_h3 = _he.update(2.0, leader_vel_fru=[0.1, 0.1, 0.0])
+_h4 = _he.update(5.0, leader_vel_fru=[0.1, 0.1, 0.0])
+_h5 = _he.update(6.0, leader_yaw_ned=3.0, follower_yaw_ned=-3.0)
+check("편대: 상대 heading 소스 우선순위 — 방송 yaw(0.8) > 속도 방향(+90°, ≥0.5 m/s) > 최근값 유지(2 s) > 없음(None), 각도는 ±π 로 감김",
+      abs(_h1[0] - 0.8) < 1e-9 and _h1[1] == "broadcast" and abs(_h2[0] - _math.pi / 2) < 1e-9 and _h2[1] == "velocity"
+      and abs(_h3[0] - _math.pi / 2) < 1e-9 and _h3[1] == "hold" and _h4 == (None, "none")
+      and abs(_h5[0] - (6.0 - 2 * _math.pi)) < 1e-9 and _h5[1] == "broadcast", f"{_h1} {_h2} {_h3} {_h4} {_h5}")
+
+_S = _fm.FormationSlot
+_v_kw = dict(min_separation_m=2.0, depth_min_m=0.3, depth_max_m=10.0, depth_reserve_m=3.0)
+_v_close = _fm.validate_formation([_S("a", (-3, 0, 0), "leader", "F1"), _S("b", (-3, 1.0, 0), "leader", "F2")], **_v_kw)
+_v_far = _fm.validate_formation([_S("a", (-3, 0, 0), "leader", "F1"), _S("b", (-9, 0, 0), "leader", "F2")], **_v_kw)
+_v_dup = _fm.validate_formation([_S("a", (-3, 0, 0), "leader", "F1"), _S("b", (-3, 2.5, 0), "leader", "F1")], **_v_kw)
+_v_ok = _fm.validate_formation([_S("a", (-3, 0, 0), "leader", "F1"), _S("b", (-3, 2.5, 0), "leader", "F2"), _S("c", (-3, -2.5, 0), "leader", "F3")], **_v_kw)
+check("편대: 유효성 — 슬롯 간 1 m(<2 m)·깊이창 여유 밖(9 m > 10−3)·follower_id 중복은 거부, V 자 3슬롯(2.5 m 간격)은 통과",
+      len(_v_close) == 1 and len(_v_far) == 1 and len(_v_dup) == 1 and _v_ok == [], f"{_v_close} {_v_far} {_v_dup} {_v_ok}")
+_cfg = {"follower_id": "F2", "slots": {"F2": {"offset": [-3, 2, 0], "frame": "leader", "slot_id": "rw"}}}
+check("편대: config 슬롯 선택 — 내 follower_id 에 슬롯이 있으면 그것(리더 프레임), 없으면 None(LOS 기본 = 기존 동작)",
+      _fm.slot_from_config(_cfg, "F2").slot_id == "rw" and _fm.slot_from_config(_cfg, "F2").frame == "leader"
+      and _fm.slot_from_config(_cfg, "F9") is None and _fm.slot_from_config({}, "F1") is None)
+
+_rx2 = _LTR(kind="udp", expected_leader_id="L1")
+_acc = [_rx2._accept(parse_leader_json(js)) for js in ('{"lat":1,"lon":2,"alt":3,"leader_id":"L1"}',
+                                                       '{"lat":1,"lon":2,"alt":3,"leader_id":"L2"}',
+                                                       '{"lat":1,"lon":2,"alt":3}')]
+_rx3 = _LTR(kind="udp", expected_leader_id="L1", require_leader_id=True)
+check("편대: 리더 ID 필터(ArduPilot FOLL_SYSID 역할) — 기대 ID 만 채택, 다른 ID 는 버리고 셈, ID 없는 패킷은 호환을 위해 통과(require_leader_id 면 거부)",
+      _acc == [True, False, True] and _rx2.dropped_other_leader == 1 and _rx2.latest_packet.leader_id == ""
+      and not _rx3._accept(parse_leader_json('{"lat":1,"lon":2,"alt":3}')) and _rx3.latest_packet is None, f"{_acc}")
+check("편대: 패킷에 yaw 가 없으면 None (0 = '북쪽' 으로 오해하지 않음), 있으면 float",
+      parse_leader_json('{"lat":1,"lon":2,"alt":3}').yaw is None and parse_leader_json('{"lat":1,"lon":2,"alt":3,"yaw":0.3}').yaw == 0.3
+      and build_leader_measurement_from_packet(_pk('{"lat":35.83,"lon":128.75,"alt":37.0}'), _FOLLOWER, now=0.0)["yaw"] is None)
+
+_pkt = parse_leader_json('{"timestamp": 12.5, "lat": 35.83, "lon": 128.75, "alt_msl": 37.0, "vx": 1.0, "vy": 2.0, "vz": 0.5, "yaw": 0.3, "leader_id": "L1", "seq": 4}')
+_ls = _fm.LeaderState.from_leader_packet(_pkt)
+_ft = _ls.to_follow_target()
+_back = _fm.LeaderState.from_follow_target(_ft, leader_id="L1", now=99.0)
+check("편대: LeaderState ↔ MAVLink FOLLOW_TARGET(#144) 왕복 — lat/lon degE7 정수, timestamp ms, vel ENU→NED [north, east, down], yaw↔attitude_q, est_capabilities=pos|vel|att",
+      _ft["lat"] == 358300000 and _ft["lon"] == 1287500000 and _ft["vel"] == [2.0, 1.0, -0.5] and _ft["timestamp"] == 12500
+      and _ft["est_capabilities"] == (_fm.LeaderState.EST_POS | _fm.LeaderState.EST_VEL | _fm.LeaderState.EST_ATT)
+      and abs(_back.yaw - 0.3) < 1e-9 and np3.allclose(_back.vel_enu, [1.0, 2.0, 0.5]) and _back.acc_enu is None
+      and abs(_back.lat - 35.83) < 1e-7 and _back.leader_id == "L1" and abs(_back.timestamp - 12.5) < 1e-9, f"{_ft}")
+
+# ------------------------------------------------- 편대: 체인 토폴로지 (선행기 추종 vs 선두 속도 방송) — analysis.chain_sim
+_w = 0.35   # 현재 설계의 |Γ| 피크 부근 (docs/STABILITY_MARGINS.md 6절: 비선형 1단 1.158)
+_ck = dict(n_followers=3, v_leader=0.30, T=60.0, profile="sine", omega=_w, amp=0.03)
+_hp = _sm.chain_sim(**_ck)
+_hb = _sm.chain_sim(topology="leader_broadcast", **_ck)
+_ap = _sm.chain_sine_amplitudes(_hp, _w, t_from=24.0)["amplitudes"]
+_ab = _sm.chain_sine_amplitudes(_hb, _w, t_from=24.0)["amplitudes"]
+_gp = [a / _ap[0] for a in _ap[1:]]       # 리더 → n 단 누적 이득
+_gb = [a / _ab[0] for a in _ab[1:]]
+check("편대: 체인 토폴로지 — 선행기 추종(predecessor)은 리더→n 단 누적 이득이 단마다 커지지만, 선두 속도 방송(leader_broadcast)은 단 수와 무관하게 유지(≤ 1.15)·더 작다 (Seiler 2004 / Zheng 2016)",
+      _gp[-1] > _gp[0] + 0.05 and _gb[-1] <= 1.15 and _gb[-1] <= _gb[0] + 0.03 and _gb[-1] < _gp[-1],
+      f"predecessor={[round(g, 3) for g in _gp]} broadcast={[round(g, 3) for g in _gb]}")
+_hk = _sm.chain_sim(n_followers=2, v_leader=0.3, T=40.0, profile="step", p=_sm.Params(kff=1.0), topology="leader_broadcast")
+_sk = _sm.chain_summary(_hk, t_from=10.0)
+_idx = int(np3.argmin(np3.abs(_hk["t"] - 28.0)))
+_cruise = [float(e[_idx]) for e in _hk["err"]]
+check("편대: 선두 속도 방송이면 KFF 1.0 도 안정(자기 속도 되먹임 경로 없음) — 최대 오차 < 0.8 m, 순항 잔차 ≈ KFF·DB/Kp = 0.23 m, 정지 후 0 (vision 소스의 KFF 1.0 은 선형 모델 GM −0.2 dB 로 불안정)",
+      max(_sk["max_abs_err_m"]) < 0.8 and all(abs(e - 0.05 / main.KP_FORWARD) < 0.08 for e in _cruise) and all(abs(e) < 0.15 for e in _sk["final_err_m"]),
+      f"max={[round(m, 2) for m in _sk['max_abs_err_m']]} cruise={[round(c, 2) for c in _cruise]} final={[round(f, 2) for f in _sk['final_err_m']]}")
+
+# ------------------------------------------------- 수평화: 기체 기울기 → 제어 오차 편향 (main.level_fru_by_roll_pitch)
+_rpy = (0.0, _math.radians(-10.0), 0.0)
+_rel_t = main.camera_xyz_to_fru(main._CAM_FROM_BODY @ (main.rot_body_to_ned(*_rpy).T @ np3.array([3.0, 0.0, 0.0])))
+_cmd_t = main.compute_velocity_cmd_from_estimate(_rel_t, np3.zeros(3), 1.0, 3.0, None)
+_rel_l = main.level_fru_by_roll_pitch(_rel_t, _rpy[0], _rpy[1])
+_cmd_l = main.compute_velocity_cmd_from_estimate(_rel_l, np3.zeros(3), 1.0, 3.0, None)
+check("수평화: pitch −10° 로 기운 기체는 같은 고도 리더(3 m)에 vz −0.094 m/s(상한 0.12 의 78 %) 를 내지만 roll/pitch 를 되돌리면 오차 (0,0,0)·명령 0 — FC 는 BODY_NED 를 yaw 만 회전(ArduCopter body_to_earth2D, PX4 mavlink_receiver)",
+      abs(_cmd_t[2] + 0.094) < 0.005 and abs(_rel_t[2] - 3 * _math.sin(_math.radians(10))) < 1e-6
+      and np3.allclose(_rel_l, [3.0, 0.0, 0.0], atol=1e-9) and abs(_cmd_l[2]) < 1e-9 and abs(_cmd_l[0]) < 1e-9,
+      f"tilted rel={np3.round(_rel_t, 3)} vz={_cmd_t[2]:+.3f} → leveled rel={np3.round(_rel_l, 3)}")
+_rpy2 = (_math.radians(10.0), 0.0, 0.0)
+_rel_t2 = main.camera_xyz_to_fru(main._CAM_FROM_BODY @ (main.rot_body_to_ned(*_rpy2).T @ np3.array([3.0, 2.0, 0.0])))
+check("수평화: 우측 롤 10° 에 우측 2 m 리더는 카메라 프레임에서 위로 0.35 m 떠 보이지만 수평화하면 (3, 2, 0); 수평 기체면 항등",
+      abs(_rel_t2[2] - 2 * _math.sin(_math.radians(10))) < 1e-6 and np3.allclose(main.level_fru_by_roll_pitch(_rel_t2, *_rpy2[:2]), [3.0, 2.0, 0.0], atol=1e-9)
+      and np3.allclose(main.level_fru_by_roll_pitch([1.0, 2.0, 3.0], 0.0, 0.0), [1.0, 2.0, 3.0]), f"{np3.round(_rel_t2, 3)}")
+check("수평화: 기본값은 꺼짐(config controller.level_by_attitude=False) — 기존 동작 보존, SITL 자세 시나리오 뒤 켤 것",
+      main.LEVEL_BY_ATTITUDE is False and CONFIG["controller"]["level_by_attitude"] is False)
+
+# ------------------------------------------------- ESP32 GPS 신선도: 팔로워 GLOBAL_POSITION_INT 가 오래되면 상대위치를 만들지 않는다
+_stale_fs = {"global_position": {"lat": 358300000, "lon": 1287500000, "alt": 35000, "timestamp": 1.0}, "attitude": {"yaw": 0.0, "timestamp": 5.0}}
+_js = '{"lat":35.83,"lon":128.75,"alt":37.0}'
+_m_fresh = build_leader_measurement_from_packet(_pk(_js), _stale_fs, now=1.5, follower_gps_max_age_sec=0.7)
+_m_stale = build_leader_measurement_from_packet(_pk(_js), _stale_fs, now=5.0, follower_gps_max_age_sec=0.7)
+_m_nogate = build_leader_measurement_from_packet(_pk(_js), _stale_fs, now=5.0)
+check("ESP32 GPS 신선도: 팔로워 GLOBAL_POSITION_INT 가 0.7 s 보다 오래됐으면 상대위치를 만들지 않고(stale_follower_gps), 게이트를 안 주면 기존과 같다",
+      _m_fresh["available"] and not _m_stale["available"] and _m_stale["reason"] == "stale_follower_gps" and _m_nogate["available"],
+      f"fresh={_m_fresh['available']} stale={_m_stale.get('reason')} nogate={_m_nogate['available']}")
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "
