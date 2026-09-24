@@ -1002,8 +1002,8 @@ _e_theory_p = 0.3 / main.KP_FORWARD
 check("FF: 1축 폐루프(FC τ=0.3s, EKF 지연 1s) 정상상태 오차 = (v − KFF·(v−DB) + KV·v)/Kp (소프트 데드존 + 시간간격), P 만이면 v/Kp — 발산·진동 없음",
       abs(_e_ff - _e_theory_ff) < 0.05 and abs(_e_p - _e_theory_p) < 0.05 and _emax_ff < 1.0,
       f"ff={_e_ff:.2f}m(이론 {_e_theory_ff:.2f}) p={_e_p:.2f}m(이론 {_e_theory_p:.2f}) max|e|={_emax_ff:.2f}")
-check("FF (시간간격 정책): 0.3 m/s 추종의 정상상태 이격 증가는 KV·v/Kp = 0.20 m — Kp 0.30 이 0.22 였다면 0.27 m",
-      abs(main.KV_SELF - 0.2) < 1e-9 and abs(main.KP_FORWARD - 0.30) < 1e-9 and abs(_e_theory_ff - 0.533) < 0.01,
+check("FF (시간간격 정책): h = KV/Kp = 1.0 s ≥ 2·τ_eff — 0.3 m/s 추종의 정상상태 이격 증가는 KV·v/Kp = 0.30 m (총 0.63 m)",
+      abs(main.KV_SELF - 0.3) < 1e-9 and abs(main.KP_FORWARD - 0.30) < 1e-9 and abs(_e_theory_ff - 0.633) < 0.01,
       f"e_ss={_e_theory_ff:.3f}m")
 
 # ------------------------------------------------- 미션: 리더 절대 속도(자기 속도 + 상대 속도) 기준
@@ -1076,6 +1076,13 @@ _rkv0 = _margins_of(kv=0.0)
 _rtau = _margins_of(tau_ff=2.0)
 check("분석 (FCR-10): 시간간격 항을 빼거나(KV=0) FF 저역통과를 2.0s 로 되돌리면 |Γ| 피크가 1 을 넘는다 — 두 선택의 근거",
       _rkv0["peak"] > 1.03 and _rtau["peak"] > 1.03, f"KV=0 → {_rkv0['peak']:.3f}, τ_ff 2.0 → {_rtau['peak']:.3f}")
+# 레퍼런스 대조(2026-09-24): 고전 ACC 규칙 h ≥ 2τ_eff. KV 0.2(h 0.67s)는 FC 지연 가정 0.3s 에서만 성립하고 0.5s 면 깨진다.
+_rob = {(tfc, td): _margins_of(tau_fc=tfc, Td=td)["peak"] for tfc in (0.3, 0.5, 0.8) for td in (0.1, 0.3)}
+_rob_kv02 = _margins_of(kv=0.2, tau_fc=0.5)["peak"]
+check("분석 (FCR-10 강건성): KV 0.3(h 1.0s)은 FC 지연 τ_fc ≤ 0.8s(전송 지연 0.1s) 및 τ_fc ≤ 0.5s(지연 0.3s)에서 |Γ| ≤ 1.002 — "
+      "KV 0.2 는 τ_fc 0.5s 에서 이미 넘는다. 남은 구석(τ_fc 0.8s + 지연 0.3s)은 1.02 로 문서에 기록",
+      all(_rob[k] <= 1.002 for k in ((0.3, 0.1), (0.5, 0.1), (0.8, 0.1), (0.3, 0.3), (0.5, 0.3))) and _rob[(0.8, 0.3)] < 1.03 and _rob_kv02 > 1.005,
+      "; ".join(f"τ{k[0]}/Td{k[1]}:{v:.3f}" for k, v in _rob.items()) + f" | KV0.2@τ0.5:{_rob_kv02:.3f}")
 
 # ------------------------------------------------- 추적성: docs/REQUIREMENTS.md 의 참조가 코드와 맞는가
 from analysis import trace_check as _tc  # noqa: E402

@@ -49,7 +49,7 @@ def fig_string_stability():
     curves = [("P+D only (no feedforward, no time gap)", sm.Params(kff=0.0, kv=0.0), C["gray"]),
               ("before fix (09-18): FF LPF 0.7 s, relative-velocity EKF", base.copy(**leg, **sm.BEFORE), C["orange"]),
               ("09-18 fix: FF LPF 2.0 s + self-velocity LPF 0.3 s", base.copy(**leg, **sm.PREV), C["yellow"]),
-              ("current (09-19): ego-input EKF, FF LPF 0.1 s, time gap Kv 0.2, Kp 0.30", base, C["blue"])]
+              ("current (09-19/24): ego-input EKF, FF LPF 0.1 s, time gap Kv 0.3 (h 1.0 s), Kp 0.30", base, C["blue"])]
     fig, ax = plt.subplots(figsize=(9.2, 5.4), dpi=150)
     peaks = {}
     for label, p, col in curves:

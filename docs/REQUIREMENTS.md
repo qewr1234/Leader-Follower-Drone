@@ -23,15 +23,15 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | ID | 요구도 | 출처 | 방법 | 검증 근거 | 상태 |
 |---|---|---|---|---|---|
 | FCR-01 | 팔로워는 리더 후방 목표 이격 3.0 m(`TARGET_DISTANCE_M`)를 유지하며, 리더 정지 후 목표 ±0.5 m 로 수렴하고 2.3 m 안쪽으로 접근하지 않는다 | README 제어 법칙 | T | CL[리더 정지 후 최소 접근]; SITL[hover_hold] | 검증됨 |
-| FCR-02 | 리더 등속 0.3 m/s 추종 시 정상상태 거리 오차가 이론값 (v − KFF·(v−DB) + KV·v)/Kp (0.53 m) 와 ±0.05 m 로 일치하고 평형 거리가 깊이창(목표+3 m) 안에 든다 | README 제어 법칙 | A, T | UT[FF: 1축 폐루프]; UT[FF (시간간격 정책)]; CL[FOLLOW 중(리더]; SITL[depth_range]; AN[kff_sweep.kff0.8.ss_err_per_mps] | 검증됨 (SITL 은 Kp 0.22·KV 0 설계로 실측 — 재실행 필요) |
+| FCR-02 | 리더 등속 0.3 m/s 추종 시 정상상태 거리 오차가 이론값 (v − KFF·(v−DB) + KV·v)/Kp (0.63 m) 와 ±0.05 m 로 일치하고 평형 거리가 깊이창(목표+3 m) 안에 든다 | README 제어 법칙 | A, T | UT[FF: 1축 폐루프]; UT[FF (시간간격 정책)]; CL[FOLLOW 중(리더]; SITL[depth_range]; AN[kff_sweep.kff0.8.ss_err_per_mps] | 검증됨 (SITL 은 Kp 0.22·KV 0 설계로 실측 — 재실행 필요) |
 | FCR-03 | 속도 명령은 BODY_NED 프레임으로 축별 한계(0.35 / 0.22 / 0.12 m/s, yaw 0.35 rad/s)에 포화되고 yaw_rate 마스크를 항상 유효로 보낸다 | main.py | T, I | UT[C5:]; INSPECT[main.py:MAX_VX = 0.35] | 검증됨 |
 | FCR-04 | 속도 setpoint 는 10 Hz(9.5~10.5 Hz) 로 송신한다 | main.py `SETPOINT_PERIOD_SEC` | T | CL[setpoint 송신율] | 검증됨 |
 | FCR-05 | 기수는 리더 방위각을 0 으로 유지하고, 명령 yaw_rate 0 에서 기체가 스스로 회전하지 않는다 | VERIFICATION C5 | T, A | UT[C5:]; SITL[hold_heading]; AN[yaw.nominal.pm_deg] | 검증됨 |
 | FCR-06 | 명령 평활은 프레임률과 무관하게 같은 시정수를 갖는다 | main.py `smooth_velocity_cmd` | T | UT[평활:] | 검증됨 |
 | FCR-07 | 위치 공분산 trace 가 2 / 4 를 넘으면 명령을 0.75 / 0.55 배로 줄인다 | config `controller.uncertainty_slowdown_trace` | A | AN[kff_sweep.scale0.55.gm_db] | 부분 (여유 분석만, 배율 단위 검사 없음) |
-| FCR-08 | IMM-EKF 가 직접 추정한 리더 절대 속도를 KFF 0.8 로 피드포워드하되 0.05 m/s 소프트 데드존(기울기 1)과 0.1 s 저역통과를 거치고, 자기 속도 감쇠 −KV·v_self(0.2, 시간간격 정책)를 더하며, 인자가 없으면 기존 명령과 같다 | README 제어 법칙, STABILITY_MARGINS 7절 | T | UT[FF:]; CL[FOLLOW 중(리더]; SITL[depth_range]; SITL[leader_sine] | 검증됨 (SITL 은 직전 설계 실측: depth_range 4.1 m, leader_sine 0.72 — 현재 설계 예측은 AN[sitl_like.current], 재실행 필요) |
-| FCR-09 | 바깥 루프는 전 축에서 위상여유 ≥ 45°, 이득여유 ≥ 6 dB, 감도 피크 Ms ≤ 2 를 만족한다 | STABILITY_MARGINS 1·4절 | A | AN[axes.forward.pm_deg]; AN[axes.forward.gm_db]; AN[axes.right.gm_db]; UT[분석 (FCR-10)]; UT[분석 골든:] | 검증됨 (분석: GM 18.4 / 18.7 / 19.7 dB, PM 96°, Ms ≤ 1.18. 직전 설계 14.4 dB, 수정 전 4.9 dB — 골든 검사가 두 값을 기록) |
-| FCR-10 | 리더→팔로워 속도 전달 \|Γ(jω)\| 이 모든 주파수에서 1 이하다 (스트링 안정, 다중 기체 체인 전제) | STABILITY_MARGINS 6·7절 | A, T | AN[axes.forward.peak]; AN[validation]; AN[sitl_like.current]; UT[분석 (FCR-10)]; SITL[leader_sine] | 검증됨 (분석: 1.000 / 1.000 / 0.999 — 절대속도 추정기 + FF τ 0.1 s + 시간간격 KV 0.2. KV=0 이면 1.14, τ 2.0 이면 1.08 — 골든 검사가 기록. SITL leader_sine 은 직전 설계 실측 0.72, 현재 설계 재실행 필요) |
+| FCR-08 | IMM-EKF 가 직접 추정한 리더 절대 속도를 KFF 0.8 로 피드포워드하되 0.05 m/s 소프트 데드존(기울기 1)과 0.1 s 저역통과를 거치고, 자기 속도 감쇠 −KV·v_self(0.3, 시간간격 정책 h 1.0 s)를 더하며, 인자가 없으면 기존 명령과 같다 | README 제어 법칙, STABILITY_MARGINS 7절 | T | UT[FF:]; CL[FOLLOW 중(리더]; SITL[depth_range]; SITL[leader_sine] | 검증됨 (SITL 은 직전 설계 실측: depth_range 4.1 m, leader_sine 0.72 — 현재 설계 예측은 AN[sitl_like.current], 재실행 필요) |
+| FCR-09 | 바깥 루프는 전 축에서 위상여유 ≥ 45°, 이득여유 ≥ 6 dB, 감도 피크 Ms ≤ 2 를 만족한다 | STABILITY_MARGINS 1·4절 | A | AN[axes.forward.pm_deg]; AN[axes.forward.gm_db]; AN[axes.right.gm_db]; UT[분석 (FCR-10)]; UT[분석 골든:] | 검증됨 (분석: GM 16.4 / 16.7 / 17.3 dB, PM 102°, Ms ≤ 1.22. 직전 설계 14.4 dB, 수정 전 4.9 dB — 골든 검사가 두 값을 기록) |
+| FCR-10 | 리더→팔로워 속도 전달 \|Γ(jω)\| 이 모든 주파수에서 1 이하다 (스트링 안정, 다중 기체 체인 전제) | STABILITY_MARGINS 6·7절 | A, T | AN[axes.forward.peak]; AN[validation]; AN[sitl_like.current]; UT[분석 (FCR-10)]; UT[분석 (FCR-10 강건성)]; SITL[leader_sine] | 검증됨 (분석: 1.000 / 1.000 / 0.999 — 절대속도 추정기 + FF τ 0.1 s + 시간간격 KV 0.3(h 1.0 s ≥ 2τ_eff). KV=0 이면 1.14, τ 2.0 이면 1.08, KV 0.2 는 τ_fc 0.5 s 에서 1.014 — 골든·강건성 검사가 기록. SITL leader_sine 은 직전 설계 실측 0.72, 현재 설계 재실행 필요) |
 | FCR-11 | FC ATTITUDE 의 roll/pitch/yaw 변화량으로 매 프레임 EKF 상대 상태를 역회전해 기체 기울어짐이 리더 이동으로 보이지 않게 하고, 그 보정이 CT 각속도로 새지 않는다 | README 안전 설계 | T | UT[자세보정:]; UT[ego-yaw:] | 검증됨 (실기 미검증) |
 | FCR-12 | 비전 거리가 없고 GPS 상대위치만 있으면 이격을 8 m 로 넓힌다 | README 안전 설계 | T | UT[gps-only:] | 검증됨 |
 | FCR-13 | 출발·정지·착륙 판단은 리더 절대 속도(ESP32 > 자기+상대 > 상대 폴백) 로 한다 | README 안전 설계 | T | UT[미션:]; CL[리더 출발 후]; CL[추종 중(t=8s)]; SITL[depth_range] | 검증됨 |
@@ -126,7 +126,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | ID | 상태 | 필요한 것 |
 |---|---|---|
 | EST-12 | 미충족 | 리더 드론 데이터셋 확장, 재학습 |
-| FCR-02/08/10 | 검증됨(분석) | 제어 파라미터가 바뀌었다(Kp 0.30, τ_ff 0.1, KV 0.2, 절대속도 추정기). SITL `depth_range`·`leader_sine`·`hover_hold` 재실행으로 예측(정상상태 3.53 m, 진폭비 AN[sitl_like.current])을 확인해야 한다 |
+| FCR-02/08/10 | 검증됨(분석) | 제어 파라미터가 바뀌었다(Kp 0.30, τ_ff 0.1, KV 0.3, 절대속도 추정기). SITL `depth_range`·`leader_sine`·`hover_hold` 재실행으로 예측(정상상태 3.63 m, 진폭비 AN[sitl_like.current])을 확인해야 한다 |
 | FCR-07 | 부분 | 감속 배율 0.75 / 0.55 의 단위 검사 추가 |
 | EST-02 | 부분 | 카이제곱 임계 경계값 단위 검사 추가 |
 | EST-10 | 부분 | 실외 역광·강한 빛 조건에서 노출 옵션 실기 확인 |

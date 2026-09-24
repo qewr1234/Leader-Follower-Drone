@@ -90,8 +90,9 @@ KFF_LEADER_VEL = float(CONFIG["controller"].get("leader_vel_ff_gain", 0.8))
 FF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_tau_sec", 0.1))
 # 자기 속도 감쇠 (시간간격 정책). cmd 에 −KV_SELF·v_self 를 더한다 = 전후축에서는 목표 이격이 3.0 + (KV/Kp)·v 로
 # 속도에 비례해 벌어지는 constant-time-gap 정책과 같다. 등간격 정책은 선행 기체 정보만으로는 스트링 안정이
-# 안 되고(|Γ| 피크 1.05~1.14), 시간간격 h = KV/Kp ≈ 0.7 s 가 이를 1.00 으로 내린다 (docs/STABILITY_MARGINS.md 7절).
-KV_SELF = float(CONFIG["controller"].get("self_vel_damping", 0.2))
+# 안 되고(|Γ| 피크 1.05~1.14), 시간간격 h = KV/Kp = 1.0 s 가 이를 FC 지연 0.3~0.8 s 전 범위에서 1.00 으로 내린다
+# (docs/STABILITY_MARGINS.md 7절, 고전 규칙 h ≥ 2τ).
+KV_SELF = float(CONFIG["controller"].get("self_vel_damping", 0.3))
 FF_DEADBAND_MPS = float(CONFIG["controller"].get("leader_vel_ff_deadband_mps", 0.05))
 
 # 최소 이격: 이 거리 아래로는 접근 성분을 0 으로 자르고 침범량에 비례해 물러난다 (compute_velocity_cmd_from_estimate).
@@ -346,7 +347,7 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, targ
     """IMM 추정(FRU 상대 위치·속도) → BODY_NED [vx, vy, vz, yaw_rate].
 
     축마다  cmd = KFF·v_L + Kp·e + Kd·v_rel − KV·v_self.  마지막 항이 시간간격 정책이다: 전후축에서 정상상태
-    (cmd = v) 는 e = (v − KFF·(v−db) + KV·v)/Kp 라 이격이 속도에 비례해 벌어진다 (0.3 m/s 에서 0.53 m). 그 대가로
+    (cmd = v) 는 e = (v − KFF·(v−db) + KV·v)/Kp 라 이격이 속도에 비례해 벌어진다 (0.3 m/s 에서 0.63 m). 그 대가로
     리더 속도 변동이 뒤 기체에서 증폭되지 않는다(|Γ| ≤ 1). v_self_fru 가 None(자기 속도 미수신)이면 이 항은 0 이다.
     불확실하면(pos_cov_trace) 전체를 감속한다.
     """
