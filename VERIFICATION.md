@@ -43,7 +43,31 @@ python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 | PX4 경로 | ✅ C6 PX4 SITL 차등 검증 |
 | 수정본 SITL 재검증 | ✅ C1·C2·C3·C4·C6·H2 차등 검증 / C5는 증상 발생 불가로 판정 |
 | Jetson 실기 (지상) | ✅ 리더 검출 → 모터 구동까지 확인 (개발자 보고) |
-| **실비행** | 🔶 수행 — [조건부 시험 비행 가능](README.md#운용-순서) |
+| **실비행** | 🔶 미수행 — [docs/FLIGHT_SAFETY_CHECKLIST.md](docs/FLIGHT_SAFETY_CHECKLIST.md) 의 지상 점검 12항목 통과 뒤 6절 단계대로 |
+
+## 실비행 안전 점검 (2026-09-24)
+
+실비행을 앞두고 수치·미션/FC 상호작용·인지/FPS 세 갈래로 검토해 방벽 16종을 넣었습니다. 전체 목록·재현 수치·근거는
+[docs/FLIGHT_SAFETY_CHECKLIST.md](docs/FLIGHT_SAFETY_CHECKLIST.md) 0절, 검사는 `test_closed_loop.py --scenario ...` 8종과
+`test_fixes.py` 의 `안전:` 검사입니다. 폐루프 골든 스트림은 35 s 의 착륙 결정까지 351 개 setpoint 가 바이트 단위로 동일하고,
+그 뒤만 정책 변경대로 달라집니다.
+
+**동작이 바뀐 기본값 (의도된 변경).**
+
+| 항목 | 전 | 후 | 이유 |
+|---|---|---|---|
+| `mission.autonomous_land` | (없음 = LAND 송신) | **False** = FAILSAFE_LAND 에서 호버 유지 + STATUSTEXT | 느린 리더·사람이 앉음·EKF 원점 오차·하늘 배경 깊이 소실이 전부 "리더가 보이는데 엉뚱한 곳에 LAND" |
+| LAND 송신(켰을 때) | 2 s 간격 재시도 | 결정당 1회, 결정 뒤 GUIDED heartbeat 요구 | 조종사 탈환 1 s 창·더블 플릭을 덮어쓰지 않게 (`takeover` 시나리오) |
+| `controller.level_by_attitude` | False | **True** | 맞바람 기울기가 상하 명령이 됨 (`tilt` 시나리오: OFF 면 0.52 m 상승) |
+| `MIN_AGL_M` | 1.5 | **2.0** | z 는 EKF 원점 기준이라 여유 |
+| `camera.ae_roi_follow_track` | True | **False** | `set_region_of_interest` 호출당 ~140 ms 스톨 보고 (librealsense #7130) — 지상 측정 뒤 켤 것 |
+| `utils_geometry.clamp(nan)` | +상한 | 0 | NaN 이 +0.35 전진이 되던 경로 |
+| 깊이 측정 | bbox 안쪽 중앙값 | 가장 가까운 깊이 무리의 중앙값 | 속이 빈 기체에서 배경(8 m)을 잡아 전속 전진 |
+| ATTITUDE 스트림 | 10 Hz | 30 Hz 요청 (`SET_MESSAGE_INTERVAL`) | 돌풍 중 계단식 보정 오차 |
+| 내부 시계 | `time.time()` | `time.monotonic()` | NTP 점프 = 즉시 FAILSAFE_LAND |
+
+SITL `depth_loss`(10.0 s 뒤 LAND) 는 이제 `autonomous_land=True` 조건의 기록입니다. 이 검토는 SITL 을 다시 돌리지 않았습니다 —
+소스(ArduCopter 4.5)·하네스·합성 실험 근거이며, 실기 확인이 필요한 항목은 점검서 3절과 7절에 있습니다.
 
 ## 수정 완료 (2026-09-07)
 

@@ -11,3 +11,7 @@ logs/
 
 # 플랫폼별 wheel (감사 중 유입, Jetson에선 무용)
 *.whl
+
+# C++ 코어 빌드 산출물
+cpp/build/
+*.so

@@ -27,8 +27,9 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **SITL 비행** | ArduCopter SITL에서 **실제 `main.main()`을 그대로 비행**시켜 **8개 시나리오 전부 통과** |
 | **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 **4.3m — 이론값 4.36m와 소수 둘째 자리 일치** |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
-| **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
-| **회귀 스위트** | 단위 검사 129개 + SITL 시나리오 9개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
+| **소실 대응** | 선두를 놓치면 10초 뒤 `FAILSAFE_LAND` — 기본 정책은 **제자리 호버 유지 + GCS 알림**(조종사가 착륙), `mission.autonomous_land=True` 면 자동 LAND(SITL 실측 10.0초) |
+| **회귀 스위트** | 단위 검사 169개 + 폐루프 시나리오 8종 + SITL 시나리오 9개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
+| **실비행 안전** | ArduCopter 4.5 소스로 확인한 FC 방벽 + 컴패니언 방벽 16종 + 지상 점검 12항목 + 단계별 비행 계획 — [docs/FLIGHT_SAFETY_CHECKLIST.md](docs/FLIGHT_SAFETY_CHECKLIST.md) |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 추종 동작과 Fail-safe
@@ -38,9 +39,14 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 </p>
 
 검출이 살아 있으면 Depth 거리로 간격을 잡고 중심 오차로 기수를 맞춥니다. 검출이 끊기면 즉시
-제자리 호버로 물러나 재검출을 기다리고, **10초 안에 리더가 돌아오지 않으면 자동 LAND** 합니다
-(SITL 실측 10.0초). 오른쪽 그림의 3단계가 그대로 `mission_manager.py`의
-`FOLLOW → LOST_HOLD → FAILSAFE_LAND` 전이입니다.
+제자리 호버로 물러나 재검출을 기다리고, **10초 안에 리더가 돌아오지 않으면 `FAILSAFE_LAND`** 로 갑니다.
+오른쪽 그림의 3단계가 그대로 `mission_manager.py`의 `FOLLOW → LOST_HOLD → FAILSAFE_LAND` 전이입니다.
+그 상태에서 실제로 LAND 모드를 보낼지는 정책입니다(`config.py` `mission.autonomous_land`). **기본값은 False** —
+0 속도(FC 가 위치 유지)를 계속 보내고 GCS 에 `MARS: FAILSAFE_LAND (holding, no LAND)` 를 띄워 조종사가 착륙합니다.
+느린 리더가 깊이창 밖으로 걸어 나가거나, 사람 리더가 앉거나, EKF 원점이 1 m 틀리거나, 하늘 배경에서 깊이만 10초 끊기면
+전부 "리더가 멀쩡히 보이는데 엉뚱한 곳에 LAND" 가 되기 때문입니다(근거는
+[docs/FLIGHT_SAFETY_CHECKLIST.md](docs/FLIGHT_SAFETY_CHECKLIST.md) 5절). True 로 켜면 SITL 실측대로 10.0초 뒤 LAND 를 **한 번**
+보냅니다 — 착륙 결정 뒤에 받은 heartbeat 가 GUIDED 일 때만이라 조종사가 직전 1초 안에 탈환했으면 나가지 않습니다.
 
 ## 시스템 개요
 
@@ -83,6 +89,12 @@ EKF 상대 속도의 합입니다.
 
 추정 불확실성(`pos_cov_trace`)이 크면 전체 명령에 0.55 / 0.75배 감속이 걸립니다.
 
+위치 오차 `(front − TARGET, right, up)` 은 **편대 슬롯 오차**의 특수형입니다 — 슬롯을 설정하지 않으면 후미 자신의 시선 기준
+"리더 뒤 TARGET_DISTANCE_M" 슬롯이 되어 위 식과 비트 단위로 같은 명령이 나옵니다. 슬롯을 리더 heading 기준으로 주면
+(`config.formation.slots`, ArduPilot `FOLL_OFS_TYPE=1` 과 같은 개념) 후미 여럿이 선두 하나를 V 자 등으로 따라갈 수 있는 토대가
+됩니다. 체인이 아니라 **선두 속도 방송**(`ff_source="broadcast"|"auto"`) 을 쓰는 이유, 기체 기울기가 제어 오차로 새는 결함
+(`controller.level_by_attitude`, 기본 꺼짐)과 문헌 근거는 [docs/MULTI_FOLLOWER_FOUNDATION.md](docs/MULTI_FOLLOWER_FOUNDATION.md) 에 있습니다.
+
 **피드포워드가 없으면 정상상태 거리 오차가 `v/KP_FORWARD` 로 남습니다** — 리더 0.3 m/s 에 1.4 m,
 1 m/s 에 4.5 m 로 깊이창(10 m) 밖으로 밀려 소실됩니다. 초기 SITL 실측 평형 거리 4.3 m 가 이론값
 `3.0 + 0.3/0.22 = 4.36 m` 와 일치한 것이 이 오차입니다. 피드포워드(`KFF = 0.8`)를 넣으면 오차는
@@ -120,11 +132,24 @@ EKF 상대 속도의 합입니다.
 - **조종사가 항상 이깁니다.** 컴패니언은 FC 모드를 매 루프 확인하고, GUIDED/OFFBOARD가
   아니면 모드 변경 명령을 보내지 않습니다. 조종사가 LOITER로 탈환하면 그대로 유지됩니다
   (SITL 25초 검증).
-- **선두 소실 시 자동 착륙.** 거리 관측이 끊기면 호버로 버티다가 총 10초 뒤 LAND —
+- **선두 소실 시 호버, 착륙은 정책.** 거리 관측이 끊기면 호버로 버티다가 총 10초 뒤 `FAILSAFE_LAND` —
   깊이 센서만 죽고 검출이 살아 있는 교묘한 경우까지 거리 기준(`range_coast_time`)으로 잡습니다.
+  LAND 송신은 `mission.autonomous_land`(기본 False = 호버 유지 + GCS 알림) 로 켭니다.
+- **명령이 될 수 없는 값은 명령이 되지 않습니다.** NaN/inf 는 `clamp` 에서 0 으로 잘리고(예전 max/min 구현은 NaN 을
+  +0.35 전진으로 바꿨습니다), 제어기가 입력을 검증하며, EKF 상태가 비유한이면 추정기를 리셋합니다. 리더 텔레메트리의
+  Infinity/NaN/20 m/s 초과 속도 패킷은 버립니다.
+- **FC 상태를 모르면 움직이지 않습니다.** ATTITUDE/LOCAL_POSITION 이 1초 이상 정체되면 정지 명령, HEARTBEAT 가 3초
+  이상 정체되면 모드 불명으로 보아 모드 변경을 보내지 않고 링크 복구 시 미션을 리셋합니다.
+- **전방 1.2 m 정지.** 추적과 무관하게 원시 깊이 영상 중앙에 1.2 m 보다 가까운 덩어리가 있으면 전진을 막습니다.
+- **깊이는 가장 가까운 무리.** 속이 빈 드론 기체는 bbox 안쪽 영역의 절반 이상이 배경이라 단순 중앙값이 배경(8 m)을
+  잡아 "멀다"고 전속 전진합니다 — 가장 가까운 깊이 무리의 중앙값을 씁니다(사람처럼 단단한 표적은 동일).
+- **기울기가 명령이 되지 않습니다.** 기체가 pitch −10° 로 기울면(맞바람) 같은 고도 리더에 vz −0.09 m/s 가 나가
+  0.5 m 위로 올라가 정착했습니다 — `controller.level_by_attitude`(기본 True)가 roll/pitch 를 되돌립니다.
+- **천장.** GUIDED 인계 고도 + 5 m 위에서는 상승 명령을 막습니다(`MAX_CLIMB_ABOVE_ENTRY_M`).
 - **이륙 인계가 안전합니다.** 수동 상승 후 GUIDED로 넘기는 순간 미션·명령 버퍼를 리셋해
   깨끗한 상태로 추종을 시작합니다 (SITL 검증).
-- **고도 바닥.** `MIN_AGL_M`(1.5m) 아래에서는 하강 명령을 차단합니다.
+- **고도 바닥.** `MIN_AGL_M`(2.0 m, EKF 원점 기준) 아래에서는 하강 명령을 차단하고, 고도를 모르면(LOCAL_POSITION 정체)
+  하강 자체를 막습니다.
 - **GPS만으로는 붙지 않습니다.** 카메라 깊이가 끊기고 ESP32 GPS 상대위치만 남으면 이격을
   3m에서 8m(`TARGET_DISTANCE_GPS_ONLY_M`)로 넓힙니다 — GPS 상대오차는 m 단위라 3m는
   오차보다 작고, 8m는 깊이창(10m) 안이라 리더가 다시 보이면 비전이 이어받습니다.
@@ -148,8 +173,9 @@ EKF 상대 속도의 합입니다.
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 129개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 169개 — numpy만 있으면 됨
 python3 test_closed_loop.py    # 폐루프 특성화 — 가짜 FC·가짜 시계로 실제 main.main() 결정론 실행 (--dump/--compare)
+python3 test_closed_loop.py --scenario tilt|nan|fc_stale|climb|lost_alt|takeover   # 안전 시나리오 (docs/FLIGHT_SAFETY_CHECKLIST.md)
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 python3 analysis/stability_margins.py --plots   # 분석 층: 바깥 루프 선형 모델의 여유·스트링 안정성 (matplotlib)
 python3 analysis/trace_check.py                 # 요구도 ↔ 검사 추적성
@@ -171,7 +197,7 @@ python3 analysis/trace_check.py                 # 요구도 ↔ 검사 추적성
 주파수를 자극하지 않아 SITL 8개가 전부 통과했던 것입니다. 원인(자기 속도와 EKF 상대속도의 지연 불일치)과 수정
 (피드포워드 저역통과 2 s + 자기 속도 정합 필터 0.3 s + 소프트 데드존 → 14.4 dB, 1.13배)은
 [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) 에 있고, 정현파 리더 SITL 시나리오 `leader_sine` 이 이를
-ArduCopter 에서 검사합니다(실측: 현재 코드 0.72배, 수정 전 코드 1.95배로 FAIL). 요구도 57개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
+ArduCopter 에서 검사합니다(실측: 현재 코드 0.72배, 수정 전 코드 1.95배로 FAIL). 요구도 86개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 의 추적성 표에 있습니다.
 
 그리고 모든 시나리오는 **차등 검증**입니다 — 수정 전 코드에도 같은 시나리오를 돌려 대조군에서
@@ -264,6 +290,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 |---|---|
 | `main.py` | 제어 루프 전체 — 상수, 명령 생성, MAVLink 송신, 상태 표시 |
 | `mission_manager.py` | 미션 상태머신 (WAIT_LEADER / READY_HOVER / FOLLOW / LOST_HOLD / FAILSAFE_LAND …) |
+| `formation.py` | 선두 1 : 후미 N 토대 — 편대 슬롯(리더 heading / NED / 시선 기준), 리더 상대 heading 추정, `FOLLOW_TARGET` 호환 리더 상태 방송 스키마, 슬롯 정적 유효성 |
 | `imm_ekf.py` | 2모델 IMM-EKF (CV + Coordinated-Turn) |
 | `scheduler.py` | 검출기 on/off와 ROI 크기 스케줄링 |
 | `reliability.py` | 신뢰도 기반 R 팽창 + Mahalanobis 게이팅 |
@@ -282,7 +309,13 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 ## 문서
 
 - [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
+- [docs/MULTI_FOLLOWER_FOUNDATION.md](docs/MULTI_FOLLOWER_FOUNDATION.md) — 코드 정밀 분석(데이터 흐름·발견 결함), 문헌·ArduPilot/PX4 소스 기준의 제어 판단, 선두 1 : 후미 N 확장 토대
+- [docs/FORMATION_THEORY.md](docs/FORMATION_THEORY.md) — 편대 이론(이론 우선 트랙): 선두 방송 토폴로지의 스트링 안정성 정리, 시간간격 정책의 최소 h, 포화·이득 전환에 대한 원판 판별법 절대안정성, 실제 코드 체인 시뮬 검증, 졸업 논문 구성 제안 (`analysis/formation_theory.py`)
 - [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) — 바깥 루프 선형 모델, 위상·이득 여유, 스트링 안정성, 체인 시뮬레이션, 개선안
-- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 57개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
+- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 86개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
+- [docs/FLIGHT_SAFETY_CHECKLIST.md](docs/FLIGHT_SAFETY_CHECKLIST.md) — 실비행 안전 점검서: ArduCopter 소스로 확인한 FC 동작, FC 파라미터, 지상 점검 12항목, 단계별 비행 계획, 남은 위험
+- [docs/EXPERIMENT_PROTOCOL.md](docs/EXPERIMENT_PROTOCOL.md) — 논문(AST)용 비행 캠페인: UWB 거리 GT 장비·교정, 실험 카드 E1~E7, 분석 도구(`analysis/id_flight.py`·`identify_plant.py`·`sine_gain.py`·`nees_nis.py`), go/no-go 기준
+- [cpp/README.md](cpp/README.md) — C++ 코어 `mars_core`(IMM-EKF·제어 법칙·미션 상태머신 이식, 의존성 0). `./cpp/build.sh` 로 빌드·gtest·파이썬 오라클 차등 검증, `MARS_CORE=cpp python3 main.py` 로 사용. 기본은 파이썬
+- [docs/RELATED_WORK_EXPERIMENTS.md](docs/RELATED_WORK_EXPERIMENTS.md) — 관련 논문 5편의 실험 절 정리(플랫폼·GT·시행·수치, 증거 수준 표시), 실험 절의 공통 구조, 우리 프로토콜에 반영할 것, 전문 확인 목록
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
 - [docs/images/README.md](docs/images/README.md) — README 그림 파일과 수정 방법

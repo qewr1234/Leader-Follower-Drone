@@ -130,7 +130,7 @@ pymavlink 2.4.49, `arducopter` stable 배포 바이너리(빌드 없음), 시나
 | `depth_range` | PASS | 후반 3.9m (피드포워드 전 4.4m). `vL=0.28 ff=+0.28 fresh=LP1/ATT1`, FOLLOW 유지. 3.3m 까지 못 간 것은 MAX_VX 0.35 − 리더 0.3 = 0.05 m/s 의 추격 여유 때문 (아래). 피드포워드 안정성 수정(82b4f74) 뒤 재실행에서는 4.1m — 소프트 데드존이 빼는 0.05 m/s 만큼(+0.18 m 예측) |
 | `hover_hold` | PASS | 후반 3.0m |
 | `hold_heading` | PASS | 기수 편차 0.0° |
-| `depth_loss` | PASS | 깊이 소실 → LAND 10.0초 |
+| `depth_loss` | PASS | 깊이 소실 → LAND 10.0초 (2026-09-24 부터 `mission.autonomous_land=True` 일 때의 동작. 기본 False 는 FAILSAFE_LAND 에서 호버 유지) |
 | `handover` | PASS | GUIDED 인계 후 LAND 없음 |
 | `leader_sine` | PASS | 진폭비 0.72 (수정 전 대조군 1.95 FAIL). 아래 절 |
 

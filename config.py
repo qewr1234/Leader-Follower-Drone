@@ -37,7 +37,10 @@ CONFIG = {
         # 하늘 배경 역광에서 어두운 피사체 쪽으로 노출 보정.
         "color_backlight_compensation": True,
         # AE 측광 영역을 추적 bbox(1.5배)로 옮긴다(≤1Hz). 하늘 평균이 아니라 리더에 노출을 맞춘다. 소실 시 전체로 복귀.
-        "ae_roi_follow_track": True,
+        # 기본 False (2026-09-24): set_region_of_interest 는 hwmon USB 왕복이라 호출당 ~140 ms 가 보고된 적이 있다
+        # (librealsense #7130, Windows 측정). 제어 루프 안에서 초당 한 번 100 ms 스톨이면 프레임 3~4 개가 빠진다.
+        # 지상에서 재 본 뒤(camera.py 가 5 ms 초과 시 경고를 찍는다) 켤 것.
+        "ae_roi_follow_track": False,
     },
     "measurement": {
         "bbox_inner_ratio": 0.55,
@@ -88,9 +91,66 @@ CONFIG = {
         # 3 이라 리더 0.1~0.2 m/s 에서 실효 KFF 가 2.4 가 됐다. 빼는 만큼 정상상태 오차가 KFF·DB/Kp 늘므로(0.10 → +0.36m)
         # 폭을 0.05 로 줄였다. 호버 잡음은 위의 2.0s 저역통과가 평균내므로 데드존은 바이어스만 막으면 된다.
         "leader_vel_ff_deadband_mps": 0.05,
+        # 제어 오차 수평화. EKF 상대위치는 기체 고정 카메라 프레임(roll/pitch 포함)인데 FC 는 BODY_NED 속도를 yaw 만으로
+        # 회전한다(ArduCopter body_to_earth2D, PX4 mavlink_receiver — z 는 그대로). 그래서 pitch 10° 로 기운 채 같은 고도
+        # 리더를 보면 vz 0.094 m/s(상한 0.12) 가 나간다. True 면 제어 직전에 roll/pitch 를 되돌린다(main.level_fru_by_roll_pitch).
+        # 기본 True (2026-09-24). 폐루프 하네스 tilt 시나리오(test_closed_loop.py --scenario tilt --level 0/1)가 꺼진 상태의
+        # 결함(pitch −10° 에 vz −0.092, 팔로워가 D·tan10° = 0.52 m 위로 올라가 정착)과 켠 상태의 해소(|vz| < 0.01)를 재현한다.
+        # 맞바람에 기운 채 호버하면 이 편향이 상시 걸린다. 실기 전 지상 기울임 점검은 docs/FLIGHT_SAFETY_CHECKLIST.md.
+        "level_by_attitude": True,
+    },
+    # ---- 편대 (선두 1 : 후미 N 토대, formation.py) ----
+    # 기본값은 슬롯 미설정 = 후미 자신의 시선 기준 리더 뒤 TARGET_DISTANCE_M (기존 동작과 동일).
+    "formation": {
+        "follower_id": os.environ.get("MARS_FOLLOWER_ID", "F1"),
+        # 기대하는 리더 ID (ArduPilot FOLL_SYSID 역할). "" 이면 검사하지 않는다. 패킷의 leader_id/id/sysid 와 비교.
+        "leader_id": os.environ.get("MARS_LEADER_ID", ""),
+        # follower_id → 슬롯. offset 은 리더 → 슬롯 벡터. frame: "leader" = 리더 heading 기준 [front, right, up]
+        # (ArduPilot FOLL_OFS_TYPE=1) / "ned" = [north, east, down] (FOLL_OFS_TYPE=0) / "los" = 후미 시선 기준(기존).
+        # 예)  "F1": {"offset": [-3.0, 0.0, 0.0], "frame": "leader", "slot_id": "tail"},
+        #      "F2": {"offset": [-3.0, 2.5, 0.0], "frame": "leader", "slot_id": "right_wing"},
+        #      "F3": {"offset": [-3.0, -2.5, 0.0], "frame": "leader", "slot_id": "left_wing"},
+        "slots": {},
+        # 슬롯 정적 검사(formation.validate_formation): 슬롯 간 최소 이격, 깊이창 여유(C4 의 목표+v/Kp 여유).
+        "min_separation_m": 2.0,
+        "depth_reserve_m": 3.0,
+        # 리더 heading 을 속도 방향에서 얻을 때의 최소 수평 속도(PX4 follow_me 는 1.0 m/s). 그 아래는 최근값을 hold_sec 유지.
+        "heading_min_speed_mps": 0.5,
+        "heading_hold_sec": 2.0,
+        # 피드포워드 소스. "vision" = 자기 속도 + EKF 상대 속도(기존, 자기 속도 양성 되먹임 경로 있음 → KFF<1 필요),
+        # "broadcast" = 선두가 방송한 절대 속도만(없으면 P+D 만), "auto" = 방송이 있으면 방송, 없으면 vision.
+        # 체인·다중 후미에서는 broadcast/auto 가 맞다 (docs/MULTI_FOLLOWER_FOUNDATION.md, Seiler 2004 / Zheng 2016).
+        "ff_source": "vision",
     },
     "logger": {
         "enabled": True,
         "log_dir": "logs",
+    },
+    # ---- UWB 거리 GT (uwb_reader.py, docs/EXPERIMENT_PROTOCOL.md) — 로그 전용, 제어에 쓰지 않는다 ----
+    "uwb": {
+        "enabled": False,
+        # "serial": 후미 Jetson 에 붙인 UWB 모듈이 거리를 한 줄씩 찍는다 (권장 — ESP-NOW 링크와 독립)
+        # "leader_packet": 선두 ESP32 가 잰 거리를 텔레메트리 JSON 의 "uwb_range" 로 보낸다
+        "kind": "serial",
+        "port": os.environ.get("MARS_UWB_PORT", "/dev/ttyUSB1"),
+        "baud": 115200,
+        "unit": "m",                 # 모듈이 찍는 단위: m / cm / mm (줄에 단위가 있으면 그것이 우선)
+        "max_age_sec": 0.5,
+        "min_m": 0.2,
+        "max_m": 60.0,
+        # 후미 UWB 안테나 위치 (카메라 원점 기준 FRU, m) 와 선두 태그 위치 (선두 시각 중심 기준, 선두 FRU, m). 줄자로 재서 적는다.
+        "anchor_offset_fru": [0.0, 0.0, 0.0],
+        "tag_offset_leader_fru": [0.0, 0.0, 0.0],
+        # 정적 교정(docs/EXPERIMENT_PROTOCOL.md 3절) 으로 얻은 바이어스 [m] — 측정값에서 뺀다.
+        "bias_m": 0.0,
+    },
+    # ---- 미션 정책 ----
+    "mission": {
+        # 자율 착륙(FAILSAFE_LAND / CONFIRMED_LANDING 에서 LAND 모드 송신). False(기본) 면 그 상태에서도 0 속도(위치 유지)를
+        # 계속 보내고 GCS 에 STATUSTEXT 로 알린다 — 조종사가 있는 시험에서는 "엉뚱한 곳에 LAND" 가 더 위험하다:
+        # 느린 리더(< 0.25 m/s) 가 깊이창 밖으로 걸어 나감, 사람 리더가 앉음(z<0.65·하강·정지 → 착륙 판정), EKF 원점 1 m 오차,
+        # 하늘 배경에서 깊이만 10 s 끊김 — 전부 리더가 멀쩡히 보이는데 착륙한다 (docs/FLIGHT_SAFETY_CHECKLIST.md 5절 F1).
+        # True 면 LAND 를 결정당 한 번만, 결정 뒤에 받은 GUIDED heartbeat 가 있을 때만 보낸다.
+        "autonomous_land": False,
     },
 }

@@ -58,11 +58,14 @@ class LeaderPacket:
     vz: float
     roll: float
     pitch: float
-    yaw: float
+    yaw: Optional[float]          # rad, 북 기준 우회전 +. 필드가 없으면 None (0 으로 두면 '북쪽' 으로 오해된다)
     rx_time: float
     seq: int = -1
     alt_frame: str = "AMSL"       # "AMSL" | "ELLIPSOID"
     raw: Optional[Dict[str, Any]] = None
+    leader_id: str = ""           # 편대: 어느 리더의 패킷인가 (ArduPilot FOLL_SYSID 역할). 없으면 ""
+    acc: Optional[tuple] = None   # 편대: 선두 가속도 (vx/vy/vz 와 같은 프레임). FOLLOW_TARGET.acc 대응. 없으면 None
+    uwb_range: Optional[float] = None   # 선두 UWB 가 잰 선두↔후미 거리 [m] (GT 전용, 제어 미사용). 없거나 비유한·0 이하면 None
 
 
 # ============================================================
@@ -89,6 +92,8 @@ class LeaderTelemetryReceiver:
         udp_port=5005,
         timeout=0.001,
         default_alt_frame="AMSL",
+        expected_leader_id=None,
+        require_leader_id=False,
     ):
         self.kind = kind
         self.port = port
@@ -98,6 +103,11 @@ class LeaderTelemetryReceiver:
         self.timeout = timeout
         self.default_alt_frame = default_alt_frame
 
+        # 편대: 기대 리더 ID. 주면 다른 ID 의 패킷은 버린다(같은 채널에 리더가 둘일 때). require_leader_id 면 ID 없는
+        # 패킷도 버린다 — 기본은 호환을 위해 통과.
+        self.expected_leader_id = str(expected_leader_id) if expected_leader_id else None
+        self.require_leader_id = bool(require_leader_id)
+        self.dropped_other_leader = 0
         self.ser = None
         self.sock = None
         self._rx_buf = b""
@@ -137,6 +147,21 @@ class LeaderTelemetryReceiver:
         if msg != self._last_err:
             print(f"[LEADER] {msg}")
             self._last_err = msg
+
+    def _accept(self, pkt: Optional[LeaderPacket]) -> bool:
+        """파싱된 패킷을 latest_packet 으로 채택할지. 리더 ID 필터."""
+        if pkt is None:
+            return False
+        if self.expected_leader_id is not None:
+            if pkt.leader_id:
+                if pkt.leader_id != self.expected_leader_id:
+                    self.dropped_other_leader += 1
+                    return False
+            elif self.require_leader_id:
+                self.dropped_other_leader += 1
+                return False
+        self.latest_packet = pkt
+        return True
 
     def read_latest(self) -> Optional[LeaderPacket]:
         """
@@ -179,9 +204,7 @@ class LeaderTelemetryReceiver:
             text = line.decode("utf-8", errors="ignore").strip()
             if not text:
                 continue
-            pkt = parse_leader_json(text, default_alt_frame=self.default_alt_frame)
-            if pkt is not None:
-                self.latest_packet = pkt
+            self._accept(parse_leader_json(text, default_alt_frame=self.default_alt_frame))
 
         if len(self._rx_buf) > self._RX_BUF_LIMIT:
             self._rx_buf = self._rx_buf[-4096:]
@@ -197,9 +220,7 @@ class LeaderTelemetryReceiver:
                     break
 
                 text = data.decode("utf-8", errors="ignore").strip()
-                pkt = parse_leader_json(text, default_alt_frame=self.default_alt_frame)
-                if pkt is not None:
-                    self.latest_packet = pkt
+                self._accept(parse_leader_json(text, default_alt_frame=self.default_alt_frame))
 
             except BlockingIOError:
                 break
@@ -228,10 +249,20 @@ _ALT_FIELDS = (
 )
 
 
+def _reject_json_constant(name):
+    # json.loads 는 기본으로 NaN / Infinity / -Infinity 를 float 로 받아들인다. 속도에 inf 가 들어오면 피드포워드가
+    # NaN 으로 고정돼(inf − inf) 상한 전진 명령이 된다 (FLIGHT_SAFETY_CHECKLIST G1). 패킷 자체를 버린다.
+    raise ValueError(f"non-finite JSON constant {name}")
+
+
+# 리더 속도 상한(m/s). 이 위는 단위 오류(cm/s, mm/s)나 쓰레기 값이다 — 패킷을 버린다.
+LEADER_SPEED_MAX_MPS = 20.0
+
+
 def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[LeaderPacket]:
     try:
-        d = json.loads(text)
-        now = time.time()
+        d = json.loads(text, parse_constant=_reject_json_constant)
+        now = time.monotonic()
 
         # alias 지원
         timestamp = float(_get_any(d, ["timestamp", "time", "t", "ts"], now))
@@ -257,9 +288,26 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
 
         roll = float(_get_any(d, ["roll", "r"], 0.0))
         pitch = float(_get_any(d, ["pitch", "p"], 0.0))
-        yaw = float(_get_any(d, ["yaw", "y"], 0.0))
+        _yaw = _get_any(d, ["yaw", "y", "heading"], None)
+        yaw = None if _yaw is None else float(_yaw)
+
+        # 1e999 같은 리터럴은 json 이 inf 로 만든다 — 수치 필드는 전부 유한해야 하고 속도는 상한 안이어야 한다.
+        _nums = [timestamp, lat, lon, alt, vx, vy, vz, roll, pitch] + ([] if yaw is None else [yaw])
+        if not all(math.isfinite(v) for v in _nums) or math.sqrt(vx * vx + vy * vy + vz * vz) > LEADER_SPEED_MAX_MPS:
+            return None
 
         seq = int(_get_any(d, ["seq", "packet_seq"], -1))
+        leader_id = _get_any(d, ["leader_id", "id", "sysid", "system_id"], "")
+        leader_id = "" if leader_id is None else str(leader_id)
+        _acc = [_get_any(d, keys, None) for keys in (("ax", "acc_x"), ("ay", "acc_y"), ("az", "acc_z"))]
+        acc = None if any(a is None for a in _acc) else tuple(float(a) for a in _acc)
+        _uwb = _get_any(d, ["uwb_range", "uwb", "range_uwb", "uwb_m"], None)
+        try:
+            uwb_range = None if _uwb is None else float(_uwb)
+        except (TypeError, ValueError):
+            uwb_range = None
+        if uwb_range is not None and not (math.isfinite(uwb_range) and uwb_range > 0.0):
+            uwb_range = None          # 거리 필드가 나빠도 패킷은 살린다 (GT 는 부가 정보)
 
         return LeaderPacket(
             timestamp=timestamp,
@@ -276,6 +324,9 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
             seq=seq,
             alt_frame=alt_frame,
             raw=d,
+            leader_id=leader_id,
+            acc=acc,
+            uwb_range=uwb_range,
         )
 
     except Exception:
@@ -435,6 +486,8 @@ def build_leader_measurement_from_packet(
     now: Optional[float] = None,
     max_age_sec=0.7,
     leader_velocity_frame="ENU",
+    follower_gps_max_age_sec=None,
+    follower_attitude_max_age_sec=None,
 ):
     """
     ESP32 leader packet과 follower Pixhawk state를 이용해
@@ -455,7 +508,7 @@ def build_leader_measurement_from_packet(
         leader_hspeed
         roll/pitch/yaw
     """
-    now = time.time() if now is None else float(now)
+    now = time.monotonic() if now is None else float(now)
 
     if packet is None:
         return {"available": False, "reason": "no_leader_packet"}
@@ -465,17 +518,22 @@ def build_leader_measurement_from_packet(
         return _unavailable("stale_leader_packet", age, fresh=False)
 
     # follower GPS는 GPS_RAW_INT보다 GLOBAL_POSITION_INT를 우선 사용
-    follower_lla = normalize_lat_lon_alt_from_mavlink(
-        follower_vehicle_state.get("global_position", {})
-    )
+    follower_src = follower_vehicle_state.get("global_position", {})
+    follower_lla = normalize_lat_lon_alt_from_mavlink(follower_src)
 
     if follower_lla is None:
-        follower_lla = normalize_lat_lon_alt_from_mavlink(
-            follower_vehicle_state.get("gps", {})
-        )
+        follower_src = follower_vehicle_state.get("gps", {})
+        follower_lla = normalize_lat_lon_alt_from_mavlink(follower_src)
 
     if follower_lla is None:
         return _unavailable("no_follower_gps", age)
+
+    # 팔로워 위치가 오래됐으면 상대위치도 그만큼 틀린다(팔로워가 그 사이 움직인 만큼). 스트림이 죽었을 때 조용히
+    # 틀린 값을 쓰지 않도록 게이트. None 이면 검사하지 않는다(기존 동작).
+    if follower_gps_max_age_sec is not None:
+        _ts = follower_src.get("timestamp", None)
+        if _ts is not None and (now - float(_ts)) > float(follower_gps_max_age_sec):
+            return _unavailable("stale_follower_gps", age)
 
     # 리더가 타원체고를 보내면 팔로워도 타원체고(GPS_RAW_INT.alt_ellipsoid)로 뺀다.
     # 해발과 타원체고를 섞으면 지오이드 차이가 그대로 상대 고도가 된다.
@@ -484,6 +542,14 @@ def build_leader_measurement_from_packet(
         if f_alt_ell is None:
             return _unavailable("no_follower_ellipsoid_alt", age)
         follower_lla = (follower_lla[0], follower_lla[1], f_alt_ell)
+
+    # 상대위치는 팔로워 yaw 로 회전한다 — yaw 가 오래됐으면(ATTITUDE 정체) 회전이 틀리고 그 값이 EKF 에 gps 관측으로
+    # 들어간다. 자세가 있으면 자세 시각으로, 없으면(hdg 폴백) 위 GPS 신선도 게이트가 이미 걸러 준다.
+    if follower_attitude_max_age_sec is not None:
+        _att = follower_vehicle_state.get("attitude", {})
+        _att_ts = _att.get("timestamp", None)
+        if _att.get("yaw") is not None and _att_ts is not None and (now - float(_att_ts)) > float(follower_attitude_max_age_sec):
+            return _unavailable("stale_follower_attitude", age)
 
     follower_yaw = get_follower_yaw(follower_vehicle_state)
     if follower_yaw is None:
@@ -557,7 +623,8 @@ def build_leader_measurement_from_packet(
 
         "roll": float(packet.roll),
         "pitch": float(packet.pitch),
-        "yaw": float(packet.yaw),
+        "yaw": (None if packet.yaw is None else float(packet.yaw)),   # 편대: 리더 heading (없으면 None)
+        "leader_id": str(getattr(packet, "leader_id", "") or ""),
         "timestamp": float(packet.timestamp),
         "rx_time": float(packet.rx_time),
         "seq": int(packet.seq),
@@ -585,6 +652,17 @@ def apply_leader_velocity_hint_to_imm(ekf, rel_vel_cam, alpha=0.12, shrink_vel_c
     rel_vel_cam = np.asarray(rel_vel_cam, dtype=float)
     if rel_vel_cam.size < 3 or not np.all(np.isfinite(rel_vel_cam[:3])):
         return False
+    # 크기 상한: 단위 오류(cm/s)나 쓰레기 값이 힌트로 들어오면 IMM 속도가 끌려가 카메라 관측이 게이트 밖으로 밀리고
+    # (교정 불가) 팔로워가 MAX_VX 로 전진한다. 리더 속도 상한 + 자기 속도 여유.
+    if float(np.linalg.norm(rel_vel_cam[:3])) > LEADER_SPEED_MAX_MPS:
+        return False
+
+    hint = getattr(ekf, "apply_velocity_hint", None)
+    if callable(hint):          # C++ 코어(mars_core.ImmEkf): 필터 내부를 밖에서 만지지 않고 메서드로
+        try:
+            return bool(hint(rel_vel_cam[:3], float(alpha), float(shrink_vel_cov)))
+        except Exception:
+            return False
 
     try:
         for f in ekf.filters:

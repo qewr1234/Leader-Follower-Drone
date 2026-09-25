@@ -32,8 +32,11 @@ class ReliabilityEstimator:
             r_skip = 0.55
         else:
             r_skip = 1.0
+        # bbox 가 프레임 가장자리에 잘리면 중심(→ bearing·측면 위치) 이 치우친다. 깊이는 안쪽 영역이라 살아 있으므로
+        # 버리지 않고 R 만 키운다.
+        r_trunc = 0.6 if track_or_meas.get("truncated", False) else 1.0
 
-        return float(np.clip(r_conf * r_lost * r_age * r_skip, 0.0, 1.0))
+        return float(np.clip(r_conf * r_lost * r_age * r_skip * r_trunc, 0.0, 1.0))
 
     def depth_reliability(self, meas):
         if meas is None or meas.get("depth_m") is None:
@@ -59,9 +62,17 @@ class ReliabilityEstimator:
 
         return float(np.clip(r_valid * r_mad, 0.0, 1.0))
 
-    def make_R_rgbd(self, r_vision, r_depth):
+    # 스테레오 깊이 오차는 z² 에 비례한다 (D435: 기선 50 mm, f≈385 px, 서브픽셀 ≈0.08 → σ_z ≈ 0.006·z²: 3 m 0.05, 8 m 0.4 m).
+    # 기본 σ_z 0.25 는 6.5 m 까지는 이미 보수적이고 그 너머는 과신이므로 z 로 키운다.
+    STEREO_SIGMA_Z_COEF = 0.006
+
+    def make_R_rgbd(self, r_vision, r_depth, depth_m=None):
         r = max(float(r_vision) * float(r_depth), self.min_r)
-        return self.R_rgbd0 / r
+        R = self.R_rgbd0 / r
+        if depth_m is not None and np.isfinite(depth_m):
+            sig_z = max(float(np.sqrt(self.R_rgbd0[2, 2])), self.STEREO_SIGMA_Z_COEF * float(depth_m) ** 2)
+            R[2, 2] = max(R[2, 2], sig_z * sig_z / r)
+        return R
 
     def make_R_bearing(self, r_vision):
         r = max(float(r_vision), self.min_r)

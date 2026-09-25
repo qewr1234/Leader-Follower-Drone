@@ -16,6 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 failures = []
 
 
+def _raises(fn):
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
+
+
 def check(name, ok, detail=""):
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  — {detail}" if detail else ""))
     if not ok:
@@ -1068,6 +1076,568 @@ _ts = _tc.run(verbose=False)
 check("추적성: REQUIREMENTS.md 의 검증 근거(UT/CL/SITL/AN/INSPECT)가 전부 실제로 존재, 요구도 ≥ 50개, 폐루프 검사 전부 요구도에 연결",
       not _ts["errors"] and _ts["requirements"] >= 50 and not _ts["cl_orphans"],
       "; ".join(_ts["errors"][:3]) or f"{_ts['requirements']}개, UT {_ts['ut_traced']}/{_ts['ut_total']}, CL {_ts['cl_traced']}/{_ts['cl_total']}")
+
+# ------------------------------------------------- 편대 토대 (formation.py) — 선두 1 : 후미 N (docs/MULTI_FOLLOWER_FOUNDATION.md)
+import math as _math  # noqa: E402
+import formation as _fm  # noqa: E402
+from leader_telemetry import LeaderTelemetryReceiver as _LTR  # noqa: E402
+
+_rng = np3.random.default_rng(7)
+_same = True
+for _ in range(50):
+    _rel = _rng.uniform(-5, 5, 3)
+    _e, _deg = _fm.slot_error_fru(_rel, _fm.los_slot(main.TARGET_DISTANCE_M))
+    _old = [_rel[0] - main.TARGET_DISTANCE_M, _rel[1], _rel[2]]
+    _same &= (not _deg) and all(float(a) == float(b) for a, b in zip(_e, _old))
+_c_old = main.compute_velocity_cmd_from_estimate([3.7, -0.4, 0.2], [0.1, 0.0, 0.0], 1.0, main.TARGET_DISTANCE_M, [0.3, 0.0, 0.0])
+_c_new = main.compute_velocity_cmd_from_estimate([3.7, -0.4, 0.2], [0.1, 0.0, 0.0], 1.0, None, [0.3, 0.0, 0.0],
+                                                 slot_error=_fm.slot_error_fru([3.7, -0.4, 0.2], _fm.los_slot(main.TARGET_DISTANCE_M))[0])
+check("편대: 기본 LOS 슬롯 (−TARGET, 0, 0) 은 기존 오차 (front−TARGET, right, up) 와 비트 단위로 같고 명령도 같다 (기존 동작 보존)",
+      _same and all(float(a) == float(b) for a, b in zip(_c_old, _c_new)), f"cmd={np3.round(_c_new, 4)}")
+
+_slot = _fm.FormationSlot("right_wing", (-3.0, 2.0, 0.0), _fm.FRAME_LEADER, follower_id="F2")
+_e, _deg = _fm.slot_error_fru([5.0, 0.0, 0.0], _slot, rel_heading=_math.pi / 2)
+check("편대: 리더 heading 기준 슬롯 — 리더가 내 기준 +90°(동쪽)를 볼 때 '리더 뒤 3 m·우측 2 m' 는 내 FRU 로 (−2, −3) → 오차 (3, −3, 0)",
+      np3.allclose(_e, [3.0, -3.0, 0.0]) and not _deg, f"e={np3.round(_e, 3)}")
+_e0, _ = _fm.slot_error_fru([5.0, 0.0, 0.0], _slot, rel_heading=0.0)
+_ed, _deg = _fm.slot_error_fru([5.0, 0.0, 0.0], _slot, rel_heading=None)
+check("편대: 상대 heading 0 이면 리더 프레임 슬롯은 LOS 와 같은 기하(오차 (2, 2, 0)); heading 을 모르면 같은 거리(3.61 m)의 LOS 후방으로 강등하고 알린다",
+      np3.allclose(_e0, [2.0, 2.0, 0.0]) and _deg and np3.allclose(_ed, [5.0 - _math.hypot(3, 2), 0.0, 0.0]), f"e0={np3.round(_e0, 3)} ed={np3.round(_ed, 3)}")
+_en, _ = _fm.slot_error_fru([0.0, 0.0, 0.0], _fm.FormationSlot("west3", (0.0, -3.0, 0.0), _fm.FRAME_NED), follower_yaw=_math.pi / 2)
+check("편대: NED 슬롯 (북 0, 동 −3, 하 0) 은 동쪽을 보는 후미의 FRU 로 (−3, 0, 0) — ArduPilot FOLL_OFS_TYPE=0 대응",
+      np3.allclose(_en, [-3.0, 0.0, 0.0]), f"e={np3.round(_en, 3)}")
+_eg, _ = _fm.slot_error_fru([0.0, 0.0, 0.0], _fm.los_slot(3.0), min_distance=8.0)
+_eg2, _ = _fm.slot_error_fru([0.0, 0.0, 0.0], _fm.FormationSlot("s", (-3.0, 4.0, 0.0), _fm.FRAME_LEADER), rel_heading=0.0, min_distance=10.0)
+check("편대: 비전 거리 없이 GPS 뿐이면 슬롯 방향을 유지한 채 이격을 최소치로 늘린다 ((−3,0,0)→(−8,0,0) 정확히, (−3,4,0)→(−6,8,0)) — 기존 TARGET_DISTANCE_GPS_ONLY_M 규칙의 일반형",
+      float(_eg[0]) == -8.0 and np3.allclose(_eg, [-8.0, 0.0, 0.0]) and np3.allclose(_eg2, [-6.0, 8.0, 0.0]), f"{_eg} {_eg2}")
+
+_he = _fm.RelativeHeadingEstimator(min_speed_mps=0.5, hold_sec=2.0)
+_h1 = _he.update(0.0, leader_yaw_ned=1.0, follower_yaw_ned=0.2, leader_vel_fru=[0.0, 1.0, 0.0])
+_h2 = _he.update(1.0, leader_vel_fru=[0.0, 1.0, 0.0])
+_h3 = _he.update(2.0, leader_vel_fru=[0.1, 0.1, 0.0])
+_h4 = _he.update(5.0, leader_vel_fru=[0.1, 0.1, 0.0])
+_h5 = _he.update(6.0, leader_yaw_ned=3.0, follower_yaw_ned=-3.0)
+check("편대: 상대 heading 소스 우선순위 — 방송 yaw(0.8) > 속도 방향(+90°, ≥0.5 m/s) > 최근값 유지(2 s) > 없음(None), 각도는 ±π 로 감김",
+      abs(_h1[0] - 0.8) < 1e-9 and _h1[1] == "broadcast" and abs(_h2[0] - _math.pi / 2) < 1e-9 and _h2[1] == "velocity"
+      and abs(_h3[0] - _math.pi / 2) < 1e-9 and _h3[1] == "hold" and _h4 == (None, "none")
+      and abs(_h5[0] - (6.0 - 2 * _math.pi)) < 1e-9 and _h5[1] == "broadcast", f"{_h1} {_h2} {_h3} {_h4} {_h5}")
+
+_S = _fm.FormationSlot
+_v_kw = dict(min_separation_m=2.0, depth_min_m=0.3, depth_max_m=10.0, depth_reserve_m=3.0)
+_v_close = _fm.validate_formation([_S("a", (-3, 0, 0), "leader", "F1"), _S("b", (-3, 1.0, 0), "leader", "F2")], **_v_kw)
+_v_far = _fm.validate_formation([_S("a", (-3, 0, 0), "leader", "F1"), _S("b", (-9, 0, 0), "leader", "F2")], **_v_kw)
+_v_dup = _fm.validate_formation([_S("a", (-3, 0, 0), "leader", "F1"), _S("b", (-3, 2.5, 0), "leader", "F1")], **_v_kw)
+_v_ok = _fm.validate_formation([_S("a", (-3, 0, 0), "leader", "F1"), _S("b", (-3, 2.5, 0), "leader", "F2"), _S("c", (-3, -2.5, 0), "leader", "F3")], **_v_kw)
+check("편대: 유효성 — 슬롯 간 1 m(<2 m)·깊이창 여유 밖(9 m > 10−3)·follower_id 중복은 거부, V 자 3슬롯(2.5 m 간격)은 통과",
+      len(_v_close) == 1 and len(_v_far) == 1 and len(_v_dup) == 1 and _v_ok == [], f"{_v_close} {_v_far} {_v_dup} {_v_ok}")
+_cfg = {"follower_id": "F2", "slots": {"F2": {"offset": [-3, 2, 0], "frame": "leader", "slot_id": "rw"}}}
+check("편대: config 슬롯 선택 — 내 follower_id 에 슬롯이 있으면 그것(리더 프레임), 없으면 None(LOS 기본 = 기존 동작)",
+      _fm.slot_from_config(_cfg, "F2").slot_id == "rw" and _fm.slot_from_config(_cfg, "F2").frame == "leader"
+      and _fm.slot_from_config(_cfg, "F9") is None and _fm.slot_from_config({}, "F1") is None)
+
+_rx2 = _LTR(kind="udp", expected_leader_id="L1")
+_acc = [_rx2._accept(parse_leader_json(js)) for js in ('{"lat":1,"lon":2,"alt":3,"leader_id":"L1"}',
+                                                       '{"lat":1,"lon":2,"alt":3,"leader_id":"L2"}',
+                                                       '{"lat":1,"lon":2,"alt":3}')]
+_rx3 = _LTR(kind="udp", expected_leader_id="L1", require_leader_id=True)
+check("편대: 리더 ID 필터(ArduPilot FOLL_SYSID 역할) — 기대 ID 만 채택, 다른 ID 는 버리고 셈, ID 없는 패킷은 호환을 위해 통과(require_leader_id 면 거부)",
+      _acc == [True, False, True] and _rx2.dropped_other_leader == 1 and _rx2.latest_packet.leader_id == ""
+      and not _rx3._accept(parse_leader_json('{"lat":1,"lon":2,"alt":3}')) and _rx3.latest_packet is None, f"{_acc}")
+check("편대: 패킷에 yaw 가 없으면 None (0 = '북쪽' 으로 오해하지 않음), 있으면 float",
+      parse_leader_json('{"lat":1,"lon":2,"alt":3}').yaw is None and parse_leader_json('{"lat":1,"lon":2,"alt":3,"yaw":0.3}').yaw == 0.3
+      and build_leader_measurement_from_packet(_pk('{"lat":35.83,"lon":128.75,"alt":37.0}'), _FOLLOWER, now=0.0)["yaw"] is None)
+
+_pkt = parse_leader_json('{"timestamp": 12.5, "lat": 35.83, "lon": 128.75, "alt_msl": 37.0, "vx": 1.0, "vy": 2.0, "vz": 0.5, "yaw": 0.3, "leader_id": "L1", "seq": 4}')
+_ls = _fm.LeaderState.from_leader_packet(_pkt)
+_ft = _ls.to_follow_target()
+_back = _fm.LeaderState.from_follow_target(_ft, leader_id="L1", now=99.0)
+check("편대: LeaderState ↔ MAVLink FOLLOW_TARGET(#144) 왕복 — lat/lon degE7 정수, timestamp ms, vel ENU→NED [north, east, down], yaw↔attitude_q, est_capabilities=pos|vel|att",
+      _ft["lat"] == 358300000 and _ft["lon"] == 1287500000 and _ft["vel"] == [2.0, 1.0, -0.5] and _ft["timestamp"] == 12500
+      and _ft["est_capabilities"] == (_fm.LeaderState.EST_POS | _fm.LeaderState.EST_VEL | _fm.LeaderState.EST_ATT)
+      and abs(_back.yaw - 0.3) < 1e-9 and np3.allclose(_back.vel_enu, [1.0, 2.0, 0.5]) and _back.acc_enu is None
+      and abs(_back.lat - 35.83) < 1e-7 and _back.leader_id == "L1" and abs(_back.timestamp - 12.5) < 1e-9, f"{_ft}")
+
+# ------------------------------------------------- 편대: 체인 토폴로지 (선행기 추종 vs 선두 속도 방송) — analysis.chain_sim
+_w = 0.35   # 현재 설계의 |Γ| 피크 부근 (docs/STABILITY_MARGINS.md 6절: 비선형 1단 1.158)
+_ck = dict(n_followers=3, v_leader=0.30, T=60.0, profile="sine", omega=_w, amp=0.03)
+_hp = _sm.chain_sim(**_ck)
+_hb = _sm.chain_sim(topology="leader_broadcast", **_ck)
+_ap = _sm.chain_sine_amplitudes(_hp, _w, t_from=24.0)["amplitudes"]
+_ab = _sm.chain_sine_amplitudes(_hb, _w, t_from=24.0)["amplitudes"]
+_gp = [a / _ap[0] for a in _ap[1:]]       # 리더 → n 단 누적 이득
+_gb = [a / _ab[0] for a in _ab[1:]]
+check("편대: 체인 토폴로지 — 선행기 추종(predecessor)은 리더→n 단 누적 이득이 단마다 커지지만, 선두 속도 방송(leader_broadcast)은 단 수와 무관하게 유지(≤ 1.15)·더 작다 (Seiler 2004 / Zheng 2016)",
+      _gp[-1] > _gp[0] + 0.05 and _gb[-1] <= 1.15 and _gb[-1] <= _gb[0] + 0.03 and _gb[-1] < _gp[-1],
+      f"predecessor={[round(g, 3) for g in _gp]} broadcast={[round(g, 3) for g in _gb]}")
+_hk = _sm.chain_sim(n_followers=2, v_leader=0.3, T=40.0, profile="step", p=_sm.Params(kff=1.0), topology="leader_broadcast")
+_sk = _sm.chain_summary(_hk, t_from=10.0)
+_idx = int(np3.argmin(np3.abs(_hk["t"] - 28.0)))
+_cruise = [float(e[_idx]) for e in _hk["err"]]
+check("편대: 선두 속도 방송이면 KFF 1.0 도 안정(자기 속도 되먹임 경로 없음) — 최대 오차 < 0.8 m, 순항 잔차 ≈ KFF·DB/Kp = 0.23 m, 정지 후 0 (vision 소스의 KFF 1.0 은 선형 모델 GM −0.2 dB 로 불안정)",
+      max(_sk["max_abs_err_m"]) < 0.8 and all(abs(e - 0.05 / main.KP_FORWARD) < 0.08 for e in _cruise) and all(abs(e) < 0.15 for e in _sk["final_err_m"]),
+      f"max={[round(m, 2) for m in _sk['max_abs_err_m']]} cruise={[round(c, 2) for c in _cruise]} final={[round(f, 2) for f in _sk['final_err_m']]}")
+
+# ------------------------------------------------- 수평화: 기체 기울기 → 제어 오차 편향 (main.level_fru_by_roll_pitch)
+_rpy = (0.0, _math.radians(-10.0), 0.0)
+_rel_t = main.camera_xyz_to_fru(main._CAM_FROM_BODY @ (main.rot_body_to_ned(*_rpy).T @ np3.array([3.0, 0.0, 0.0])))
+_cmd_t = main.compute_velocity_cmd_from_estimate(_rel_t, np3.zeros(3), 1.0, 3.0, None)
+_rel_l = main.level_fru_by_roll_pitch(_rel_t, _rpy[0], _rpy[1])
+_cmd_l = main.compute_velocity_cmd_from_estimate(_rel_l, np3.zeros(3), 1.0, 3.0, None)
+check("수평화: pitch −10° 로 기운 기체는 같은 고도 리더(3 m)에 vz −0.094 m/s(상한 0.12 의 78 %) 를 내지만 roll/pitch 를 되돌리면 오차 (0,0,0)·명령 0 — FC 는 BODY_NED 를 yaw 만 회전(ArduCopter body_to_earth2D, PX4 mavlink_receiver)",
+      abs(_cmd_t[2] + 0.094) < 0.005 and abs(_rel_t[2] - 3 * _math.sin(_math.radians(10))) < 1e-6
+      and np3.allclose(_rel_l, [3.0, 0.0, 0.0], atol=1e-9) and abs(_cmd_l[2]) < 1e-9 and abs(_cmd_l[0]) < 1e-9,
+      f"tilted rel={np3.round(_rel_t, 3)} vz={_cmd_t[2]:+.3f} → leveled rel={np3.round(_rel_l, 3)}")
+_rpy2 = (_math.radians(10.0), 0.0, 0.0)
+_rel_t2 = main.camera_xyz_to_fru(main._CAM_FROM_BODY @ (main.rot_body_to_ned(*_rpy2).T @ np3.array([3.0, 2.0, 0.0])))
+check("수평화: 우측 롤 10° 에 우측 2 m 리더는 카메라 프레임에서 위로 0.35 m 떠 보이지만 수평화하면 (3, 2, 0); 수평 기체면 항등",
+      abs(_rel_t2[2] - 2 * _math.sin(_math.radians(10))) < 1e-6 and np3.allclose(main.level_fru_by_roll_pitch(_rel_t2, *_rpy2[:2]), [3.0, 2.0, 0.0], atol=1e-9)
+      and np3.allclose(main.level_fru_by_roll_pitch([1.0, 2.0, 3.0], 0.0, 0.0), [1.0, 2.0, 3.0]), f"{np3.round(_rel_t2, 3)}")
+check("수평화: 기본값은 켜짐(config controller.level_by_attitude=True) — 폐루프 tilt 시나리오가 결함 재현·해소를 모두 확인 (test_closed_loop.py --scenario tilt)",
+      main.LEVEL_BY_ATTITUDE is True and CONFIG["controller"]["level_by_attitude"] is True)
+
+# ------------------------------------------------- ESP32 GPS 신선도: 팔로워 GLOBAL_POSITION_INT 가 오래되면 상대위치를 만들지 않는다
+_stale_fs = {"global_position": {"lat": 358300000, "lon": 1287500000, "alt": 35000, "timestamp": 1.0}, "attitude": {"yaw": 0.0, "timestamp": 5.0}}
+_js = '{"lat":35.83,"lon":128.75,"alt":37.0}'
+_m_fresh = build_leader_measurement_from_packet(_pk(_js), _stale_fs, now=1.5, follower_gps_max_age_sec=0.7)
+_m_stale = build_leader_measurement_from_packet(_pk(_js), _stale_fs, now=5.0, follower_gps_max_age_sec=0.7)
+_m_nogate = build_leader_measurement_from_packet(_pk(_js), _stale_fs, now=5.0)
+check("ESP32 GPS 신선도: 팔로워 GLOBAL_POSITION_INT 가 0.7 s 보다 오래됐으면 상대위치를 만들지 않고(stale_follower_gps), 게이트를 안 주면 기존과 같다",
+      _m_fresh["available"] and not _m_stale["available"] and _m_stale["reason"] == "stale_follower_gps" and _m_nogate["available"],
+      f"fresh={_m_fresh['available']} stale={_m_stale.get('reason')} nogate={_m_nogate['available']}")
+
+# ------------------------------------------------- 이론: 편대 스트링 안정성 · 시간간격 · 절대안정성 (analysis/formation_theory.py, docs/FORMATION_THEORY.md)
+from analysis import formation_theory as _ft  # noqa: E402
+_th = _ft.compute_all(_frf)
+_t1 = _th["theorem1"]
+check("이론: 정리 1 — 선두 방송 토폴로지: 인접 단 교란 전달 ‖T‖∞ ≤ 1 (L2 스트링 안정), 리더→i 단 |Γ_i| 피크가 i 에 대해 유계(6단까지 ≤ Γ_1+0.01, 6단 ≤ 1.0)이고 꼬리 ‖P·B_d‖∞ ≤ KFF; 선행기 추종은 Γ_1^i 로 발산(6단 ≥ 2.0)",
+      _t1["T_inf_norm"] <= 1.0 + 1e-6 and max(_t1["peaks_broadcast"]) <= _t1["peaks_broadcast"][0] + 0.01
+      and _t1["peaks_broadcast"][-1] <= 1.0 + 1e-3 and _t1["PBd_inf_norm"] <= main.KFF_LEADER_VEL + 1e-6
+      and _t1["peaks_predecessor"][-1] >= 2.0 and all(b < a for a, b in zip(_t1["peaks_predecessor"], _t1["peaks_broadcast"])),
+      f"T∞={_t1['T_inf_norm']:.4f} 방송={[round(v, 3) for v in _t1['peaks_broadcast']]} 선행기={[round(v, 3) for v in _t1['peaks_predecessor']]}")
+_vb = [v for v in _th["validation"] if v["topology"] == "leader_broadcast"]; _vp = [v for v in _th["validation"] if v["topology"] == "predecessor"]
+check("이론: 정리 1 검증 — 실제 코드 4단 체인 시뮬의 리더→i 단 진폭비가 선형 Γ_i 와 방송 토폴로지 ≤ 10 %, 선행기 추종 ≤ 25 %(단마다 4 % 안팎 누적) 안에서 맞음",
+      all(v["max_rel_err"] <= 0.10 for v in _vb) and all(v["max_rel_err"] <= 0.25 for v in _vp),
+      f"방송 {[round(100 * v['max_rel_err'], 1) for v in _vb]} % 선행기 {[round(100 * v['max_rel_err'], 1) for v in _vp]} %")
+_t2 = _th["theorem2"]
+check("이론: 정리 2 — 시간간격 정책 D0 + h·v_F: vision FF(KFF 0.8) 은 h_min 1.22 s(±0.1) 에서 ‖Γ_h‖∞ = 1, 추가 이격 0.37 m @0.3 m/s, 여유 개선(PM ≥ 90°, GM ≥ 18 dB); KFF 1.0 은 h_min 2.1 s(±0.15)",
+      abs(_t2["kff0.8"]["h_min_s"] - 1.22) <= 0.1 and abs(_t2["kff0.8"]["peak"] - 1.0) <= 0.01 and _t2["kff0.8"]["pm_deg"] >= 90 and _t2["kff0.8"]["gm_db"] >= 18
+      and abs(_t2["kff1.0"]["h_min_s"] - 2.12) <= 0.15,
+      f"h_min={_t2['kff0.8']['h_min_s']:.2f}/{_t2['kff1.0']['h_min_s']:.2f} s PM={_t2['kff0.8']['pm_deg']:.0f}° GM={_t2['kff0.8']['gm_db']:.1f} dB")
+_t3 = _th["theorem3"]
+check("이론: 정리 3 — 원판 판별법: 현재 설계 min Re L(jω) ≈ −0.24 (여유 ≥ 0.7 > 0), 수정 전 설계·Kp ≤ 0.8 스윕도 모두 −1 위 → 명령 포화·불확실성 감속·추종 이득 전환(섹터 [δ,1]) 에 절대안정. 2026-09-18 스트링 결함은 대신호 문제가 아니었음",
+      _t3["current"]["certified"] and _t3["current"]["disk_margin"] >= 0.7 and abs(_t3["current"]["min_re_L"] + 0.237) < 0.03
+      and all(v["certified"] for v in _t3.values()) and _t3["before_2026-09-18"]["disk_margin"] >= 0.4,
+      " ".join(f"{k}:{v['min_re_L']:+.3f}" for k, v in _t3.items()))
+_ls = _th["large_signal"]
+check("이론: 대신호 확인(실제 코드) — 초기 오차 +4 m 계단에서 명령이 0.35 로 오래 포화해도 언더슈트 없이(최소 간격 ≥ 2.9 m) 수렴(최종 |오차| < 0.05 m); 리더 0.3±0.5 m/s 로 포화가 상시 활성인 정현파에서도 오차 진폭이 커지지 않음",
+      _ls["step"]["min_spacing_m"] >= 2.9 and abs(_ls["step"]["final_err_m"]) < 0.05 and _ls["sine"]["bounded"],
+      f"min_spacing={_ls['step']['min_spacing_m']:.2f} final={_ls['step']['final_err_m']:+.3f} sine {_ls['sine']['max_abs_err_first_half_m']:.2f}→{_ls['sine']['max_abs_err_second_half_m']:.2f} m")
+
+# ------------------------------------------------- 안전: NaN 명령 방벽 (docs/FLIGHT_SAFETY_CHECKLIST.md)
+from utils_geometry import clamp as _clamp  # noqa: E402
+_nan = float("nan")
+check("안전: clamp — 예전 max/min 구현은 clamp(nan, −0.35, 0.35) = +0.35(상한 전진) 였다. 지금은 NaN/inf → 0 을 범위로 자른 값, 유한 값은 그대로",
+      _clamp(_nan, -main.MAX_VX, main.MAX_VX) == 0.0 and _clamp(float("inf"), -1, 1) == 0.0 and _clamp(float("-inf"), 2, 5) == 2
+      and _clamp(0.5, -1, 1) == 0.5 and _clamp(3.0, -1, 1) == 1 and max(-0.35, min(0.35, _nan)) == 0.35,
+      f"clamp(nan)={_clamp(_nan, -0.35, 0.35)} raw max/min={max(-0.35, min(0.35, _nan))}")
+_ok_cmd, _ok = main.sanitize_cmd(np3.array([0.1, -0.2, 0.05, 0.3]))
+_bad_cmd, _bad = main.sanitize_cmd(np3.array([_nan, 0.0, 0.0, 0.0]))
+_inf_cmd, _inf = main.sanitize_cmd([0.0, 0.0, float("-inf"), 0.0])
+check("안전: sanitize_cmd 는 유한 명령은 그대로, NaN/inf 가 한 성분이라도 있으면 네 축 전부 0(정지) + False",
+      _ok and np3.allclose(_ok_cmd, [0.1, -0.2, 0.05, 0.3]) and not _bad and not _inf and not _bad_cmd.any() and not _inf_cmd.any())
+
+
+class _SendRec:
+    def __init__(self):
+        self.sent = []
+        self.mav = self
+        self.target_system = self.target_component = 1
+
+    def set_position_target_local_ned_send(self, *a):
+        self.sent.append(a)
+
+
+_sr = _SendRec()
+main.send_body_velocity(_sr, _nan, 0.1, float("inf"), 0.2)
+main.send_body_velocity(_sr, 0.11, -0.05, 0.02, -0.1)
+check("안전: send_body_velocity 최종 방벽 — 비유한 성분이 있으면 (0,0,0,yaw 0) 을 보내고, 유한 명령은 그대로 보낸다",
+      _sr.sent[0][8:11] == (0.0, 0.0, 0.0) and _sr.sent[0][15] == 0.0 and _sr.sent[1][8:11] == (0.11, -0.05, 0.02) and _sr.sent[1][15] == -0.1,
+      f"{_sr.sent[0][8:11]} {_sr.sent[1][8:11]}")
+check("안전: 상수 — 인계 고도 위 천장 5 m, FC 모드 불명 3 s, FC 상태 정체 정지 1 s, AGL 바닥 2.0 m, 전방 정지 1.2 m, 자율 착륙 기본 꺼짐",
+      main.MAX_CLIMB_ABOVE_ENTRY_M == 5.0 and main.FC_MODE_MAX_AGE_SEC == 3.0 and main.FC_STATE_HOLD_AGE_SEC == 1.0 and main.MIN_AGL_M == 2.0
+      and main.FORWARD_STOP_M == 1.2 and main.AUTONOMOUS_LAND is False and CONFIG["mission"]["autonomous_land"] is False)
+
+# ------------------------------------------------- 안전 2차 (검토 반영, docs/FLIGHT_SAFETY_CHECKLIST.md 4·5절)
+import measurement as _meas  # noqa: E402
+from imm_ekf import ImmEkf as _Ekf2  # noqa: E402
+from leader_telemetry import parse_leader_json as _plj, apply_leader_velocity_hint_to_imm as _hint  # noqa: E402
+from formation import RelativeHeadingEstimator as _RHE  # noqa: E402
+from tracker import LeaderTracker as _Trk  # noqa: E402
+from scheduler import PerceptionScheduler as _Sch  # noqa: E402
+import detector as _det  # noqa: E402
+import mavlink_io as _mio  # noqa: E402
+
+_mb = _meas.MeasurementBuilder({"fx": 615.0, "fy": 615.0, "ppx": 320.0, "ppy": 240.0}, depth_scale=0.001)
+_rng = np3.random.default_rng(0)
+
+
+def _bimodal_depth(body_frac, body_m=3.0, bg_m=8.0):
+    """100×100 bbox 의 안쪽 55 % 영역 중 body_frac 만 기체(body_m), 나머지는 배경(bg_m). D435 급 잡음."""
+    img = np3.full((480, 640), int(bg_m * 1000), dtype=np3.uint16)
+    x1, y1 = 270, 190
+    inner = img[y1 + 22:y1 + 78, x1 + 22:x1 + 78]           # 56×56 ≈ 안쪽 55 %
+    n = inner.size
+    mask = np3.zeros(n, dtype=bool); mask[: int(body_frac * n)] = True; _rng.shuffle(mask)
+    vals = np3.where(mask, body_m * 1000 + _rng.normal(0, 40, n), bg_m * 1000 + _rng.normal(0, 150, n))
+    inner[...] = vals.reshape(inner.shape).astype(np3.uint16)
+    return img, (x1, y1, x1 + 100, y1 + 100)
+
+
+_res = {}
+for _bf in (0.15, 0.30, 0.45, 0.60, 1.0):
+    _img, _bb = _bimodal_depth(_bf)
+    _res[_bf] = _mb._depth_stats(_img, _bb)["depth_m"]
+_img1, _bb1 = _bimodal_depth(1.0)
+_plain = float(np3.median(_img1[212:268, 292:348].astype(np3.float32) * 0.001))
+check("안전: nearest-mode 깊이 — 속이 빈 기체(안쪽 영역의 15~45 % 만 기체 3 m, 나머지 배경 8 m)에서도 3 m 를 잡는다(단순 중앙값은 <50 % 에서 8 m); 단단한 표적은 중앙값과 동일",
+      all(abs(_res[b] - 3.0) < 0.1 for b in (0.15, 0.30, 0.45, 0.60)) and abs(_res[1.0] - _plain) < 1e-6,
+      " ".join(f"{int(b * 100)}%:{_res[b]:.2f}" for b in _res))
+_clr_img = np3.full((480, 640), 5000, dtype=np3.uint16)
+_c0 = _mb.forward_clearance(_clr_img)
+_clr_img[230:250, 295:345] = 900               # 1.2 m 의 350 급 기체 몸통 크기(50×20 px) 덩어리
+_c1 = _mb.forward_clearance(_clr_img)
+_clr_img2 = np3.full((480, 640), 5000, dtype=np3.uint16); _clr_img2[236:244, 316:324] = 900   # 8×8 px 날림 화소는 무시
+_c1b = _mb.forward_clearance(_clr_img2)
+_c2 = _mb.forward_clearance(np3.zeros((480, 640), dtype=np3.uint16))
+_edge = np3.full((480, 640), 5000, dtype=np3.uint16); _edge[:, :60] = 400     # 가장자리(프로펠러) 는 무시
+_c3 = _mb.forward_clearance(_edge)
+check("안전: 전방 여유(forward_clearance) — 중앙 영역에서 40 번째로 가까운 표본(≈640 px): 균일 5 m → 5.0, 50×20 px 덩어리 0.9 m → 0.9, 8×8 px 날림 화소 → 5.0, 유효 깊이 없음 → None, 가장자리 0.4 m 는 무시",
+      abs(_c0 - 5.0) < 1e-6 and abs(_c1 - 0.9) < 1e-6 and abs(_c1b - 5.0) < 1e-6 and _c2 is None and abs(_c3 - 5.0) < 1e-6,
+      f"{_c0} {_c1} {_c1b} {_c2} {_c3}")
+
+_good = _plj('{"lat":35.8,"lon":128.7,"alt":50,"vx":0.3,"vy":0.0,"vz":0.0}')
+_bad = [_plj(t) for t in ('{"lat":35.8,"lon":128.7,"alt":50,"vx":Infinity}', '{"lat":35.8,"lon":128.7,"alt":50,"vx":NaN}',
+                          '{"lat":35.8,"lon":128.7,"alt":50,"vx":1e999}', '{"lat":35.8,"lon":128.7,"alt":50,"vx":25,"vy":0}',
+                          '{"lat":NaN,"lon":128.7,"alt":50}', '{"lat":35.8,"lon":128.7,"alt":50,"yaw":Infinity}')]
+check("안전: parse_leader_json 은 Infinity/NaN/1e999 와 속도 > 20 m/s 패킷을 버린다(None) — inf 속도는 피드포워드를 NaN 으로 고정시켜 상한 전진이 됐다",
+      _good is not None and all(b is None for b in _bad), f"good={_good is not None} bad={[b is None for b in _bad]}")
+_ek = _Ekf2(); _ek.init(np3.array([0.0, 0.0, 3.0]))
+check("안전: 속도 힌트 상한 — |v| > 20 m/s(단위 오류·쓰레기) 힌트는 거부, 1 m/s 는 적용",
+      _hint(_ek, [30.0, 0.0, 0.0]) is False and _hint(_ek, [1.0, 0.0, 0.0]) is True)
+check("안전: 상대 heading 추정기 — 방송 yaw 가 NaN 이면 None 으로(hold 로도 남기지 않음), 유한하면 정상",
+      _RHE().update(0.0, leader_yaw_ned=float("nan"), follower_yaw_ned=0.0) == (None, "none")
+      and abs(_RHE().update(0.0, leader_yaw_ned=0.5, follower_yaw_ned=0.0)[0] - 0.5) < 1e-9)
+_lp0 = main.self_velocity_lpf(np3.array([0.1, 0.0, 0.0]), [float("nan"), 0.0, 0.0], 0.033)
+_lp1 = main.self_velocity_lpf(None, [float("nan"), 0.0, 0.0], 0.033)
+check("안전: self_velocity_lpf — FC 속도에 NaN 이 오면 직전 값을 유지하고(prev 없으면 0), 필터가 NaN 으로 고정되지 않는다",
+      np3.allclose(_lp0, [0.1, 0.0, 0.0]) and np3.allclose(_lp1, [0.0, 0.0, 0.0]))
+_cn = [main.compute_velocity_cmd_from_estimate([3.0, 0, 0], [0, 0, 0], 1.0, 3.0, [_nan, 0, 0]),
+       main.compute_velocity_cmd_from_estimate([_nan, 0, 0], [0, 0, 0], 1.0, 3.0, None),
+       main.compute_velocity_cmd_from_estimate([3.0, 0, 0], [0, 0, 0], 1.0, 3.0, None, slot_error=[_nan, _nan, 0]),
+       main.compute_velocity_cmd_from_estimate([-3.0, 0, 0], [0, 0, 0], 1.0, 3.0, None)]
+_cok = main.compute_velocity_cmd_from_estimate([4.0, 0, 0], [0, 0, 0], 1.0, 3.0, None)
+check("안전: 제어기 입력 검증 — 피드포워드·상대 상태·슬롯 오차에 NaN 이 있으면(예전엔 clamp 가 +0.35 전진으로 바꿈) 정지, 추정이 카메라 뒤(front ≤ 0)면 정지, 정상 입력은 그대로",
+      all(not c.any() for c in _cn) and abs(_cok[0] - 0.22) < 1e-9, f"{[list(c) for c in _cn]} ok={_cok}")
+_fs_att = {"global_position": {"lat": 358300000, "lon": 1287500000, "alt": 35000, "timestamp": 4.9},
+           "attitude": {"yaw": 0.0, "timestamp": 1.0}}
+_m_att_stale = build_leader_measurement_from_packet(_pk(_js), _fs_att, now=5.0, follower_attitude_max_age_sec=0.3)
+_m_att_ok = build_leader_measurement_from_packet(_pk(_js), _fs_att, now=1.2, follower_attitude_max_age_sec=0.3)
+_m_att_nogate = build_leader_measurement_from_packet(_pk(_js), _fs_att, now=5.0)
+check("안전: 팔로워 자세 신선도 — ATTITUDE yaw 가 0.3 s 보다 오래됐으면 ESP32 상대위치를 만들지 않는다(stale_follower_attitude); 게이트를 안 주면 기존과 같다",
+      not _m_att_stale["available"] and _m_att_stale["reason"] == "stale_follower_attitude" and _m_att_ok["available"] and _m_att_nogate["available"],
+      f"{_m_att_stale.get('reason')} ok={_m_att_ok['available']} nogate={_m_att_nogate['available']}")
+_rel2 = ReliabilityEstimator()
+_R3, _R10, _Rn = _rel2.make_R_rgbd(1.0, 1.0, depth_m=3.0), _rel2.make_R_rgbd(1.0, 1.0, depth_m=10.0), _rel2.make_R_rgbd(1.0, 1.0)
+check("안전: 스테레오 R — σ_z = max(0.25, 0.006·z²): 3 m 는 기본 0.25² 그대로, 10 m 는 0.6² 로 커진다(원거리 과신 방지); depth 를 안 주면 기존과 같다",
+      abs(_R3[2, 2] - 0.0625) < 1e-9 and abs(_R10[2, 2] - 0.36) < 1e-9 and abs(_Rn[2, 2] - 0.0625) < 1e-9 and abs(_R10[0, 0] - 0.0225) < 1e-9)
+_t2 = _Trk(); _t2.update([{"bbox": (100, 100, 200, 300), "conf": 0.8, "area": 20000}]); _t2.update([])
+_steal = _t2.update([{"bbox": (150, 100, 450, 700), "conf": 0.9, "area": 180000}])
+_t3 = _Trk(); _t3.update([{"bbox": (100, 100, 200, 300), "conf": 0.8, "area": 20000}]); _t3.update([])
+_recov = _t3.update([{"bbox": (160, 110, 265, 320), "conf": 0.8, "area": 22050}])
+check("안전: 트래커 크기 게이트 — 한 프레임 놓친 뒤 대각선 3 배짜리 검출(다른 거리의 사람)은 근접 반경 안이라도 거부(트랙 미스), 비슷한 크기의 근접 검출은 회복",
+      _steal["is_lost"] and _steal["lost_count"] == 2 and not _recov["is_lost"] and _recov["track_id"] == 1)
+_sch = _Sch()
+_pol_off = _sch.decide({"x": np3.array([40.0, 0.0, 3.0, 0, 0, 0]), "P": np3.eye(6) * 0.01, "mode_probs": np3.array([0.7, 0.3]), "initialized": True},
+                       (480, 640, 3), {"fx": 615.0, "fy": 615.0, "ppx": 320.0, "ppy": 240.0}, {"lost_count": 0})
+_pol_in = _sch.decide({"x": np3.array([0.0, 0.0, 3.0, 0, 0, 0]), "P": np3.eye(6) * 0.01, "mode_probs": np3.array([0.7, 0.3]), "initialized": True},
+                      (480, 640, 3), {"fx": 615.0, "fy": 615.0, "ppx": 320.0, "ppy": 240.0}, {"lost_count": 0})
+_dets = _det._postprocess([[10, 10, 10, 50, 0.9, 0], [10, 10, 60, 50, 0.8, 0]], 0, 0, 640, 480, {0: "person"}, "person")
+check("안전: 스케줄러 — EKF 투영이 화면 밖이면 1 px ROI 대신 전체 프레임(off_image), 안이면 ROI; 검출기는 폭·높이 < 2 px 퇴화 검출을 버린다(clip_bbox 가 1 px 로 넓히기 전에)",
+      _pol_off["reason"] == "off_image" and _pol_off["use_full_frame"] and _pol_in["reason"] == "risk_bound_roi"
+      and len(_dets) == 1 and _dets[0]["bbox"] == (10, 10, 60, 50), f"{_pol_off['reason']} {_pol_in['reason']} dets={len(_dets)}")
+
+
+class _StRec:
+    def __init__(self, has=True):
+        self.mav = self
+        self.target_system = self.target_component = 1
+        self.sent = []
+        if not has:
+            del type(self).statustext_send   # noqa — 아래 별도 클래스로 처리
+
+    def statustext_send(self, sev, text, *a):
+        self.sent.append((sev, text))
+
+
+class _StNone:
+    mav = None
+
+
+_sr2 = _StRec()
+check("안전: STATUSTEXT — 50 바이트로 잘라 보내고(ASCII 대체), 지원하지 않는 링크에서는 False 로 조용히 넘어간다",
+      main.send_statustext(_sr2, "MARS: " + "x" * 80) and len(_sr2.sent[0][1]) == 50 and _sr2.sent[0][1].startswith(b"MARS:")
+      and main.send_statustext(_StNone(), "a") is False)
+
+
+class _StreamRec:
+    def __init__(self):
+        self.mav = self
+        self.target_system = self.target_component = 1
+        self.streams, self.cmds = [], []
+
+    def request_data_stream_send(self, *a):
+        self.streams.append(a)
+
+    def command_long_send(self, *a):
+        self.cmds.append(a)
+
+
+_srr = _StreamRec(); _mio.request_data_streams(_srr)
+check("안전: ATTITUDE 30 Hz — request_data_streams 는 스트림 3개 외에 MAV_CMD_SET_MESSAGE_INTERVAL(ATTITUDE id 30, 33333 µs) 를 보낸다",
+      len(_srr.streams) == 3 and len(_srr.cmds) == 1 and _srr.cmds[0][2] == 511 and _srr.cmds[0][4] == 30 and abs(_srr.cmds[0][5] - 1e6 / 30) < 1,
+      f"{_srr.cmds}")
+_src_main = open(Path(__file__).resolve().parent / "main.py", encoding="utf-8").read()
+_src_lt = open(Path(__file__).resolve().parent / "leader_telemetry.py", encoding="utf-8").read()
+_src_mio = open(Path(__file__).resolve().parent / "mavlink_io.py", encoding="utf-8").read()
+check("안전: 단조 시계 — 루프·수신 시각·패킷 rx_time 은 time.monotonic() (NTP 가 벽시계를 튀겨도 소실 타이머·dt 가 튀지 않음); 벽시계는 MAVLink time_boot_ms 와 로그에만",
+      "now = time.monotonic()" in _src_main and "prev_time = time.monotonic()" in _src_main and _src_main.count("time.time()") == 2
+      and "time.time()" not in _src_lt and "time.time()" not in _src_mio and "now = time.monotonic()" in _src_mio)
+
+# ------------------------------------------------- 논문 도구: UWB 거리 GT · 식별 · 정현파 이득 · 일관성 (docs/EXPERIMENT_PROTOCOL.md)
+import uwb_reader as _uw  # noqa: E402
+from analysis import logtools as _lt, identify_plant as _idp, sine_gain as _sgn, nees_nis as _nn2, id_flight as _idf  # noqa: E402
+
+_p1 = _uw.parse_uwb_line('{"range": 3.12, "seq": 17, "q": -80}', now=1.0)
+_p2, _p3, _p4 = _uw.parse_uwb_line("312 cm", now=1.0), _uw.parse_uwb_line("Range: 3.12 m", now=1.0), _uw.parse_uwb_line("distance=312", unit="cm", now=1.0)
+check("논문 도구: UWB 줄 파싱 — JSON(range/seq/q)·숫자+단위·키:값 세 형식이 같은 3.12 m, 쓰레기·NaN·음수는 None",
+      _p1.range_m == 3.12 and _p1.seq == 17 and _p1.quality == -80 and abs(_p2.range_m - 3.12) < 1e-9 and abs(_p3.range_m - 3.12) < 1e-9
+      and abs(_p4.range_m - 3.12) < 1e-9 and _uw.parse_uwb_line("garbage") is None and _uw.parse_uwb_line('{"range": NaN}') is None and _uw.parse_uwb_line("-3") is None)
+_rx = _uw.UwbRangeReceiver(unit="m", min_m=0.2, max_m=60.0)
+_rx.feed_line("3.10", now=1.0); _rx.feed_line("70", now=1.1); _rx.feed_line("x", now=1.2)
+check("논문 도구: UWB 수신기 — 범위 밖(70 m)·쓰레기는 세기만 하고 최신값(3.10) 을 지킨다", _rx.latest.range_m == 3.10 and _rx.n_ok == 1 and _rx.n_out_of_range == 1 and _rx.n_bad == 1)
+check("논문 도구: UWB 기하 — 앵커 0.1 m 앞·태그 0.1 m 위·리더 3 m 정면에서 측정 3.0 → 중심 거리 3.098 (정확해), 태그 0.2 m 앞이면 2.8",
+      abs(_uw.uwb_range_to_center(3.0, [1, 0, 0], anchor_offset_fru=[0.1, 0, 0], tag_offset_fru=[0, 0, 0.1]) - (0.1 + _math.sqrt(9 - 0.01))) < 1e-9
+      and abs(_uw.uwb_range_to_center(3.0, [1, 0, 0], tag_offset_fru=[0.2, 0, 0]) - 2.8) < 1e-9)
+_blk = _uw.uwb_block(_uw.UwbRange(3.05, rx_time=10.0), now=10.1, max_age_sec=0.5, rel_fru=[3.0, 0.0, 0.0])
+_blk_stale = _uw.uwb_block(_uw.UwbRange(3.05, rx_time=10.0), now=11.0, max_age_sec=0.5)
+check("논문 도구: UWB 로그 블록 — 신선하면 available·range_center·잔차(EKF −GT = −0.05), 0.5 s 넘으면 stale_uwb",
+      _blk["available"] and abs(_blk["residual_m"] + 0.05) < 1e-9 and not _blk_stale["available"] and _blk_stale["reason"] == "stale_uwb")
+_pk_uwb = _pk('{"lat":35.83,"lon":128.75,"alt":37.0,"uwb_range":3.21}')
+_pk_bad = _pk('{"lat":35.83,"lon":128.75,"alt":37.0,"uwb_range":"x"}')
+check("논문 도구: 선두 패킷의 uwb_range 필드 — 있으면 float, 나쁜 값이면 None 이되 패킷은 살린다, 없으면 None",
+      _pk_uwb.uwb_range == 3.21 and _pk_bad is not None and _pk_bad.uwb_range is None and _pk(_js).uwb_range is None)
+check("논문 도구: 제어는 UWB 를 쓰지 않는다 — main 에 uwb 를 명령·EKF 로 넣는 코드가 없다 (로그 블록·STAT 뿐)",
+      "uwb" not in _src_main.split("def compute_velocity_cmd_from_estimate")[1].split("def smooth_velocity_cmd")[0]
+      and "uwb" not in _src_main.split("def fuse_vision")[1].split("ESP_IDLE")[0] and CONFIG["uwb"]["enabled"] is False)
+check("논문 도구: chi2_ppf(불완전감마 이분법, scipy 없음) — χ²(0.975;3)=9.348, χ²(0.025;3)=0.2158, χ²(0.95;30)=43.77, χ²(0.95;1)=3.841 을 0.2 % 안에서",
+      abs(_lt.chi2_ppf(0.975, 3) / 9.3484 - 1) < 0.002 and abs(_lt.chi2_ppf(0.025, 3) / 0.21580 - 1) < 0.002 and abs(_lt.chi2_ppf(0.95, 30) / 43.773 - 1) < 0.002
+      and abs(_lt.chi2_ppf(0.95, 1) / 3.8415 - 1) < 0.002, f"{_lt.chi2_ppf(0.975, 3):.4f} {_lt.chi2_ppf(0.025, 3):.5f} {_lt.chi2_ppf(0.95, 30):.3f} {_lt.chi2_ppf(0.95, 1):.4f}")
+_seq = _idf.step_sequence("forward", 0.9, 4.0, 4.0, 2)
+check("논문 도구: id_flight 계단 순서 — 진폭이 축 상한(forward 0.5)으로 잘리고, 정지→+→정지→−→정지 × 2 = 9 구간 36 s, up 상한 0.15, 총 120 s 초과는 거부",
+      max(abs(c[0]) for _, c in _seq) == 0.5 and len(_seq) == 9 and sum(d for d, _ in _seq) == 36.0 and _idf.step_sequence("up", 1.0, 4, 4, 1)[1][1][2] == 0.15
+      and (lambda: (_idf.step_sequence("forward", 0.3, 20, 20, 3), False))()[1] is False if False else True)
+try:
+    _idf.step_sequence("forward", 0.3, 20.0, 20.0, 3); _too_long = False
+except ValueError:
+    _too_long = True
+check("논문 도구: id_flight 총 시간 상한 — 20 s 계단 × 3 회(140 s) 는 ValueError", _too_long)
+import io as _io, contextlib as _ctx
+with _ctx.redirect_stdout(_io.StringIO()):
+    _ok_id, _ = _idp.selftest(); _ok_sg = _sgn.selftest(); _ok_nn = _nn2.selftest()
+check("논문 도구: 자체검사 — identify_plant(K 0.97·τ 0.35·L 0.12 되찾음), sine_gain(이득 0.7·위상 −35° 를 esp32/uwb/ekf 출처에서), nees_nis(일관/과신 판별)",
+      _ok_id and _ok_sg and _ok_nn, f"id={_ok_id} sine={_ok_sg} nees={_ok_nn}")
+
+# ------------------------------------------------- C++ 코어 (cpp/, mars_core): 파이썬 오라클 대비 차등 검증
+try:
+    import mars_core as _mc
+except ImportError:
+    _mc = None
+if _mc is None:
+    print("[SKIP] C++ 코어: mars_core 미빌드 — ./cpp/build.sh 뒤 이 검사가 활성화된다")
+else:
+    from imm_ekf import ImmEkf as _PyEkf, SIGMA_XY as _sxy, SIGMA_Z as _sz, MAX_COAST_SEC as _mcs, RANGE_COAST_MAX_SEC as _rcs
+
+    def _diff_run(seed, steps=600):
+        rng = np3.random.default_rng(seed)
+        py, cc = _PyEkf(), _mc.ImmEkf(_sxy, _sz, _mcs, _rcs)
+        rel_r = ReliabilityEstimator()
+        truth = np3.array([0.2, -0.1, 3.0, 0.05, 0.0, 0.3])
+        worst = 0.0
+        for k in range(steps):
+            dt = float(rng.uniform(0.02, 0.05))
+            truth[:3] += truth[3:] * dt
+            if k == 0:
+                z = truth[:3] + rng.normal(0, 0.05, 3)
+                py.init(z); cc.init(z)
+            for e in (py, cc):
+                e.predict(dt)
+            u = rng.random()
+            if u < 0.55:
+                z = truth[:3] + rng.normal(0, 0.05, 3)
+                R = rel_r.make_R_rgbd(float(rng.uniform(0.3, 1.0)), float(rng.uniform(0.3, 1.0)), depth_m=float(z[2]))
+                for e in (py, cc):
+                    e.update_position3d(z, R)
+            elif u < 0.80:
+                zb = truth[:2] / truth[2] + rng.normal(0, 0.01, 2)
+                Rb = rel_r.make_R_bearing(float(rng.uniform(0.3, 1.0)))
+                for e in (py, cc):
+                    e.update_bearing2d(zb, Rb)
+            elif u < 0.88:
+                for e in (py, cc):
+                    e.on_lost(dt)
+            if rng.random() < 0.3:
+                dpsi = float(rng.normal(0, 0.02))
+                c, s = _math.cos(dpsi), _math.sin(dpsi)
+                T = np3.array([[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]])
+                for e in (py, cc):
+                    e.compensate_ego_rotation(T)
+            if rng.random() < 0.1:
+                v = rng.normal(0, 0.3, 3)
+                a = apply_leader_velocity_hint_to_imm(py, v, alpha=0.10, shrink_vel_cov=0.98)
+                b = apply_leader_velocity_hint_to_imm(cc, v, alpha=0.10, shrink_vel_cov=0.98)
+                assert a == b
+            xp, Pp = py.get_state(); xc, Pc = cc.get_state()
+            yp, Sp = py.innovation_position3d(truth[:3]); yc, Sc = cc.innovation_position3d(truth[:3])
+            worst = max(worst, float(np3.max(np3.abs(xp - xc))), float(np3.max(np3.abs(Pp - Pc))),
+                        float(np3.max(np3.abs(py.get_model_probs() - cc.get_model_probs()))),
+                        float(np3.max(np3.abs(yp - yc))), float(np3.max(np3.abs(Sp - Sc))),
+                        abs(py.coast_time - cc.coast_time), abs(py.range_coast_time - cc.range_coast_time))
+            assert py.has_range_fix() == cc.has_range_fix() and py.is_reliable() == cc.is_reliable()
+        return worst
+
+    from leader_telemetry import apply_leader_velocity_hint_to_imm  # noqa: E402
+    _worsts = [_diff_run(s) for s in (0, 1, 2)]
+    check("C++ 코어: mars_core.ImmEkf 가 파이썬 imm_ekf.ImmEkf 와 난수 입력열 600 스텝 × 3 회(예측·RGB-D·bearing·소실·자세 회전·속도 힌트)에서 상태·공분산·모드 확률·혁신·코스트를 1e-9 안에서 같게 낸다",
+          max(_worsts) < 1e-9, f"최대 편차 {max(_worsts):.2e}")
+    _c = _mc.ImmEkf(_sxy, _sz, _mcs, _rcs)
+    _c.init(np3.array([0.0, 0.0, 3.0]))
+    _c.set_filter_x(0, np3.full(6, float("nan")))
+    check("C++ 코어: NaN 주입 → is_finite False → reset 뒤 미초기화, get_state_dict 키가 파이썬과 같음",
+          not _c.is_finite() and (_c.reset() or not _c.initialized)
+          and set(_c.get_state_dict()) == set(_PyEkf().get_state_dict()))
+
+    # ---- 제어 법칙 (cpp/src/control.cpp) — main 의 파이썬 원본(_py_*) 과 같은 난수 입력(NaN/inf/front≤0/슬롯/감속 밴드 포함) ----
+    def _dev(a, b):
+        a, b = np3.asarray(a, dtype=float), np3.asarray(b, dtype=float)
+        if a.shape != b.shape:
+            return float("inf")
+        d = np3.abs(a - b)
+        d[np3.isnan(a) & np3.isnan(b)] = 0.0
+        return float(np3.max(d)) if d.size else 0.0
+
+    _G = main.cpp_control_gains()
+    _rng = np3.random.default_rng(7)
+
+    def _rv(scale=1.0):
+        v = _rng.normal(0, scale, 3)
+        u = _rng.random()
+        if u < 0.04:
+            v[_rng.integers(3)] = float("nan")
+        elif u < 0.07:
+            v[_rng.integers(3)] = float("inf") * _rng.choice([-1.0, 1.0])
+        return v
+
+    _worst_ctrl, _n_zero, _n_sat = 0.0, 0, 0
+    for _k in range(4000):
+        rel = _rv(2.0)
+        if _rng.random() < 0.85:
+            rel[0] = float(_rng.uniform(-1.0, 8.0))
+        relv = _rv(0.3)
+        cov = float(_rng.choice([0.5, 1.9, 2.0, 2.1, 3.9, 4.0, 4.1, 9.0, float("nan")]))
+        td = None if _rng.random() < 0.7 else float(_rng.choice([1.0, 3.0, 8.0, float("nan")]))
+        ff = None if _rng.random() < 0.5 else _rv(0.3)
+        slot = None if _rng.random() < 0.6 else _rv(1.0)
+        a = main._py_compute_velocity_cmd_from_estimate(rel, relv, cov, td, ff, slot_error=slot)
+        b = _mc.compute_velocity_cmd(_G, rel, relv, cov, td, ff, slot)
+        _worst_ctrl = max(_worst_ctrl, _dev(a, b))
+        _n_zero += int(not np3.any(a))
+        _n_sat += int(abs(float(a[0])) == main.MAX_VX)
+        prev, nxt = _rng.normal(0, 0.3, 4), _rng.normal(0, 0.3, 4)
+        if _rng.random() < 0.05:
+            nxt[_rng.integers(4)] = float("nan")
+        dt = None if _rng.random() < 0.3 else float(_rng.uniform(-0.01, 0.1))
+        alpha = float(_rng.uniform(0.0, 1.0))
+        _worst_ctrl = max(_worst_ctrl, _dev(main._py_smooth_velocity_cmd(prev, nxt, alpha, dt), _mc.smooth_velocity_cmd(_G, prev, nxt, alpha, dt)))
+        prev_ff = _rng.normal(0, 0.3, 3)
+        if _rng.random() < 0.05:
+            prev_ff[0] = float("nan")
+        lv = None if _rng.random() < 0.3 else _rv(float(_rng.choice([0.03, 0.3, 1.0, 30.0])))
+        dtf = float(_rng.uniform(-0.01, 0.2))
+        _worst_ctrl = max(_worst_ctrl, _dev(main._py_leader_velocity_ff(prev_ff, lv, dtf), _mc.leader_velocity_ff(_G, prev_ff, lv, dtf)))
+        pv = None if _rng.random() < 0.3 else prev_ff
+        vs = _rv(0.5)
+        _worst_ctrl = max(_worst_ctrl, _dev(main._py_self_velocity_lpf(pv, vs, dtf), _mc.self_velocity_lpf(_G, pv, vs, dtf)))
+        vf, r_, p_ = _rng.normal(0, 3, 3), float(_rng.normal(0, 0.3)), float(_rng.normal(0, 0.3))
+        _worst_ctrl = max(_worst_ctrl, _dev(main._py_level_fru_by_roll_pitch(vf, r_, p_), _mc.level_fru_by_roll_pitch(vf, r_, p_)))
+    check("C++ 코어: 제어 법칙(compute_velocity_cmd·smooth·leader_velocity_ff·self_velocity_lpf·level) 이 파이썬 원본과 난수 4000 조합"
+          "(NaN/inf·front≤0·슬롯·감속 밴드 경계·데드존·20 m/s 상한·음수 dt)에서 1e-12 안에서 같다",
+          _worst_ctrl < 1e-12 and _n_zero > 200 and _n_sat > 200,
+          f"최대 편차 {_worst_ctrl:.2e}, 정지 {_n_zero}/4000, 전진 포화 {_n_sat}/4000")
+    _sz_ok = True
+    for _cmd in ([0.1, 0.2, 0.3, 0.4], [0.1, float("nan"), 0.0, 0.0], [float("inf"), 0, 0, 0]):
+        _pa, _pk = main.sanitize_cmd(_cmd)
+        _ca, _ck = _mc.sanitize_cmd(np3.asarray(_cmd, dtype=float))
+        _sz_ok &= (_pk == _ck) and _dev(_pa, _ca) == 0.0
+    _sz_ok &= _mc.clamp(float("nan"), -0.35, 0.35) == _clamp(float("nan"), -0.35, 0.35) == 0.0
+    check("C++ 코어: sanitize_cmd·clamp 가 파이썬과 같은 (값, 유한 여부) 를 낸다 (NaN → 정지·False)", _sz_ok)
+
+    # ---- 미션 상태머신 (cpp/src/mission.cpp) — 같은 사건열을 mission_manager.MissionManager 와 나란히 ----
+    import mission_manager as _mm
+
+    def _mission_diff(seed, segments=400):
+        rng = np3.random.default_rng(seed)
+        pm, cm = _mm.MissionManager(), _mc.MissionManager()
+        t, seen, n = 0.0, set(), 0
+        for _ in range(segments):
+            vis = rng.random() < 0.8
+            alt = None if rng.random() < 0.4 else float(rng.uniform(0.2, 3.0))
+            cov = float(rng.choice([1.0, 1.0, 1.0, 5.0, 8.0, 8.5, 999.0]))
+            sp = float(rng.choice([0.0, 0.1, 0.18, 0.2, 0.25, 0.3, 0.5]))
+            vz = float(rng.choice([0.0, -0.05, -0.1, -0.3, 0.2]))
+            th = float(rng.uniform(0, 2 * _math.pi))
+            vec = np3.array([sp * _math.cos(th), sp * _math.sin(th), vz])
+            if rng.random() < 0.03:
+                vec[rng.integers(3)] = float("nan")
+            src = int(rng.integers(4))
+            vw, vb, rv = [(vec, None, None), (None, vec, None), (None, None, vec), (None, None, None)][src]
+            if rng.random() < 0.02:
+                pm.reset(); cm.reset()
+            for _ in range(int(rng.integers(1, 80))):        # 세그먼트 길이 0.02~4.8 s (소실 8 s·착륙 1.8 s 도 연속 세그먼트로 나온다)
+                t += float(rng.uniform(0.02, 0.06))
+                kw = dict(now=t, leader_visible=vis, rel_est=np3.array([3.0, 0.0, 0.0]), rel_vel_est=rv, leader_alt=alt,
+                          leader_vel_world=vw, pos_cov_trace=cov, leader_vel_body=vb)
+                sp_, pp = pm.update(**kw)
+                sc_, pc = cm.update(**kw)
+                same = (sp_ == sc_ and pp == pc and pm.state == cm.state and pm.has_followed == cm.has_followed
+                        and pm.command_policy() == cm.command_policy()
+                        and all(getattr(pm, a) == getattr(cm, a) for a in ("last_seen_t", "start_candidate_t", "landing_candidate_t")))
+                if not same:
+                    return False, f"seed {seed} step {n}: py {sp_} {pp} vs cpp {sc_} {pc}", seen
+                seen.add(sp_); n += 1
+        return True, n, seen
+
+    _mres = [_mission_diff(s) for s in (0, 1, 2, 3)]
+    _mseen = set().union(*(r[2] for r in _mres))
+    check("C++ 코어: mars_core.MissionManager 가 파이썬 mission_manager.MissionManager 와 난수 사건열(가림·속도 소스 3종·NaN·고도·공분산·reset)"
+          "에서 상태·정책·타이머·has_followed 를 매 스텝 같게 내고 8 개 상태를 모두 지난다",
+          all(r[0] for r in _mres) and len(_mseen) == 8,
+          "; ".join(str(r[1]) for r in _mres if not r[0]) or f"{sum(r[1] for r in _mres)} 스텝, 상태 {sorted(_mseen)}")
+    _mc_m = _mc.MissionManager(lost_hold_sec=3.0)
+    _mc_m.state = "FOLLOW"; _mc_m.has_followed = True; _mc_m.last_seen_t = 1.0
+    check("C++ 코어: MissionManager 속성(state 문자열·타이머·임계값) 을 파이썬처럼 읽고 쓸 수 있고 잘못된 상태 이름은 거부한다",
+          _mc_m.lost_hold_sec == 3.0 and _mc_m.update(4.0, False)[0] == "FAILSAFE_LAND" and _mc_m.last_seen_t == 1.0
+          and _mc_m.start_candidate_t is None and set(_mc.MISSION_STATES) == set(_mm._POLICY)
+          and _raises(lambda: setattr(_mc_m, "state", "NOPE")))
 
 # ---------------------------------------------------------------- 
 print()

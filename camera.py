@@ -12,6 +12,8 @@ rs.align 은 매 프레임 640x480 전체를 재투영한다. pip 휠의 libreal
 Jetson 에서 프레임당 수 ms 를 쓴다 — BUILD_WITH_CUDA=ON 으로 직접 빌드하면 GPU 로 간다.
 """
 
+import time
+
 import numpy as np
 
 from config import CONFIG
@@ -154,6 +156,7 @@ class D435i:
             if dx < AE_ROI_MOVE_FRAC * self.width and dy < AE_ROI_MOVE_FRAC * self.height:
                 return False
         self._ae_roi_last_t = now
+        t0 = time.perf_counter()
         try:
             r = rs.region_of_interest()
             r.min_x, r.min_y, r.max_x, r.max_y = roi
@@ -161,6 +164,11 @@ class D435i:
         except Exception as exc:
             print(f"[CAM] AE ROI {roi} 설정 실패: {type(exc).__name__}: {exc}")
             return False
+        # hwmon USB 왕복이라 느릴 수 있다 (librealsense #7130: ~140 ms 보고). 제어 루프 안에서 5 ms 를 넘으면 알린다 —
+        # 그러면 config camera.ae_roi_follow_track 을 끄거나 워커 스레드로 옮길 것.
+        cost_ms = (time.perf_counter() - t0) * 1e3
+        if cost_ms > 5.0:
+            print(f"[CAM] AE ROI 설정 {cost_ms:.0f} ms — 제어 루프 스톨. ae_roi_follow_track 끄기를 권장")
         self._ae_roi_last = roi
         return True
 

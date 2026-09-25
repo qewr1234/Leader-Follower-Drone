@@ -81,6 +81,7 @@ class LeaderTracker:
             iou = iou_xyxy(prev_bbox, det["bbox"])
             if iou < self.iou_threshold and not (
                 lost_count > 0 and self._near_enough(prev_bbox, det["bbox"], lost_count)
+                and self._size_similar(prev_bbox, det["bbox"])
             ):
                 continue
             score = 0.75 * iou + 0.25 * det["conf"]
@@ -103,6 +104,16 @@ class LeaderTracker:
         grow = min(float(lost_count), float(self.recover_gate_frames))
         max_move = diag * (0.75 + 0.75 * grow)
         return math.hypot(dx - px, dy - py) <= max_move
+
+    @staticmethod
+    def _size_similar(prev_bbox, det_bbox, ratio=1.3):
+        """회복 중 크기(대각선) 가 1/ratio ~ ratio 안인 검출만 받는다. 한 프레임 놓친 사이 다른 거리의 사람(1.5 배 대각선 반경은
+        3 m 의 사람에게 화면 전체)이 트랙을 가져가는 것을 막는다. 정상 기동의 크기 변화는 한 프레임에 수 % 다."""
+        d0 = math.hypot(prev_bbox[2] - prev_bbox[0], prev_bbox[3] - prev_bbox[1])
+        d1 = math.hypot(det_bbox[2] - det_bbox[0], det_bbox[3] - det_bbox[1])
+        if d0 <= 0 or d1 <= 0:
+            return False
+        return 1.0 / ratio <= d1 / d0 <= ratio
 
     def _choose_initial(self, detections):
         return max(detections, key=lambda d: d.get("area", 0) * max(d.get("conf", 0.0), 0.01))
