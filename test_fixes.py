@@ -16,6 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 failures = []
 
 
+def _raises(fn):
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
+
+
 def check(name, ok, detail=""):
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  — {detail}" if detail else ""))
     if not ok:
@@ -1517,6 +1525,119 @@ else:
     check("C++ 코어: NaN 주입 → is_finite False → reset 뒤 미초기화, get_state_dict 키가 파이썬과 같음",
           not _c.is_finite() and (_c.reset() or not _c.initialized)
           and set(_c.get_state_dict()) == set(_PyEkf().get_state_dict()))
+
+    # ---- 제어 법칙 (cpp/src/control.cpp) — main 의 파이썬 원본(_py_*) 과 같은 난수 입력(NaN/inf/front≤0/슬롯/감속 밴드 포함) ----
+    def _dev(a, b):
+        a, b = np3.asarray(a, dtype=float), np3.asarray(b, dtype=float)
+        if a.shape != b.shape:
+            return float("inf")
+        d = np3.abs(a - b)
+        d[np3.isnan(a) & np3.isnan(b)] = 0.0
+        return float(np3.max(d)) if d.size else 0.0
+
+    _G = main.cpp_control_gains()
+    _rng = np3.random.default_rng(7)
+
+    def _rv(scale=1.0):
+        v = _rng.normal(0, scale, 3)
+        u = _rng.random()
+        if u < 0.04:
+            v[_rng.integers(3)] = float("nan")
+        elif u < 0.07:
+            v[_rng.integers(3)] = float("inf") * _rng.choice([-1.0, 1.0])
+        return v
+
+    _worst_ctrl, _n_zero, _n_sat = 0.0, 0, 0
+    for _k in range(4000):
+        rel = _rv(2.0)
+        if _rng.random() < 0.85:
+            rel[0] = float(_rng.uniform(-1.0, 8.0))
+        relv = _rv(0.3)
+        cov = float(_rng.choice([0.5, 1.9, 2.0, 2.1, 3.9, 4.0, 4.1, 9.0, float("nan")]))
+        td = None if _rng.random() < 0.7 else float(_rng.choice([1.0, 3.0, 8.0, float("nan")]))
+        ff = None if _rng.random() < 0.5 else _rv(0.3)
+        slot = None if _rng.random() < 0.6 else _rv(1.0)
+        a = main._py_compute_velocity_cmd_from_estimate(rel, relv, cov, td, ff, slot_error=slot)
+        b = _mc.compute_velocity_cmd(_G, rel, relv, cov, td, ff, slot)
+        _worst_ctrl = max(_worst_ctrl, _dev(a, b))
+        _n_zero += int(not np3.any(a))
+        _n_sat += int(abs(float(a[0])) == main.MAX_VX)
+        prev, nxt = _rng.normal(0, 0.3, 4), _rng.normal(0, 0.3, 4)
+        if _rng.random() < 0.05:
+            nxt[_rng.integers(4)] = float("nan")
+        dt = None if _rng.random() < 0.3 else float(_rng.uniform(-0.01, 0.1))
+        alpha = float(_rng.uniform(0.0, 1.0))
+        _worst_ctrl = max(_worst_ctrl, _dev(main._py_smooth_velocity_cmd(prev, nxt, alpha, dt), _mc.smooth_velocity_cmd(_G, prev, nxt, alpha, dt)))
+        prev_ff = _rng.normal(0, 0.3, 3)
+        if _rng.random() < 0.05:
+            prev_ff[0] = float("nan")
+        lv = None if _rng.random() < 0.3 else _rv(float(_rng.choice([0.03, 0.3, 1.0, 30.0])))
+        dtf = float(_rng.uniform(-0.01, 0.2))
+        _worst_ctrl = max(_worst_ctrl, _dev(main._py_leader_velocity_ff(prev_ff, lv, dtf), _mc.leader_velocity_ff(_G, prev_ff, lv, dtf)))
+        pv = None if _rng.random() < 0.3 else prev_ff
+        vs = _rv(0.5)
+        _worst_ctrl = max(_worst_ctrl, _dev(main._py_self_velocity_lpf(pv, vs, dtf), _mc.self_velocity_lpf(_G, pv, vs, dtf)))
+        vf, r_, p_ = _rng.normal(0, 3, 3), float(_rng.normal(0, 0.3)), float(_rng.normal(0, 0.3))
+        _worst_ctrl = max(_worst_ctrl, _dev(main._py_level_fru_by_roll_pitch(vf, r_, p_), _mc.level_fru_by_roll_pitch(vf, r_, p_)))
+    check("C++ 코어: 제어 법칙(compute_velocity_cmd·smooth·leader_velocity_ff·self_velocity_lpf·level) 이 파이썬 원본과 난수 4000 조합"
+          "(NaN/inf·front≤0·슬롯·감속 밴드 경계·데드존·20 m/s 상한·음수 dt)에서 1e-12 안에서 같다",
+          _worst_ctrl < 1e-12 and _n_zero > 200 and _n_sat > 200,
+          f"최대 편차 {_worst_ctrl:.2e}, 정지 {_n_zero}/4000, 전진 포화 {_n_sat}/4000")
+    _sz_ok = True
+    for _cmd in ([0.1, 0.2, 0.3, 0.4], [0.1, float("nan"), 0.0, 0.0], [float("inf"), 0, 0, 0]):
+        _pa, _pk = main.sanitize_cmd(_cmd)
+        _ca, _ck = _mc.sanitize_cmd(np3.asarray(_cmd, dtype=float))
+        _sz_ok &= (_pk == _ck) and _dev(_pa, _ca) == 0.0
+    _sz_ok &= _mc.clamp(float("nan"), -0.35, 0.35) == _clamp(float("nan"), -0.35, 0.35) == 0.0
+    check("C++ 코어: sanitize_cmd·clamp 가 파이썬과 같은 (값, 유한 여부) 를 낸다 (NaN → 정지·False)", _sz_ok)
+
+    # ---- 미션 상태머신 (cpp/src/mission.cpp) — 같은 사건열을 mission_manager.MissionManager 와 나란히 ----
+    import mission_manager as _mm
+
+    def _mission_diff(seed, segments=400):
+        rng = np3.random.default_rng(seed)
+        pm, cm = _mm.MissionManager(), _mc.MissionManager()
+        t, seen, n = 0.0, set(), 0
+        for _ in range(segments):
+            vis = rng.random() < 0.8
+            alt = None if rng.random() < 0.4 else float(rng.uniform(0.2, 3.0))
+            cov = float(rng.choice([1.0, 1.0, 1.0, 5.0, 8.0, 8.5, 999.0]))
+            sp = float(rng.choice([0.0, 0.1, 0.18, 0.2, 0.25, 0.3, 0.5]))
+            vz = float(rng.choice([0.0, -0.05, -0.1, -0.3, 0.2]))
+            th = float(rng.uniform(0, 2 * _math.pi))
+            vec = np3.array([sp * _math.cos(th), sp * _math.sin(th), vz])
+            if rng.random() < 0.03:
+                vec[rng.integers(3)] = float("nan")
+            src = int(rng.integers(4))
+            vw, vb, rv = [(vec, None, None), (None, vec, None), (None, None, vec), (None, None, None)][src]
+            if rng.random() < 0.02:
+                pm.reset(); cm.reset()
+            for _ in range(int(rng.integers(1, 80))):        # 세그먼트 길이 0.02~4.8 s (소실 8 s·착륙 1.8 s 도 연속 세그먼트로 나온다)
+                t += float(rng.uniform(0.02, 0.06))
+                kw = dict(now=t, leader_visible=vis, rel_est=np3.array([3.0, 0.0, 0.0]), rel_vel_est=rv, leader_alt=alt,
+                          leader_vel_world=vw, pos_cov_trace=cov, leader_vel_body=vb)
+                sp_, pp = pm.update(**kw)
+                sc_, pc = cm.update(**kw)
+                same = (sp_ == sc_ and pp == pc and pm.state == cm.state and pm.has_followed == cm.has_followed
+                        and pm.command_policy() == cm.command_policy()
+                        and all(getattr(pm, a) == getattr(cm, a) for a in ("last_seen_t", "start_candidate_t", "landing_candidate_t")))
+                if not same:
+                    return False, f"seed {seed} step {n}: py {sp_} {pp} vs cpp {sc_} {pc}", seen
+                seen.add(sp_); n += 1
+        return True, n, seen
+
+    _mres = [_mission_diff(s) for s in (0, 1, 2, 3)]
+    _mseen = set().union(*(r[2] for r in _mres))
+    check("C++ 코어: mars_core.MissionManager 가 파이썬 mission_manager.MissionManager 와 난수 사건열(가림·속도 소스 3종·NaN·고도·공분산·reset)"
+          "에서 상태·정책·타이머·has_followed 를 매 스텝 같게 내고 8 개 상태를 모두 지난다",
+          all(r[0] for r in _mres) and len(_mseen) == 8,
+          "; ".join(str(r[1]) for r in _mres if not r[0]) or f"{sum(r[1] for r in _mres)} 스텝, 상태 {sorted(_mseen)}")
+    _mc_m = _mc.MissionManager(lost_hold_sec=3.0)
+    _mc_m.state = "FOLLOW"; _mc_m.has_followed = True; _mc_m.last_seen_t = 1.0
+    check("C++ 코어: MissionManager 속성(state 문자열·타이머·임계값) 을 파이썬처럼 읽고 쓸 수 있고 잘못된 상태 이름은 거부한다",
+          _mc_m.lost_hold_sec == 3.0 and _mc_m.update(4.0, False)[0] == "FAILSAFE_LAND" and _mc_m.last_seen_t == 1.0
+          and _mc_m.start_candidate_t is None and set(_mc.MISSION_STATES) == set(_mm._POLICY)
+          and _raises(lambda: setattr(_mc_m, "state", "NOPE")))
 
 # ---------------------------------------------------------------- 
 print()

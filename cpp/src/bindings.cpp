@@ -4,7 +4,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "mars_core/control.hpp"
 #include "mars_core/imm_ekf.hpp"
+#include "mars_core/mission.hpp"
 
 namespace py = pybind11;
 using namespace mars;
@@ -48,6 +50,31 @@ py::array_t<double> from_mat(const Mat<R, C>& m) {
     for (std::size_t i = 0; i < R; ++i)
         for (std::size_t j = 0; j < C; ++j) w(i, j) = m(i, j);
     return a;
+}
+
+using NpArr = py::array_t<double, py::array::c_style | py::array::forcecast>;
+
+// None → nullopt, 아니면 앞 N 성분 (파이썬 쪽 np.asarray(x)[:N] 과 같은 관대함)
+template <std::size_t N>
+std::optional<Vec<N>> opt_vec(const py::object& o) {
+    if (o.is_none()) return std::nullopt;
+    return to_vec<N>(o.cast<NpArr>());
+}
+
+std::optional<double> opt_double(const py::object& o) {
+    if (o.is_none()) return std::nullopt;
+    return o.cast<double>();
+}
+
+py::object from_opt_double(const std::optional<double>& v) {
+    if (!v) return py::none();
+    return py::float_(*v);
+}
+
+py::dict policy_dict(const MissionPolicy& p) {
+    py::dict d;
+    d["mode"] = p.mode; d["allow_follow"] = p.allow_follow; d["land"] = p.land;
+    return d;
 }
 
 py::array_t<double> mu_array(const ImmEkf& e) {
@@ -132,5 +159,89 @@ PYBIND11_MODULE(mars_core, m) {
         .def_readwrite("range_coast_time", &ImmEkf::range_coast_time)
         .def_readwrite("vision_range_coast_time", &ImmEkf::vision_range_coast_time);
 
-    m.attr("__version__") = "0.1.0";
+    // ---------------- 제어 법칙 (main.py 의 함수들; 이득은 ControlGains 로 매 호출 전달) ----------------
+    py::class_<ControlGains>(m, "ControlGains")
+        .def(py::init<>())
+        .def_readwrite("kp_forward", &ControlGains::kp_forward).def_readwrite("kd_forward", &ControlGains::kd_forward)
+        .def_readwrite("kp_right", &ControlGains::kp_right).def_readwrite("kd_right", &ControlGains::kd_right)
+        .def_readwrite("kp_up", &ControlGains::kp_up).def_readwrite("kd_up", &ControlGains::kd_up)
+        .def_readwrite("kff", &ControlGains::kff).def_readwrite("kp_yaw", &ControlGains::kp_yaw)
+        .def_readwrite("max_vx", &ControlGains::max_vx).def_readwrite("max_vy", &ControlGains::max_vy)
+        .def_readwrite("max_vz", &ControlGains::max_vz).def_readwrite("max_yaw_rate", &ControlGains::max_yaw_rate)
+        .def_readwrite("target_distance", &ControlGains::target_distance).def_readwrite("slowdown_trace", &ControlGains::slowdown_trace)
+        .def_readwrite("ff_tau", &ControlGains::ff_tau).def_readwrite("ff_self_tau", &ControlGains::ff_self_tau)
+        .def_readwrite("ff_deadband", &ControlGains::ff_deadband).def_readwrite("ff_speed_max", &ControlGains::ff_speed_max)
+        .def_readwrite("smooth_ref_dt", &ControlGains::smooth_ref_dt);
+    m.def("clamp", &mars::clamp, py::arg("x"), py::arg("lo"), py::arg("hi"));
+    m.def("compute_velocity_cmd", [](const ControlGains& g, NpArr rel, NpArr relv, double pos_cov_trace, py::object target_distance,
+                                     py::object leader_vel_ff, py::object slot_error) {
+              const double td = target_distance.is_none() ? g.target_distance : target_distance.cast<double>();
+              return from_vec(compute_velocity_cmd(g, to_vec<3>(rel), to_vec<3>(relv), pos_cov_trace, td, opt_vec<3>(leader_vel_ff), opt_vec<3>(slot_error)));
+          }, py::arg("gains"), py::arg("rel_fru"), py::arg("rel_vel_fru"), py::arg("pos_cov_trace"), py::arg("target_distance") = py::none(),
+          py::arg("leader_vel_ff") = py::none(), py::arg("slot_error") = py::none());
+    m.def("smooth_velocity_cmd", [](const ControlGains& g, NpArr prev, NpArr next, double alpha, py::object dt) {
+              return from_vec(smooth_velocity_cmd(g, to_vec<4>(prev), to_vec<4>(next), alpha, opt_double(dt)));
+          }, py::arg("gains"), py::arg("prev_cmd"), py::arg("new_cmd"), py::arg("alpha") = 0.28, py::arg("dt") = py::none());
+    m.def("leader_velocity_ff", [](const ControlGains& g, NpArr prev_ff, py::object leader_vel_fru, double dt) {
+              return from_vec(leader_velocity_ff(g, to_vec<3>(prev_ff), opt_vec<3>(leader_vel_fru), dt));
+          }, py::arg("gains"), py::arg("prev_ff"), py::arg("leader_vel_fru"), py::arg("dt"));
+    m.def("self_velocity_lpf", [](const ControlGains& g, py::object prev, NpArr v, double dt) {
+              return from_vec(self_velocity_lpf(g, opt_vec<3>(prev), to_vec<3>(v), dt));
+          }, py::arg("gains"), py::arg("prev"), py::arg("v_self_fru"), py::arg("dt"));
+    m.def("rot_body_to_ned", [](double roll, double pitch, double yaw) { return from_mat(rot_body_to_ned(roll, pitch, yaw)); },
+          py::arg("roll"), py::arg("pitch"), py::arg("yaw"));
+    m.def("level_fru_by_roll_pitch", [](NpArr v, double roll, double pitch) { return from_vec(level_fru_by_roll_pitch(to_vec<3>(v), roll, pitch)); },
+          py::arg("v_fru"), py::arg("roll"), py::arg("pitch"));
+    m.def("sanitize_cmd", [](NpArr cmd) {
+              Vec<4> out; bool ok = false;
+              if (cmd.ndim() == 1 && cmd.shape(0) == 4) ok = sanitize_cmd(to_vec<4>(cmd), out);
+              return py::make_tuple(from_vec(out), ok);
+          }, py::arg("cmd"));
+
+    // ---------------- 미션 상태머신 (mission_manager.MissionManager 와 같은 이름·인자·반환) ----------------
+    py::class_<MissionManager>(m, "MissionManager")
+        .def(py::init([](double start_speed_thresh, double start_confirm_sec, double hover_speed_thresh, double landing_z_thresh,
+                         double landing_vz_thresh, double landing_hspeed_thresh, double landing_confirm_sec, double lost_hold_sec) {
+                 MissionParams p;
+                 p.start_speed_thresh = start_speed_thresh; p.start_confirm_sec = start_confirm_sec; p.hover_speed_thresh = hover_speed_thresh;
+                 p.landing_z_thresh = landing_z_thresh; p.landing_vz_thresh = landing_vz_thresh; p.landing_hspeed_thresh = landing_hspeed_thresh;
+                 p.landing_confirm_sec = landing_confirm_sec; p.lost_hold_sec = lost_hold_sec;
+                 return MissionManager(p);
+             }),
+             py::arg("start_speed_thresh") = 0.25, py::arg("start_confirm_sec") = 0.7, py::arg("hover_speed_thresh") = 0.18,
+             py::arg("landing_z_thresh") = 0.65, py::arg("landing_vz_thresh") = -0.10, py::arg("landing_hspeed_thresh") = 0.25,
+             py::arg("landing_confirm_sec") = 1.8, py::arg("lost_hold_sec") = 8.0)
+        .def("reset", &MissionManager::reset)
+        .def("update", [](MissionManager& mm, double now, bool leader_visible, py::object rel_est, py::object rel_vel_est, py::object leader_alt,
+                          py::object leader_vel_world, double pos_cov_trace, py::object leader_vel_body) {
+                 const MissionState s = mm.update(now, leader_visible, opt_vec<3>(rel_est), opt_vec<3>(rel_vel_est), opt_double(leader_alt),
+                                                  opt_vec<3>(leader_vel_world), pos_cov_trace, opt_vec<3>(leader_vel_body));
+                 return py::make_tuple(py::str(mission_state_name(s)), policy_dict(mm.command_policy()));
+             },
+             py::arg("now"), py::arg("leader_visible"), py::arg("rel_est") = py::none(), py::arg("rel_vel_est") = py::none(),
+             py::arg("leader_alt") = py::none(), py::arg("leader_vel_world") = py::none(), py::arg("pos_cov_trace") = 999.0,
+             py::arg("leader_vel_body") = py::none())
+        .def("command_policy", [](const MissionManager& mm) { return policy_dict(mm.command_policy()); })
+        .def_property("state", [](const MissionManager& mm) { return std::string(mission_state_name(mm.state)); },
+                      [](MissionManager& mm, const std::string& name) {
+                          const auto s = mission_state_from_name(name);
+                          if (!s) throw std::invalid_argument("unknown mission state: " + name);
+                          mm.state = *s;
+                      })
+        .def_property("last_seen_t", [](const MissionManager& mm) { return from_opt_double(mm.last_seen_t); },
+                      [](MissionManager& mm, py::object v) { mm.last_seen_t = opt_double(v); })
+        .def_property("start_candidate_t", [](const MissionManager& mm) { return from_opt_double(mm.start_candidate_t); },
+                      [](MissionManager& mm, py::object v) { mm.start_candidate_t = opt_double(v); })
+        .def_property("landing_candidate_t", [](const MissionManager& mm) { return from_opt_double(mm.landing_candidate_t); },
+                      [](MissionManager& mm, py::object v) { mm.landing_candidate_t = opt_double(v); })
+        .def_readwrite("has_followed", &MissionManager::has_followed)
+#define MARS_PARAM(name) .def_property(#name, [](const MissionManager& mm) { return mm.params().name; }, [](MissionManager& mm, double v) { mm.params_mut().name = v; })
+        MARS_PARAM(start_speed_thresh) MARS_PARAM(start_confirm_sec) MARS_PARAM(hover_speed_thresh) MARS_PARAM(landing_z_thresh)
+        MARS_PARAM(landing_vz_thresh) MARS_PARAM(landing_hspeed_thresh) MARS_PARAM(landing_confirm_sec) MARS_PARAM(lost_hold_sec)
+#undef MARS_PARAM
+        ;
+    m.attr("MISSION_STATES") = py::make_tuple("WAIT_LEADER", "READY_HOVER", "FOLLOW", "LEADER_HOVER", "LANDING_CANDIDATE",
+                                              "CONFIRMED_LANDING", "LOST_HOLD", "FAILSAFE_LAND");
+
+    m.attr("__version__") = "0.2.0";
 }

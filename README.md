@@ -315,7 +315,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 - [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 86개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
 - [docs/FLIGHT_SAFETY_CHECKLIST.md](docs/FLIGHT_SAFETY_CHECKLIST.md) — 실비행 안전 점검서: ArduCopter 소스로 확인한 FC 동작, FC 파라미터, 지상 점검 12항목, 단계별 비행 계획, 남은 위험
 - [docs/EXPERIMENT_PROTOCOL.md](docs/EXPERIMENT_PROTOCOL.md) — 논문(AST)용 비행 캠페인: UWB 거리 GT 장비·교정, 실험 카드 E1~E7, 분석 도구(`analysis/id_flight.py`·`identify_plant.py`·`sine_gain.py`·`nees_nis.py`), go/no-go 기준
-- [cpp/README.md](cpp/README.md) — C++ 코어 `mars_core`(IMM-EKF 이식, 의존성 0). `./cpp/build.sh` 로 빌드·gtest·파이썬 오라클 차등 검증, `MARS_CORE=cpp python3 main.py` 로 사용. 기본은 파이썬
+- [cpp/README.md](cpp/README.md) — C++ 코어 `mars_core`(IMM-EKF·제어 법칙·미션 상태머신 이식, 의존성 0). `./cpp/build.sh` 로 빌드·gtest·파이썬 오라클 차등 검증, `MARS_CORE=cpp python3 main.py` 로 사용. 기본은 파이썬
 - [docs/RELATED_WORK_EXPERIMENTS.md](docs/RELATED_WORK_EXPERIMENTS.md) — 관련 논문 5편의 실험 절 정리(플랫폼·GT·시행·수치, 증거 수준 표시), 실험 절의 공통 구조, 우리 프로토콜에 반영할 것, 전문 확인 목록
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
 - [docs/images/README.md](docs/images/README.md) — README 그림 파일과 수정 방법

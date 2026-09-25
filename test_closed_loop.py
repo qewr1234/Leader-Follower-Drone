@@ -398,7 +398,7 @@ camera.D435i = FakeCam
 detector.YoloDetector = FakeDetector
 detector.load_model = lambda *a, **k: None
 
-import main, mavlink_io, mission_manager  # noqa: E402,E401
+import main, mavlink_io  # noqa: E402,E401
 
 main.time = CLOCK
 mavlink_io.time = CLOCK
@@ -456,7 +456,7 @@ if ARGS.scenario == "nan":
 STATES = []          # (frame, sim_t, state)
 
 
-class RecordingMission(mission_manager.MissionManager):
+class RecordingMission(main.MissionManager):   # --core cpp 면 mars_core.MissionManager 를 감싼다
     def update(self, *a, **k):
         st, pol = super().update(*a, **k)
         if not STATES or STATES[-1][2] != st:

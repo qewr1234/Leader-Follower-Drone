@@ -42,7 +42,11 @@ from leader_telemetry import (LeaderTelemetryReceiver, apply_leader_velocity_hin
 from logger import ExperimentLogger
 from mavlink_io import battery_text, connect_fc, drain_messages, get_vehicle_state, stream_rates_text
 from measurement import MeasurementBuilder
-from mission_manager import MissionManager
+from mission_manager import MissionManager as _PyMissionManager
+if MARS_CORE == "cpp":
+    MissionManager = _mars_core.MissionManager   # 생성 인자·update()·command_policy()·속성이 파이썬 클래스와 같다 (cpp/README.md)
+else:
+    MissionManager = _PyMissionManager
 from reliability import ReliabilityEstimator
 from scheduler import PerceptionScheduler
 from tracker import LeaderTracker
@@ -418,6 +422,57 @@ def smooth_velocity_cmd(prev_cmd, new_cmd, alpha=0.28, dt=None):
     for i in range(4):
         out[i] = clamp(out[i], -lim[i], lim[i])
     return out
+
+
+# ------------------------------------------------------------
+# MARS_CORE=cpp: 위 다섯 함수를 C++(mars_core, cpp/src/control.cpp) 로 바꿔 끼운다. 파이썬 정의는 _py_* 로 남겨
+# test_fixes.py 의 차등 검사가 둘을 나란히 돌린다. 이득·한계는 호출 시점의 모듈 상수를 ControlGains 에 실어 보낸다
+# (분석 스크립트가 main.KP_FORWARD 등을 바꿔 가며 스윕해도 그대로 통한다).
+# ------------------------------------------------------------
+_py_compute_velocity_cmd_from_estimate = compute_velocity_cmd_from_estimate
+_py_smooth_velocity_cmd = smooth_velocity_cmd
+_py_leader_velocity_ff = leader_velocity_ff
+_py_self_velocity_lpf = self_velocity_lpf
+_py_level_fru_by_roll_pitch = level_fru_by_roll_pitch
+
+
+def cpp_control_gains():
+    """지금의 모듈 상수로 mars_core.ControlGains 를 만든다. MARS_CORE=py 에서도 test_fixes.py 의 차등 검사가 부른다."""
+    import mars_core as _mc   # 이미 import 됐으면 사전 조회 한 번
+    g = _mc.ControlGains()
+    g.kp_forward, g.kd_forward = KP_FORWARD, KD_FORWARD
+    g.kp_right, g.kd_right = KP_RIGHT, KD_RIGHT
+    g.kp_up, g.kd_up = KP_UP, KD_UP
+    g.kff, g.kp_yaw = KFF_LEADER_VEL, KP_YAW
+    g.max_vx, g.max_vy, g.max_vz, g.max_yaw_rate = MAX_VX, MAX_VY, MAX_VZ, MAX_YAW_RATE
+    g.target_distance, g.slowdown_trace = TARGET_DISTANCE_M, UNCERTAINTY_SLOWDOWN_TRACE
+    g.ff_tau, g.ff_self_tau, g.ff_deadband, g.ff_speed_max = FF_TAU_SEC, FF_SELF_TAU_SEC, FF_DEADBAND_MPS, 20.0
+    g.smooth_ref_dt = SMOOTH_REF_DT
+    return g
+
+
+if MARS_CORE == "cpp":
+    def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance=None, leader_vel_ff=None,
+                                           slot_error=None):
+        return _mars_core.compute_velocity_cmd(cpp_control_gains(), np.asarray(rel_fru, dtype=float), np.asarray(rel_vel_fru, dtype=float),
+                                               float(pos_cov_trace), None if target_distance is None else float(target_distance),
+                                               None if leader_vel_ff is None else np.asarray(leader_vel_ff, dtype=float),
+                                               None if slot_error is None else np.asarray(slot_error, dtype=float))
+
+    def smooth_velocity_cmd(prev_cmd, new_cmd, alpha=0.28, dt=None):
+        return _mars_core.smooth_velocity_cmd(cpp_control_gains(), np.asarray(prev_cmd, dtype=float), np.asarray(new_cmd, dtype=float),
+                                              float(alpha), None if dt is None else float(dt))
+
+    def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
+        return _mars_core.leader_velocity_ff(cpp_control_gains(), np.asarray(prev_ff, dtype=float),
+                                             None if leader_vel_fru is None else np.asarray(leader_vel_fru, dtype=float), float(dt))
+
+    def self_velocity_lpf(prev, v_self_fru, dt):
+        return _mars_core.self_velocity_lpf(cpp_control_gains(), None if prev is None else np.asarray(prev, dtype=float),
+                                            np.asarray(v_self_fru, dtype=float), float(dt))
+
+    def level_fru_by_roll_pitch(v_fru, roll, pitch):
+        return _mars_core.level_fru_by_roll_pitch(np.asarray(v_fru, dtype=float), float(roll), float(pitch))
 
 
 # ============================================================
