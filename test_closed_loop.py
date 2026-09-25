@@ -50,7 +50,11 @@ _P.add_argument("--scenario", default="default", choices=["default", "tilt", "na
 _P.add_argument("--level", type=int, default=None, help="controller.level_by_attitude 강제 (0/1). 없으면 config 값")
 _P.add_argument("--autonomous-land", type=int, default=None, help="mission.autonomous_land 강제 (0/1). 없으면 config 값(False)")
 _P.add_argument("--log-dir", default=None, help="이 디렉터리에 main 의 JSONL 로그를 남긴다 (분석 스크립트 검증용). 가짜 UWB 거리 GT 도 켠다")
+_P.add_argument("--core", default=None, choices=["py", "cpp"], help="추정 코어 (환경변수 MARS_CORE 와 같음). cpp 는 cpp/build.sh 로 만든 mars_core")
 ARGS = _P.parse_args()
+if ARGS.core:
+    import os as _os
+    _os.environ["MARS_CORE"] = ARGS.core
 
 import numpy as np  # noqa: E402
 
@@ -440,8 +444,12 @@ if ARGS.scenario == "nan":
             super().predict(dt)
             if not _nan_fired and CLOCK.sim >= 6.0 and self.initialized:
                 _nan_fired.append(CLOCK.sim)
-                for f in self.filters:
-                    f.x[:] = float("nan")
+                if hasattr(self, "set_filter_x"):          # C++ 코어
+                    for i in range(2):
+                        self.set_filter_x(i, np.full(6, float("nan")))
+                else:
+                    for f in self.filters:
+                        f.x[:] = float("nan")
                 self.mark_dirty()
     main.ImmEkf = _NanEkf
 

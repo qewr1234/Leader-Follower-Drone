@@ -657,6 +657,13 @@ def apply_leader_velocity_hint_to_imm(ekf, rel_vel_cam, alpha=0.12, shrink_vel_c
     if float(np.linalg.norm(rel_vel_cam[:3])) > LEADER_SPEED_MAX_MPS:
         return False
 
+    hint = getattr(ekf, "apply_velocity_hint", None)
+    if callable(hint):          # C++ 코어(mars_core.ImmEkf): 필터 내부를 밖에서 만지지 않고 메서드로
+        try:
+            return bool(hint(rel_vel_cam[:3], float(alpha), float(shrink_vel_cov)))
+        except Exception:
+            return False
+
     try:
         for f in ekf.filters:
             f.x[3:6] = (1.0 - alpha) * f.x[3:6] + alpha * rel_vel_cam[:3]

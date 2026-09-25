@@ -133,6 +133,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | OPS-06 | 정현파 시험 로그에서 리더→팔로워 속도 이득 \|Γ(jω)\| 과 위상을 페이저 최소제곱으로 뽑고(리더 출처 esp32/uwb, ekf 는 추정기 FRF 로 치우쳐 참고용) 선형 모델 예측과 비교한다 | analysis/sine_gain.py | T | UT[논문 도구: 자체검사]; CL[정현파(sine) 로그 → analysis/sine_gain.py] | 검증됨 (폐루프 실제 코드 ↔ 선형 모델 ↔ 도구: 0.699 vs 0.669, 위상 −132 vs −131°) |
 | OPS-07 | IMM-EKF 일관성: NIS(RGB-D 3차원·bearing 2차원·ESP32 3차원) 의 평균과 χ² 95 % 구간, UWB 거리 GT 로 1차원 NEES·잔차 바이어스/σ 를 계산한다 (scipy 없이 정확한 χ² 분위수) | analysis/nees_nis.py | T | UT[논문 도구: chi2_ppf]; UT[논문 도구: 자체검사]; CL[정현파(sine) 로그 → analysis/nees_nis.py] | 검증됨 (합성; 실기 NEES 는 UWB 정적 교정 뒤) |
 | OPS-08 | 폐루프 하네스는 `--log-dir` 로 main 의 실제 JSONL 로그와 가짜 UWB GT 를 남기고 `--scenario sine` 에서 위 세 도구를 그 로그에 돌려 3자 일치를 회귀로 검사한다 | test_closed_loop.py | T | CL[정현파(sine):] | 검증됨 |
+| OPS-09 | C++ 코어(`cpp/`, pybind11 모듈 `mars_core`)의 `ImmEkf` 는 파이썬 `imm_ekf.ImmEkf` 와 같은 API 이고, (1) gtest 불변식, (2) 난수 입력열 차등 검사 1e-9, (3) `MARS_CORE=cpp` 폐루프 setpoint 스트림이 파이썬 골든과 동일 — 세 겹으로 검증된다. 기본은 파이썬(`MARS_CORE=py`) | cpp/README.md | T | UT[C++ 코어:]; CL[main.main()] | 검증됨 (x86; 최대 편차 1.2e-14. Jetson 빌드는 실기 확인) |
 
 ## 2. 역추적: SITL 시나리오 → 요구도
 

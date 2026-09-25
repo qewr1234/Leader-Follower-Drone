@@ -1449,6 +1449,75 @@ with _ctx.redirect_stdout(_io.StringIO()):
 check("논문 도구: 자체검사 — identify_plant(K 0.97·τ 0.35·L 0.12 되찾음), sine_gain(이득 0.7·위상 −35° 를 esp32/uwb/ekf 출처에서), nees_nis(일관/과신 판별)",
       _ok_id and _ok_sg and _ok_nn, f"id={_ok_id} sine={_ok_sg} nees={_ok_nn}")
 
+# ------------------------------------------------- C++ 코어 (cpp/, mars_core): 파이썬 오라클 대비 차등 검증
+try:
+    import mars_core as _mc
+except ImportError:
+    _mc = None
+if _mc is None:
+    print("[SKIP] C++ 코어: mars_core 미빌드 — ./cpp/build.sh 뒤 이 검사가 활성화된다")
+else:
+    from imm_ekf import ImmEkf as _PyEkf, SIGMA_XY as _sxy, SIGMA_Z as _sz, MAX_COAST_SEC as _mcs, RANGE_COAST_MAX_SEC as _rcs
+
+    def _diff_run(seed, steps=600):
+        rng = np3.random.default_rng(seed)
+        py, cc = _PyEkf(), _mc.ImmEkf(_sxy, _sz, _mcs, _rcs)
+        rel_r = ReliabilityEstimator()
+        truth = np3.array([0.2, -0.1, 3.0, 0.05, 0.0, 0.3])
+        worst = 0.0
+        for k in range(steps):
+            dt = float(rng.uniform(0.02, 0.05))
+            truth[:3] += truth[3:] * dt
+            if k == 0:
+                z = truth[:3] + rng.normal(0, 0.05, 3)
+                py.init(z); cc.init(z)
+            for e in (py, cc):
+                e.predict(dt)
+            u = rng.random()
+            if u < 0.55:
+                z = truth[:3] + rng.normal(0, 0.05, 3)
+                R = rel_r.make_R_rgbd(float(rng.uniform(0.3, 1.0)), float(rng.uniform(0.3, 1.0)), depth_m=float(z[2]))
+                for e in (py, cc):
+                    e.update_position3d(z, R)
+            elif u < 0.80:
+                zb = truth[:2] / truth[2] + rng.normal(0, 0.01, 2)
+                Rb = rel_r.make_R_bearing(float(rng.uniform(0.3, 1.0)))
+                for e in (py, cc):
+                    e.update_bearing2d(zb, Rb)
+            elif u < 0.88:
+                for e in (py, cc):
+                    e.on_lost(dt)
+            if rng.random() < 0.3:
+                dpsi = float(rng.normal(0, 0.02))
+                c, s = _math.cos(dpsi), _math.sin(dpsi)
+                T = np3.array([[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]])
+                for e in (py, cc):
+                    e.compensate_ego_rotation(T)
+            if rng.random() < 0.1:
+                v = rng.normal(0, 0.3, 3)
+                a = apply_leader_velocity_hint_to_imm(py, v, alpha=0.10, shrink_vel_cov=0.98)
+                b = apply_leader_velocity_hint_to_imm(cc, v, alpha=0.10, shrink_vel_cov=0.98)
+                assert a == b
+            xp, Pp = py.get_state(); xc, Pc = cc.get_state()
+            yp, Sp = py.innovation_position3d(truth[:3]); yc, Sc = cc.innovation_position3d(truth[:3])
+            worst = max(worst, float(np3.max(np3.abs(xp - xc))), float(np3.max(np3.abs(Pp - Pc))),
+                        float(np3.max(np3.abs(py.get_model_probs() - cc.get_model_probs()))),
+                        float(np3.max(np3.abs(yp - yc))), float(np3.max(np3.abs(Sp - Sc))),
+                        abs(py.coast_time - cc.coast_time), abs(py.range_coast_time - cc.range_coast_time))
+            assert py.has_range_fix() == cc.has_range_fix() and py.is_reliable() == cc.is_reliable()
+        return worst
+
+    from leader_telemetry import apply_leader_velocity_hint_to_imm  # noqa: E402
+    _worsts = [_diff_run(s) for s in (0, 1, 2)]
+    check("C++ 코어: mars_core.ImmEkf 가 파이썬 imm_ekf.ImmEkf 와 난수 입력열 600 스텝 × 3 회(예측·RGB-D·bearing·소실·자세 회전·속도 힌트)에서 상태·공분산·모드 확률·혁신·코스트를 1e-9 안에서 같게 낸다",
+          max(_worsts) < 1e-9, f"최대 편차 {max(_worsts):.2e}")
+    _c = _mc.ImmEkf(_sxy, _sz, _mcs, _rcs)
+    _c.init(np3.array([0.0, 0.0, 3.0]))
+    _c.set_filter_x(0, np3.full(6, float("nan")))
+    check("C++ 코어: NaN 주입 → is_finite False → reset 뒤 미초기화, get_state_dict 키가 파이썬과 같음",
+          not _c.is_finite() and (_c.reset() or not _c.initialized)
+          and set(_c.get_state_dict()) == set(_PyEkf().get_state_dict()))
+
 # ---------------------------------------------------------------- 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "

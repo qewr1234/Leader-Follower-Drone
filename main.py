@@ -21,7 +21,21 @@ from pymavlink import mavutil
 from camera import D435i
 from config import CONFIG
 from detector import YoloDetector
-from imm_ekf import ImmEkf
+from imm_ekf import ImmEkf as _PyImmEkf, SIGMA_XY as _SIGMA_XY, SIGMA_Z as _SIGMA_Z, MAX_COAST_SEC as _MAX_COAST_SEC, \
+    RANGE_COAST_MAX_SEC as _RANGE_COAST_MAX_SEC
+
+# 추정 코어 선택: MARS_CORE=py(기본) | cpp. cpp 는 cpp/ 의 pybind11 모듈 mars_core (imm_ekf.py 와 차등 검증됨, cpp/README.md).
+MARS_CORE = os.environ.get("MARS_CORE", "py").strip().lower()
+if MARS_CORE == "cpp":
+    import mars_core as _mars_core
+
+    class ImmEkf(_mars_core.ImmEkf):
+        """C++ ImmEkf 에 config 의 imm.* 값을 넣는 얇은 껍데기 — 생성 인자 없이 파이썬 클래스와 같은 모양."""
+
+        def __init__(self):
+            super().__init__(_SIGMA_XY, _SIGMA_Z, _MAX_COAST_SEC, _RANGE_COAST_MAX_SEC)
+else:
+    ImmEkf = _PyImmEkf
 from formation import RelativeHeadingEstimator, los_slot, slot_error_fru, slot_from_config
 from leader_telemetry import (LeaderTelemetryReceiver, apply_leader_velocity_hint_to_imm,
                               build_leader_measurement_from_packet, enu_to_body_fru)
@@ -582,7 +596,7 @@ def build_log_row(s):
 def main():
     global SEND_MAVLINK_COMMANDS
 
-    print("[SYS] start MARS-IMM Drone Follow")
+    print(f"[SYS] start MARS-IMM Drone Follow (core={MARS_CORE})")
     use_mars_imm = USE_MARS_IMM_DEFAULT
 
     master = connect_fc()          # FC 먼저 — 없으면 YOLO 를 올리고 카메라를 켠 채 기다리지 않게.
