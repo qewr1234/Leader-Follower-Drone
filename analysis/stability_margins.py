@@ -100,7 +100,7 @@ TAU_SMOOTH = -(1.0 / FPS) / math.log(1.0 - SMOOTH_ALPHA)        # 0.1015 s: smoo
 #   BEFORE : 2026-09-18 수정 전. FF 저역통과 0.7s, 자기 속도 정합 없음, 0.10 램프 데드밴드, 상대속도 추정기.
 #   PREV   : 2026-09-18 수정. FF 2.0s + 자기 속도 정합 0.3s + 소프트 데드존, 상대속도 추정기 (SITL leader_sine 0.72 가 이 설계).
 #   현재    : PREV 의 FF 파라미터 + 절대속도 추정기(자기 속도가 예측 입력). 정합 저역통과가 필요 없어졌다.
-#   전후 이득도 다르다: BEFORE/PREV 는 Kp 0.22, 현재는 0.30 (+ 자기 속도 감쇠 KV 0.2).
+#   전후 이득도 다르다: BEFORE/PREV 는 Kp 0.22, 현재는 0.30 (+ 자기 속도 감쇠 KV 0.3).
 LEGACY_FWD = (0.22, 0.05)
 BEFORE = dict(tau_ff=0.7, tau_m=0.0, legacy_ff=True, deadband=0.10, ego_input=False, legacy_ekf=True, kv=0.0)
 PREV = dict(tau_ff=2.0, tau_m=0.3, ego_input=False, legacy_ekf=True, kv=0.0)

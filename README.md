@@ -28,7 +28,7 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 **4.3m — 이론값 4.36m와 소수 둘째 자리 일치** |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
-| **회귀 스위트** | 단위 검사 172개 + SITL 시나리오 10개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
+| **회귀 스위트** | 단위 검사 181개 + SITL 시나리오 11개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 추종 동작과 Fail-safe
@@ -156,7 +156,7 @@ D435i (color+depth, 640×480@30)
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 172개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 181개 — numpy만 있으면 됨
 python3 test_closed_loop.py    # 폐루프 특성화 — 가짜 FC·가짜 시계로 실제 main.main() 결정론 실행 (--dump/--compare)
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 python3 analysis/stability_margins.py --plots   # 분석 층: 바깥 루프 선형 모델의 여유·스트링 안정성 (matplotlib)
@@ -186,8 +186,8 @@ ArduCopter 에서 검사합니다(실측: 현재 코드 0.72배, 수정 전 코�
 문제가 실제로 재현되는지 확인합니다. 대조군이 통과하는 테스트는 아무것도 증명하지 못하기
 때문입니다.
 
-SITL 시나리오 10개: 부팅 대기 · 조종사 탈환 · 공중 오판 방지 · 이동 리더 추종 · 정지 리더
-정위치 유지 · 기수 유지 · 소실 시 자동 착륙 · GUIDED 인계 · 정현파 리더(스트링 안정성). 상세 이력과 실측값은
+SITL 시나리오 11개(ArduCopter 10 · PX4 1): 부팅 대기 · 조종사 탈환 · 공중 오판 방지 · 이동 리더 추종 · 정지 리더
+정위치 유지 · 기수 유지 · 소실 시 자동 착륙 · GUIDED 인계 · 정현파 리더(스트링 안정성) · 최소 이격(회피). 상세 이력과 실측값은
 **[VERIFICATION.md](VERIFICATION.md)**, 하네스 실행법은 [sitl/README.md](sitl/README.md).
 
 ## 하드웨어
@@ -282,7 +282,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회, 실외 노출 옵션·AE 측광 ROI) |
 | `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | 단위 회귀 172개 (하드웨어·FC 불필요) |
+| `test_fixes.py` | 단위 회귀 181개 (하드웨어·FC 불필요) |
 | `test_closed_loop.py` | 폐루프 특성화 테스트 — 가짜 FC·가짜 시계로 실제 `main.main()` 결정론 실행, `--dump`/`--compare`로 리팩토링 전후 스트림 비교 |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 | `docs/images/` | README 다이어그램(SVG) |
