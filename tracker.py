@@ -12,6 +12,8 @@ from config import CONFIG
 from utils_geometry import iou_xyxy, bbox_area, bbox_center
 
 RECOVER_GATE_MIN_PX = float(CONFIG["scheduler"].get("recover_gate_min_px", 80))
+# 새 트랙을 시작할 최소 검출 신뢰도 (config detector.init_conf_thres). 기존 트랙의 매칭에는 적용하지 않는다.
+INIT_MIN_CONF = float(CONFIG["detector"].get("init_conf_thres", CONFIG["detector"].get("conf_thres", 0.25)))
 
 
 class LeaderTracker:
@@ -43,6 +45,9 @@ class LeaderTracker:
         않는다(화면 어딘가의 더 큰 물체로 신원이 넘어가는 것을 막는다). 힌트가 없으면(추정기 미초기화·코스팅 만료) 예전처럼
         면적×신뢰도 최대 검출로 시작한다."""
         if self.track is None:
+            # 새 트랙은 init_conf_thres 이상의 검출로만 시작한다 — YOLO 임계(0.25) 바로 위의 흔들리는 검출 한 장이 추정기 초기화까지
+            # 끌고 가지 않게(이전 감사 #60). 매칭 중인 트랙은 낮은 신뢰도 프레임도 이어 간다.
+            detections = [d for d in detections if float(d.get("conf", 0.0)) >= INIT_MIN_CONF]
             if not detections:
                 return None
             if reacquire_hint is not None:

@@ -12,9 +12,14 @@ from pymavlink import mavutil
 last_battery_pct = None
 last_battery_voltage = None
 
-# SITL 회귀용: MARS_FC_PORT=udpin:0.0.0.0:14550 python3 main.py
+# SITL 회귀용: MARS_FC_PORT=udpin:0.0.0.0:14550 python3 main.py.  USB(/dev/ttyACM*)는 보레이트를 무시하고, 텔레메트리 UART 는
+# SERIALn_BAUD 와 맞춰야 한다: MARS_FC_BAUD=921600 (기본 115200). /dev/ttyACM0 은 재열거되면 바뀔 수 있어 /dev/serial/by-id/… 권장(README).
 SERIAL_PORT = os.environ.get("MARS_FC_PORT", "/dev/ttyACM0")
-SERIAL_BAUD = 115200
+SERIAL_BAUD = int(os.environ.get("MARS_FC_BAUD", "115200"))
+# drain_messages 한 번에 처리할 메시지 상한 — 링크 폭주(라우터 루프·과도한 스트림)가 제어 루프를 임의 시간 굶기지 않게. 30 Hz 루프에서
+# 정상 유입은 프레임당 ~5개다. 상한에 닿으면 남은 것은 다음 프레임에 읽고 경고를 센다.
+DRAIN_MAX_MSGS = 200
+drain_overflows = 0
 
 # 메시지 타입 → (저장 키, 필드 목록). 필드가 없으면 None 으로 들어간다.
 _STATE_FIELDS = {
@@ -24,7 +29,19 @@ _STATE_FIELDS = {
     "GLOBAL_POSITION_INT": ("global_position", ("lat", "lon", "alt", "relative_alt", "vx", "vy", "vz", "hdg")),
     "LOCAL_POSITION_NED": ("local_position", ("x", "y", "z", "vx", "vy", "vz")),
     "ATTITUDE": ("attitude", ("roll", "pitch", "yaw", "rollspeed", "pitchspeed", "yawspeed")),
+    # FC 시각 — 로그에 남겨 FC .bin/.ulg 로그와 정렬한다 (time_boot_ms 는 FC 부팅 기준, time_unix_usec 은 GPS 시각).
+    "SYSTEM_TIME": ("system_time", ("time_unix_usec", "time_boot_ms")),
+    # 하향 거리계(있으면 진짜 AGL). ArduPilot RANGEFINDER(distance m) / 공용 DISTANCE_SENSOR(current_distance cm, orientation 25=아래).
+    "RANGEFINDER": ("rangefinder", ("distance", "voltage")),
+    # STATUSTEXT: FC 가 모드를 스스로 바꾼 이유(EKF failsafe, "Fence breach", PX4 "Offboard rejected" 등). 마지막 것을 저장하고 콘솔에 띄운다.
+    "STATUSTEXT": ("statustext", ("severity", "text")),
+    # 모드 변경·NAV_LAND 의 COMMAND_ACK — set_mode 가 ACK 없이 성공을 보고하던 것을 main 이 사후에 확인한다.
+    "COMMAND_ACK": ("command_ack", ("command", "result")),
 }
+_DISTANCE_SENSOR_DOWN = 25      # MAV_SENSOR_ROTATION_PITCH_270
+_MSG_ID = {"SYS_STATUS": 1, "SYSTEM_TIME": 2, "GPS_RAW_INT": 24, "ATTITUDE": 30, "LOCAL_POSITION_NED": 32, "GLOBAL_POSITION_INT": 33,
+           "RANGEFINDER": 173, "DISTANCE_SENSOR": 132, "BATTERY_STATUS": 147}
+_MAV_CMD_SET_MESSAGE_INTERVAL = 511
 
 # 기체가 아닌 heartbeat 발신자(규격 고정값. 테스트 스텁에 없을 수 있어 기본값을 둔다).
 _NON_VEHICLE_TYPES = frozenset(getattr(mavutil.mavlink, n, d) for n, d in (
@@ -90,6 +107,10 @@ _vehicle_state = {
     "local_position": {},
     "attitude": {},
     "mode": {},
+    "system_time": {},
+    "rangefinder": {},
+    "statustext": {},
+    "command_ack": {},
 }
 
 
@@ -110,8 +131,23 @@ def adopt_identity(master):
     try:
         mav.srcSystem = int(master.target_system)
         mav.srcComponent = int(COMPANION_COMPONENT_ID)
+        # mavutil 은 프로토콜 자동 전환(v1→v2) 때 self.mav 를 source_system/source_component 로 다시 만든다 — 거기에도 남긴다.
+        master.source_system = int(master.target_system)
+        master.source_component = int(COMPANION_COMPONENT_ID)
     except Exception as exc:
         print(f"[FC] 송신 신원 설정 실패: {type(exc).__name__}: {exc}")
+
+
+def mavlink2_active(master):
+    """FC 가 MAVLink 2 로 말하고 있는가 (pymavlink 는 첫 바이트 STX 253 을 보면 자동 전환). 모르면 None.
+    v1 이면 GPS_RAW_INT 의 alt_ellipsoid/h_acc/v_acc 가 없어(None) 리더 타원체고 비교·정확도 표시가 꺼진다 — SERIALn_PROTOCOL 2 (README)."""
+    fn = getattr(master, "mavlink20", None)
+    if fn is None:
+        return None
+    try:
+        return bool(fn())
+    except Exception:
+        return None
 
 
 def send_heartbeat(master):
@@ -145,6 +181,11 @@ def connect_fc(heartbeat_timeout=10, give_up_after=None):
         print(f"[FC] heartbeat 대기 중 ({waited}s) — 포트/전원 확인")
     print(f"[FC] connected  sys={master.target_system}  comp={master.target_component}")
     adopt_identity(master)
+    v2 = mavlink2_active(master)
+    if v2 is False:
+        print("[WARN] FC 링크가 MAVLink 1 — GPS_RAW_INT 확장 필드(alt_ellipsoid/h_acc) 없음. FC 의 SERIALn_PROTOCOL=2 권장")
+    elif v2 is True:
+        print("[FC] MAVLink 2")
     request_data_streams(master)
     return master
 
@@ -164,12 +205,27 @@ def reconnect_fc(old_master):
 
 
 def request_data_streams(master, rate_hz=10):
-    """쓰는 스트림만 요청한다 (ArduPilot). ALL 을 요청하면 RAW_SENS/EXTRA2 까지 매 프레임 파싱하게 된다.
-    PX4 는 이 메시지를 무시하고 포트 프로파일 기본 rate 로 보낸다."""
+    """쓰는 스트림만 요청한다. 두 경로를 다 쓴다:
+    1) REQUEST_DATA_STREAM 3개(POSITION/EXTRA1/EXTENDED_STATUS) — 구형 ArduPilot. ALL 을 요청하면 RAW_SENS/EXTRA2 까지 매 프레임 파싱한다.
+    2) MAV_CMD_SET_MESSAGE_INTERVAL — ArduPilot 4.x·PX4 공통. PX4 는 1) 을 무시하므로 이것이 없으면 기본 포트 프로파일에 LOCAL_POSITION_NED 가
+       없어 고도 바닥이 영구히 '모름'(하강 금지)으로 남았다(이전 감사 #11). SYSTEM_TIME 1 Hz(로그 정렬), 거리계 5 Hz 도 함께.
+    연결 시 한 번과, 스트림이 끊겼을 때(main 이 LOCAL_POSITION_NED 신선도로 감지) 다시 부른다."""
     for stream_id in (mavutil.mavlink.MAV_DATA_STREAM_POSITION,
                       mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,
                       mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS):
         master.mav.request_data_stream_send(master.target_system, master.target_component, stream_id, rate_hz, 1)
+    send_cmd = getattr(getattr(master, "mav", None), "command_long_send", None)
+    if send_cmd is None:
+        return
+    intervals = {"LOCAL_POSITION_NED": rate_hz, "ATTITUDE": rate_hz, "GLOBAL_POSITION_INT": rate_hz, "GPS_RAW_INT": 5,
+                 "SYS_STATUS": 2, "SYSTEM_TIME": 1, "RANGEFINDER": 5, "DISTANCE_SENSOR": 5}
+    for name, hz in intervals.items():
+        try:
+            send_cmd(master.target_system, master.target_component, _MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                     float(_MSG_ID[name]), 1e6 / float(hz), 0.0, 0.0, 0.0, 0.0, 0.0)
+        except Exception as exc:
+            print(f"[FC] SET_MESSAGE_INTERVAL {name} 실패: {type(exc).__name__}: {exc}")
+            break
 
 
 def _set_battery(pct, mv):
@@ -182,7 +238,12 @@ def _set_battery(pct, mv):
 
 
 def drain_messages(master):
-    while True:
+    """수신 큐를 비우며 상태를 갱신한다. 한 번에 DRAIN_MAX_MSGS 개까지 — 그 이상은 다음 프레임에 (drain_overflows 가 늘어난다)."""
+    global drain_overflows
+    for n in range(DRAIN_MAX_MSGS + 1):
+        if n == DRAIN_MAX_MSGS:
+            drain_overflows += 1
+            break
         msg = master.recv_match(blocking=False)
         if msg is None:
             break
@@ -218,10 +279,27 @@ def drain_messages(master):
                 _set_battery(msg.battery_remaining, msg.voltage_battery)
             except Exception:
                 pass
+        elif mt == "DISTANCE_SENSOR":
+            # 하향(orientation 25) 센서만 거리계로. cm → m. 범위 밖 값(min/max 밖)은 저장하지 않는다.
+            try:
+                if int(getattr(msg, "orientation", -1)) == _DISTANCE_SENSOR_DOWN:
+                    cm = float(msg.current_distance)
+                    lo, hi = float(getattr(msg, "min_distance", 0)), float(getattr(msg, "max_distance", 1e9))
+                    if lo <= cm <= hi:
+                        _vehicle_state["rangefinder"] = {"distance": cm / 100.0, "voltage": None, "timestamp": now}
+            except Exception:
+                pass
         elif mt in _STATE_FIELDS:
             key, fields = _STATE_FIELDS[mt]
             d = {f: getattr(msg, f, None) for f in fields}
             d["timestamp"] = now
+            if mt == "STATUSTEXT":
+                try:
+                    text = d["text"].decode("utf-8", "replace") if isinstance(d["text"], bytes) else str(d["text"])
+                    d["text"] = text.rstrip("\x00").strip()
+                    print(f"[FC] STATUSTEXT sev={d['severity']}: {d['text']}")
+                except Exception:
+                    pass
             _vehicle_state[key] = d
 
 

@@ -20,6 +20,9 @@ CONFIG = {
         # (커스텀 모델(.pt/.engine)에 해당 클래스가 있어야 함)
         "target_class_name": "person",
         "conf_thres": 0.25,
+        # 새 트랙을 시작(초기 획득·재획득)할 때 요구하는 최소 검출 신뢰도. 기존 트랙의 매칭은 conf_thres 그대로다 — 추적 중에는 낮은
+        # 신뢰도 프레임도 이어 가되, '처음 잡는' 대상은 더 확실해야 한다(이전 감사 #60: YOLO 임계 뒤에 하드 리젝트가 없었다).
+        "init_conf_thres": 0.40,
         "iou_thres": 0.45,
         "imgsz": 416,
     },
@@ -48,20 +51,40 @@ CONFIG = {
         "mount_roll_deg": 0.0,
         "mount_pitch_deg": 0.0,
         "mount_yaw_deg": 0.0,
+        # 카메라 레버암 [m, 기체 FRD]: 기체 기준점(FC/무게중심)에서 카메라 광학 중심까지. 상대 '위치' 에만 더해진다(속도는 ω×r 무시).
+        # 기수 앞 10 cm 에 달았으면 [0.10, 0, 0]. 측정하지 않았으면 0 — 3 m 추종에서 수 cm 바이어스지만 최소 이격 판정에는 그대로 들어간다.
+        "mount_offset_frd_m": [0.0, 0.0, 0.0],
+        # librealsense 후처리 필터(decimation/spatial/temporal/hole-filling)는 쓰지 않는다 — 측정은 bbox 안쪽 ROI 의 최근접 군집 median 이라
+        # 공간 평활이 필요 없고, temporal 필터는 움직이는 표적에 지연·꼬리를 만들며 hole-filling 은 하늘(무효)을 배경 깊이로 메워 거짓 거리를 준다.
+        # Jetson CPU 비용(프레임당 수 ms)도 이유다. 필요하면 camera.get_frames 에 rs.*_filter 를 끼우되 measurement 의 군집 로직을 다시 검증할 것.
     },
     "measurement": {
         "bbox_inner_ratio": 0.55,
         "min_depth_valid_count": 20,
+        # 유효 깊이 비율이 이 아래면 측정을 버린다(신뢰도 0). 이 값에서 2배까지는 비율에 선형으로 신뢰도를 올린다.
+        # (예전에는 '램프의 포화점' 이어서 EST-05 가 말하던 '비율로 걸러 0' 이 코드에 없었다.)
         "min_depth_valid_ratio": 0.15,
         "max_depth_mad": 0.50,
+        # ROI 깊이는 정렬한 뒤 이 간격보다 큰 틈으로 군집을 나누고 **가장 가까운** 군집(≥ min_depth_valid_count 화소)의 median 을 쓴다.
+        # 리더는 bbox 안에서 배경보다 앞에 있으므로, 배경 화소가 과반이어도(이중모드 ROI) median 이 배경에 앉지 않는다(이전 감사 #58).
+        "depth_cluster_gap_m": 0.5,
+        # 선택한 군집이 유효 화소 중 이 비율 아래면 신뢰도를 비율에 비례해 깎는다(0.5 → 1.0 배). 얇은 기체는 30 % 안팎이 정상이다.
+        "min_depth_cluster_ratio": 0.30,
     },
     "imm": {
         "max_coast_sec": 2.0,
         # 거리 측정이 끊긴 뒤 소실로 보기까지의 유예.
         # 미션 총 착륙 지연 = 이 값 + MissionManager.lost_hold_sec
         "range_coast_max_sec": 2.0,
-        "sigma_xy": 0.15,
-        "sigma_z": 0.25,
+        # (측정 잡음 σ 는 reliability.base_R_rgbd_diag 한 곳에만 둔다 — 예전엔 imm.sigma_xy/sigma_z 가 같은 값을 따로 들고 있었다.)
+        # 예측 역학에 쓰는 dt 상한 [s]. 카메라 스톨 뒤 수 초 dt 로 한 번에 추측항법하면 CT 회전·속도 오차가 그만큼 증폭된다.
+        # 코스트 타이머는 실제 dt 를 전부 센다(소실 판정은 늦지 않는다).
+        "max_predict_dt_sec": 0.5,
+        # EKF 초기화는 연속 이 프레임 수 동안 서로 init_consistency_m 안에 있는 RGB-D 측정이 들어와야 한다 — 한 프레임 오검출로 시작하지 않게.
+        "init_confirm_frames": 3,
+        "init_consistency_m": 0.75,
+        # v_ego(LOCAL_POSITION_NED 속도, σ ≈ 0.05~0.1 m/s)의 불확실성은 Q 에 따로 넣지 않고 sigma_a 가 흡수한다 — 명시적 항은 분석 골든(FRF)을
+        # 바꾸는 데 비해 효과가 작아(프레임당 위치 분산 1e-5 m²) 생략한 설계 결정이다(이전 감사 '알려진 입력의 불확실성').
         # CT 모델의 회전율을 추정할 최소 리더 속도. 상대가 아니라 절대 속도 기준이라 추종 중에도 유효하다.
         "omega_min_speed_mps": 0.15,
         # 프로세스 잡음 [m/s²]. CV 는 등속 가정을 좁게 잡아야 선회가 CT 쪽 우도로 간다 (VERIFICATION.md 「CT 모드 확률」).
@@ -75,8 +98,16 @@ CONFIG = {
         "min_reliability": 0.05,
         "mahalanobis_threshold_3d": 11.34,  # chi-square df=3, p≈0.99
         "mahalanobis_threshold_2d": 9.21,   # chi-square df=2, p≈0.99
+        # RGB-D 측정 잡음 (카메라 축 [right, down, forward]) — **거리 rgbd_range_ref_m(3 m) 기준값**. 실제 잡음은 거리에 따라 커진다
+        # (스테레오: 횡 σ ∝ z, 깊이 σ ∝ z²). ReliabilityEstimator 가 측정 거리로 배율을 곱한다 (rgbd_range_scale_min~max 로 자름).
+        # 3 m 에서의 값은 분석(docs/STABILITY_MARGINS.md)의 설계점이라 그대로 둔다. imm_ekf 의 기본 R 도 이 값이다.
         "base_R_rgbd_diag": [0.15**2, 0.15**2, 0.25**2],
+        "rgbd_range_ref_m": 3.0,
+        "rgbd_range_scale_min": 0.5,
+        "rgbd_range_scale_max": 4.0,
         "base_R_bearing_diag": [0.03**2, 0.03**2],
+        # ESP32 GPS 상대위치·상대속도의 기본 잡음 — **[수평, 수평, 수직]** 순서다. 측정은 카메라 축 [right, down, forward] 이므로
+        # ReliabilityEstimator 가 [h, v, h] 로 옮겨 쓴다(예전에는 그대로 써서 수직 분산이 전방 거리 축에 붙었다 — 이전 감사 #61).
         "base_R_gps_diag": [2.0**2, 2.0**2, 3.0**2],
         # ESP32 가 주는 상대 속도의 기본 측정 잡음. GPS 속도해는 위치해보다 정확하지만 m/s 단위 오차가 남는다.
         "base_R_vel_diag": [0.30**2, 0.30**2, 0.40**2],
@@ -143,6 +174,14 @@ CONFIG = {
         # 1.00 이고 0.5 s 면 1.014, 0.8 s 면 1.049 로 넘는다. 0.3(h 1.0 s)은 τ_fc 0.3~0.8 s·지연 0.1~0.3 s 전 격자에서 ≤ 1.001 —
         # 고전 ACC 규칙 h ≥ 2·τ_eff(τ_eff ≈ 0.5 s)와 일치한다(Rajamani). 대가: 0.3 m/s 이격 0.53 → 0.63 m, GM 18.4 → 16.4 dB.
         "self_vel_damping": 0.3,
+        # 상하축의 자기 속도 감쇠. 수평축 0.3 을 그대로 쓰면 수직 뒤처짐이 (1−0.8+0.3)/0.18 = 2.78 m/(m/s) 로 커진다(이전 감사 #36).
+        # 분석(상하축 Kp 0.18·Kd 0.03): KV 0 → |Γ| 1.032(불안정), 0.10 → 0.9995(τ_fc 0.8 s 구석 1.03), **0.15 → 0.9993, 전 격자 ≤ 1.003**,
+        # 0.2 → 0.9991. 0.15 로 뒤처짐 1.94 m/(m/s). (test_fixes '분석 (FCR-10)' 상하축 검사)
+        "self_vel_damping_up": 0.15,
+        # 거리 측정 코스트 중 명령 페이드: 마지막 거리 측정 뒤 이 시간까지는 그대로, 그 뒤 range_coast_max_sec 에서 0 이 되도록 선형으로
+        # 추종 항(P·D·FF·KV)을 줄인다. 외삽 추정으로 2 s 동안 전속 전진하다 LOST_HOLD 에서 계단으로 서던 것(이전 감사 #20)을 없앤다.
+        # 이격 장벽·회피와 yaw 는 줄이지 않는다(가까운 리더를 놓쳤을 때 물러남·시야 회복은 유지).
+        "coast_fade_start_sec": 0.3,
         # 소프트 데드존: |v| ≤ 이 값이면 0, 그 위는 크기에서 이 값을 뺀다(기울기 1). 예전 0.10 램프(2배까지 선형)는 국소 기울기가
         # 3 이라 리더 0.1~0.2 m/s 에서 실효 KFF 가 2.4 가 됐다. 빼는 만큼 정상상태 오차가 KFF·DB/Kp 늘므로(0.10 → +0.36m)
         # 폭을 0.05 로 줄였다. 호버 잡음(v̂ σ 0.07 m/s)은 τ 0.1s 저역통과·명령 평활(τ_s 0.1s)·FC 속도루프가 명령 σ 0.03 m/s
@@ -156,3 +195,63 @@ CONFIG = {
         "fsync_sec": 1.0,      # 전원 차단 대비 fsync 주기
     },
 }
+
+
+def validate_config(cfg=None, target_distance_m=None, target_distance_gps_only_m=None, max_v=None, gains=None):
+    """시동 시 설정의 대소·범위를 확인한다. 틀리면 ValueError 목록을 한 번에 올린다 — 비행 중에 드러나는 것보다 낫다.
+    (예전에는 config 를 어디서도 검증하지 않아 min_separation > TARGET 같은 모순이 조용히 지나갔다 — 이전 감사 '설정 검증 부재'.)
+    main 이 자기 상수(TARGET_DISTANCE_M, MAX_V*, 이득)를 넘겨 주면 그것과의 관계도 본다."""
+    cfg = CONFIG if cfg is None else cfg
+    errs = []
+
+    def need(cond, msg):
+        if not cond:
+            errs.append(msg)
+
+    c, r, m, im, cam, sch = cfg["controller"], cfg["reliability"], cfg["measurement"], cfg["imm"], cfg["camera"], cfg["scheduler"]
+    need(0.0 < c["min_separation_m"], "controller.min_separation_m > 0")
+    need(0.0 < c["evade_radius_m"] < c["min_separation_m"], "controller.evade_radius_m 는 0 과 min_separation_m 사이")
+    need(0.0 < c["evade_ramp_m"] <= c["evade_radius_m"], "controller.evade_ramp_m 는 (0, evade_radius_m]")
+    need(c["min_separation_kp"] > 0 and c["evade_speed_mps"] > 0, "controller.min_separation_kp / evade_speed_mps > 0")
+    need(0.0 <= c["leader_vel_ff_gain"] < 1.0, "controller.leader_vel_ff_gain 은 [0, 1) — 1 이상은 스트링 안정을 깬다")
+    need(c["leader_vel_ff_tau_sec"] > 0 and c["leader_vel_ff_deadband_mps"] >= 0, "controller.leader_vel_ff_tau_sec > 0, deadband ≥ 0")
+    need(0.0 <= c["self_vel_damping"] <= 1.0 and 0.0 <= c.get("self_vel_damping_up", 0.0) <= 1.0, "controller.self_vel_damping(_up) 은 [0, 1]")
+    need(str(c["lost_action"]).lower() in ("land", "rtl", "hold"), "controller.lost_action 은 land | rtl | hold")
+    need(c["max_alt_m"] > 2.0 and c["max_follow_dist_m"] > 0 and c["target_distance_ramp_mps"] > 0, "controller.max_alt_m > 2, max_follow_dist_m > 0, ramp > 0")
+    need(0.0 <= c.get("coast_fade_start_sec", 0.0) < im["range_coast_max_sec"], "controller.coast_fade_start_sec 는 [0, imm.range_coast_max_sec)")
+    need(c["uncertainty_slowdown_trace"] > 0, "controller.uncertainty_slowdown_trace > 0")
+    need(0.0 < r["min_reliability"] <= 1.0, "reliability.min_reliability 는 (0, 1]")
+    for k in ("base_R_rgbd_diag", "base_R_gps_diag", "base_R_vel_diag"):
+        need(len(r[k]) == 3 and all(v > 0 for v in r[k]), f"reliability.{k} 는 양수 3개")
+    need(len(r["base_R_bearing_diag"]) == 2 and all(v > 0 for v in r["base_R_bearing_diag"]), "reliability.base_R_bearing_diag 는 양수 2개")
+    need(0.0 < r.get("rgbd_range_scale_min", 0.5) <= 1.0 <= r.get("rgbd_range_scale_max", 4.0), "reliability.rgbd_range_scale_min ≤ 1 ≤ max")
+    need(r.get("rgbd_range_ref_m", 3.0) > 0, "reliability.rgbd_range_ref_m > 0")
+    need(r["mahalanobis_threshold_3d"] > 0 and r["mahalanobis_threshold_2d"] > 0, "reliability.mahalanobis_threshold_* > 0")
+    need(0.0 < m["bbox_inner_ratio"] <= 1.0 and m["min_depth_valid_count"] >= 1, "measurement.bbox_inner_ratio (0,1], min_depth_valid_count ≥ 1")
+    need(0.0 < m["min_depth_valid_ratio"] <= 0.5 and m["max_depth_mad"] > 0, "measurement.min_depth_valid_ratio (0, 0.5], max_depth_mad > 0")
+    need(m.get("depth_cluster_gap_m", 0.5) > 0 and 0.0 < m.get("min_depth_cluster_ratio", 0.3) <= 1.0, "measurement.depth_cluster_gap_m > 0, min_depth_cluster_ratio (0,1]")
+    need(0.0 < cam["depth_min_m"] < cam["depth_max_m"], "camera.depth_min_m < depth_max_m")
+    need(all(abs(float(cam.get(k, 0.0))) <= 90.0 for k in ("mount_roll_deg", "mount_pitch_deg", "mount_yaw_deg")), "camera.mount_*_deg 는 ±90° 안")
+    need(len(cam.get("mount_offset_frd_m", [0, 0, 0])) == 3, "camera.mount_offset_frd_m 는 3개")
+    need(im["range_coast_max_sec"] > 0 and im["max_coast_sec"] > 0, "imm.*coast* > 0")
+    need(im.get("max_predict_dt_sec", 0.5) >= 0.1, "imm.max_predict_dt_sec ≥ 0.1")
+    need(int(im.get("init_confirm_frames", 3)) >= 1 and im.get("init_consistency_m", 0.75) > 0, "imm.init_confirm_frames ≥ 1, init_consistency_m > 0")
+    need(len(im["mode_sojourn_sec"]) == 2 and all(v > 0 for v in im["mode_sojourn_sec"]), "imm.mode_sojourn_sec 양수 2개")
+    need(sch["min_roi_size"] <= sch["base_roi_size"] <= sch["max_roi_size"], "scheduler.min_roi_size ≤ base ≤ max")
+    need(int(sch.get("gate_reject_drop_frames", 3)) >= 1 and sch.get("recover_gate_min_px", 80) >= 0, "scheduler.gate_reject_drop_frames ≥ 1")
+    need(0.0 < cfg["detector"]["conf_thres"] <= cfg["detector"].get("init_conf_thres", cfg["detector"]["conf_thres"]) < 1.0,
+         "detector.conf_thres ≤ init_conf_thres < 1")
+
+    if target_distance_m is not None:
+        need(c["min_separation_m"] < target_distance_m, "min_separation_m < TARGET_DISTANCE_M")
+        need(target_distance_m < cam["depth_max_m"], "TARGET_DISTANCE_M < camera.depth_max_m")
+    if target_distance_gps_only_m is not None:
+        need((target_distance_m or 0.0) < target_distance_gps_only_m < c["max_follow_dist_m"], "TARGET < TARGET_GPS_ONLY < max_follow_dist_m")
+    if max_v is not None:
+        need(all(0.0 < v <= 2.0 for v in max_v), "MAX_VX/VY/VZ 는 (0, 2] m/s")
+        need(c["evade_speed_mps"] <= max_v[1] + 1e-9, "controller.evade_speed_mps ≤ MAX_VY")
+    if gains is not None:
+        need(all(v >= 0 for v in gains) and gains[0] > 0, "이득은 음수가 아니고 KP_FORWARD > 0")
+    if errs:
+        raise ValueError("config 검증 실패: " + "; ".join(errs))
+    return True

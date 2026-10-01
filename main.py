@@ -19,8 +19,9 @@ import cv2
 import numpy as np
 from pymavlink import mavutil
 
+import mavlink_io
 from camera import D435i
-from config import CONFIG
+from config import CONFIG, validate_config
 from detector import YoloDetector
 from imm_ekf import ImmEkf
 from leader_telemetry import (LeaderTelemetryReceiver, apply_leader_velocity_update_to_imm,
@@ -28,7 +29,7 @@ from leader_telemetry import (LeaderTelemetryReceiver, apply_leader_velocity_upd
                               fru_to_camera_xyz)  # camera_xyz_to_fru 의 역변환. analysis 가 main.fru_to_camera_xyz 로 참조
 from logger import ExperimentLogger
 from mavlink_io import (HEARTBEAT_MAX_AGE_SEC, battery_text, connect_fc, drain_messages, get_vehicle_state, reconnect_fc,
-                        send_heartbeat, stream_rates_text)
+                        request_data_streams, send_heartbeat, stream_rates_text)
 from measurement import MeasurementBuilder
 from mission_manager import MissionManager
 from reliability import ReliabilityEstimator
@@ -70,8 +71,10 @@ LEADER_ALT_FRAME = "AMSL"
 # compute_velocity_cmd_from_estimate 주석). 이 값과 config 의 depth_max_m 간격이 깊이창 안에서 추종 가능한
 # 리더 속도의 상한을 정하지만(C4), 실질 상한은 그보다 MAX_VX 가 먼저 건다.
 TARGET_DISTANCE_M = 3.0
-# 카메라 깊이 없이 ESP32 GPS 상대위치만으로 거리를 알 때의 이격. GPS 상대오차는 m 단위라 3m 는 오차보다
-# 작다. 8m 는 depth_max(10m) 안이라 리더가 다시 깊이창에 들어오면 비전이 이어받는다.
+# 카메라 깊이 없이 ESP32 GPS 상대위치만으로 거리를 알 때의 이격. GPS 상대오차는 m 단위라 3m 는 오차보다 작다.
+# 8 m 는 D435i 의 실용 깊이 범위(≈ 6 m, 그 밖은 오차가 거리 제곱으로 커진다 — reliability 의 거리 배율 ×7 이상) **밖**이다: 이 거리에서 비전이
+# 바로 이어받는 것이 아니라, 리더가 다시 6 m 안으로 들어올 때 깊이가 살아나 3 m 로 램프한다. 더 줄이면 GPS 오차(2~5 m)가 최소 이격 2 m 를
+# 침범하므로 8 m 를 유지한다(이전 감사 #46 은 README 의 '깊이창 안이라 바로 이어받는다' 는 근거를 지적한 것 — 문구를 고쳤다).
 TARGET_DISTANCE_GPS_ONLY_M = 8.0
 
 # BODY_NED 속도 제한 (x=forward, y=right, z=down). 첫 실비행은 더 낮게(0.15/0.08/0.10) 권장.
@@ -99,7 +102,15 @@ FF_TAU_SEC = float(CONFIG["controller"].get("leader_vel_ff_tau_sec", 0.1))
 # 안 되고(|Γ| 피크 1.05~1.14), 시간간격 h = KV/Kp = 1.0 s 가 이를 FC 지연 0.3~0.8 s 전 범위에서 1.00 으로 내린다
 # (docs/STABILITY_MARGINS.md 7절, 고전 규칙 h ≥ 2τ).
 KV_SELF = float(CONFIG["controller"].get("self_vel_damping", 0.3))
+# 상하축은 따로(0.15): 0.3 이면 수직 뒤처짐 2.78 m/(m/s), 0 이면 |Γ| 1.03 (config 주석의 분석 표).
+KV_SELF_UP = float(CONFIG["controller"].get("self_vel_damping_up", KV_SELF))
 FF_DEADBAND_MPS = float(CONFIG["controller"].get("leader_vel_ff_deadband_mps", 0.05))
+# 거리 코스트 중 추종 항 페이드 시작 시각 (RANGE_COAST_MAX_SEC 에서 0). coast_command_scale 참조.
+COAST_FADE_START_SEC = float(CONFIG["controller"].get("coast_fade_start_sec", 0.3))
+RANGE_COAST_MAX_SEC = float(CONFIG["imm"].get("range_coast_max_sec", 2.0))
+# EKF 초기화 확인: 연속 INIT_CONFIRM_FRAMES 프레임의 RGB-D 측정이 서로 INIT_CONSISTENCY_M 안에 있어야 시작한다 (InitConfirm).
+INIT_CONFIRM_FRAMES = int(CONFIG["imm"].get("init_confirm_frames", 3))
+INIT_CONSISTENCY_M = float(CONFIG["imm"].get("init_consistency_m", 0.75))
 
 # 최소 이격: 이 거리 아래로는 접근 성분을 0 으로 자르고 침범량에 비례해 물러난다 (compute_velocity_cmd_from_estimate).
 MIN_SEPARATION_M = float(CONFIG["controller"].get("min_separation_m", 2.0))
@@ -145,7 +156,15 @@ LOOP_RESET_SEC = 3.0
 # AE 측광 ROI 를 전체 프레임으로 되돌리는 연속 미검출 수 (1프레임 미스마다 되돌리면 1 Hz 로 측광이 왕복한다).
 AE_ROI_RELEASE_LOST = int(CONFIG["camera"].get("ae_roi_release_lost_frames", 5))
 MAV_STATE_CRITICAL = 5
-MIN_AGL_M = 1.5          # 이 고도(home 기준, LOCAL_POSITION_NED −z) 아래에서는 하강 명령을 내지 않는다. 고도를 모르면 하강 금지(fail-closed).
+# 고도 바닥. 고도 출처 우선순위(get_follower_altitude_m): 하향 거리계(RANGEFINDER/DISTANCE_SENSOR, 진짜 AGL) → LOCAL_POSITION_NED −z →
+# GLOBAL_POSITION_INT relative_alt (뒤 둘은 home 기준 — 이륙점이 평지면 AGL 근사). 모르면 하강 금지(fail-closed).
+MIN_AGL_M = 1.5
+RANGEFINDER_MAX_AGE_SEC = 0.5
+# 데이터 스트림 재요청: heartbeat 는 오는데 LOCAL_POSITION_NED 가 이 시간 넘게 안 오면 request_data_streams 를 다시 보낸다 (연결 시 한 번만
+# 요청하던 것 — FC 재부팅·라우터 재연결 뒤 스트림이 조용히 사라졌다, 이전 감사 #54). 5 s 간격.
+STREAM_REREQUEST_SEC = 5.0
+MAV_CMD_DO_SET_MODE = 176
+MAV_RESULT_ACCEPTED = 0
 
 # ATTITUDE 불연속 판정 [rad]. FC EKF 가 비행 중 yaw 를 재정렬하면(나침반 불일치, GSF 리셋) 기체는 돌지 않았는데 보고 yaw 만
 # 수십 도 뛴다. 그것을 '카메라가 돌았다' 로 보상하면 리더 추정이 3 m 에서 Δψ·3 m 만큼 옆으로 튀어 1.4~2.9 s 전부거부·측면
@@ -189,6 +208,8 @@ _CAM_PERM = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
 _CAM_MOUNT_RPY = tuple(math.radians(float(CONFIG["camera"].get(k, 0.0))) for k in ("mount_roll_deg", "mount_pitch_deg", "mount_yaw_deg"))
 _R_BODY_FROM_MOUNT = rot_body_to_ned(*_CAM_MOUNT_RPY)        # 마운트 프레임 → 기체 FRD (같은 ZYX 합성)
 _CAM_FROM_BODY = _CAM_PERM @ _R_BODY_FROM_MOUNT.T              # 기체 FRD → 카메라
+# 카메라 레버암 (기체 FRD, m): 기체 기준점 → 카메라 광학 중심. 상대 위치에만 더한다 (config camera.mount_offset_frd_m).
+_CAM_OFFSET_FRD = np.asarray(CONFIG["camera"].get("mount_offset_frd_m", [0.0, 0.0, 0.0]), dtype=float)[:3]
 
 
 def level_from_body(roll, pitch):
@@ -197,10 +218,14 @@ def level_from_body(roll, pitch):
     return rot_body_to_ned(roll, pitch, 0.0)
 
 
-def camera_to_level_fru(x_cam, roll=0.0, pitch=0.0):
+def camera_to_level_fru(x_cam, roll=0.0, pitch=0.0, position=False):
     """카메라 [right, down, forward] → 수평 FRU [front, right, up] (마운트와 기체 roll/pitch 를 편 것). roll=pitch=0·마운트 0 이면
-    camera_xyz_to_fru 와 같다."""
-    v_frd = level_from_body(roll, pitch) @ (_CAM_FROM_BODY.T @ np.asarray(x_cam, dtype=float)[:3])
+    camera_xyz_to_fru 와 같다. position=True 면 레버암(_CAM_OFFSET_FRD, 기체 기준점 → 카메라)을 더해 '기체 기준점에서 본' 상대 위치가
+    된다 — 속도에는 쓰지 않는다(ω×r 무시)."""
+    v_frd = _CAM_FROM_BODY.T @ np.asarray(x_cam, dtype=float)[:3]
+    if position:
+        v_frd = v_frd + _CAM_OFFSET_FRD
+    v_frd = level_from_body(roll, pitch) @ v_frd
     return np.array([v_frd[0], v_frd[1], -v_frd[2]], dtype=float)
 
 
@@ -222,15 +247,28 @@ def ego_rotation_cam(prev_rpy, cur_rpy):
 
 
 def fru_to_body_ned_velocity(v_fru):
-    """FRU [forward, right, up] → BODY_NED [forward, right, down]."""
+    """수평 FRU [forward, right, up] → MAV_FRAME_BODY_NED 속도 [forward, right, down]. 이름과 달리 BODY_NED 는 기체 FRD 가 아니다 —
+    ArduCopter/PX4 는 x·y 를 기수(yaw)만 돌린 수평 프레임으로, z 를 지구 하방(+)으로 해석한다. 그래서 입력이 '수평 FRU' 여야 하고
+    변환은 z 부호 반전뿐이다."""
     v = np.asarray(v_fru, dtype=float)
     return np.array([v[0], v[1], -v[2]], dtype=float)
 
 
-def get_follower_altitude_m(vehicle_state):
-    """LOCAL_POSITION_NED z 는 down 이므로 고도는 -z."""
-    z = vehicle_state.get("local_position", {}).get("z")
-    return None if z is None else -float(z)
+def get_follower_altitude_m(vehicle_state, now=None):
+    """(고도 m, 출처) — 출처 우선순위: 하향 거리계(진짜 AGL) → LOCAL_POSITION_NED −z → GLOBAL_POSITION_INT relative_alt (둘 다 home 기준).
+    now 를 주면 각 출처의 신선도(거리계 0.5 s, 위치 0.4 s, 전역 0.7 s)를 본다. 아무것도 없으면 (None, None) — enforce_agl_floor 가 하강을 막는다.
+    PX4 기본 포트 프로파일은 LOCAL_POSITION_NED 를 안 보내지만 GLOBAL_POSITION_INT 는 보내므로(이전 감사 #62), 그 경우에도 바닥·착륙 판정이
+    산다. 거리계는 ArduPilot RNGFND 가 있을 때만 온다."""
+    rf = vehicle_state.get("rangefinder", {})
+    if rf.get("distance") is not None and (now is None or is_fresh(rf, now, RANGEFINDER_MAX_AGE_SEC)):
+        return float(rf["distance"]), "rangefinder"
+    lp = vehicle_state.get("local_position", {})
+    if lp.get("z") is not None and (now is None or is_fresh(lp, now, LOCAL_POS_MAX_AGE_SEC)):
+        return -float(lp["z"]), "local_position"
+    gp = vehicle_state.get("global_position", {})
+    if gp.get("relative_alt") is not None and (now is None or is_fresh(gp, now, GPS_MAX_AGE_SEC)):
+        return float(gp["relative_alt"]) / 1000.0, "global_position"
+    return None, None
 
 
 def enforce_agl_floor(cmd_body, follower_alt):
@@ -378,15 +416,21 @@ def install_signal_handlers():
 # 제어기
 # ============================================================
 
-def follower_velocity_fru(vehicle_state):
-    """FC 의 LOCAL_POSITION_NED 속도(NED) 를 기체 yaw 로 돌린 (front, right, up). 값이 없으면 None."""
-    lp = vehicle_state.get("local_position", {})
+def follower_velocity_fru(vehicle_state, now=None):
+    """FC 의 자기 속도(NED)를 기체 yaw 로 돌린 (front, right, up). 출처: LOCAL_POSITION_NED(m/s) → 없거나 낡으면 GLOBAL_POSITION_INT(cm/s).
+    now 를 주면 신선도(0.4 s / 0.7 s)를 본다. 둘 다 없으면 None (EKF 는 정지 가정, 시간간격 항 0)."""
     yaw = vehicle_state.get("attitude", {}).get("yaw")
-    vx, vy, vz = lp.get("vx"), lp.get("vy"), lp.get("vz")
-    if None in (vx, vy, vz, yaw):
+    if yaw is None:
+        return None
+    lp = vehicle_state.get("local_position", {})
+    gp = vehicle_state.get("global_position", {})
+    if None not in (lp.get("vx"), lp.get("vy"), lp.get("vz")) and (now is None or is_fresh(lp, now, LOCAL_POS_MAX_AGE_SEC)):
+        vx, vy, vz = float(lp["vx"]), float(lp["vy"]), float(lp["vz"])
+    elif None not in (gp.get("vx"), gp.get("vy"), gp.get("vz")) and (now is None or is_fresh(gp, now, GPS_MAX_AGE_SEC)):
+        vx, vy, vz = float(gp["vx"]) / 100.0, float(gp["vy"]) / 100.0, float(gp["vz"]) / 100.0
+    else:
         return None
     c, s = math.cos(float(yaw)), math.sin(float(yaw))
-    vx, vy, vz = float(vx), float(vy), float(vz)
     return np.array([vx * c + vy * s, -vx * s + vy * c, -vz])
 
 
@@ -405,9 +449,9 @@ def leader_velocity_ff(prev_ff, leader_vel_fru, dt):
     target = np.zeros(3)
     if leader_vel_fru is not None:
         v = np.asarray(leader_vel_fru, dtype=float)
-        speed = float(np.linalg.norm(v))
-        if speed > FF_DEADBAND_MPS:
-            target = v * (1.0 - FF_DEADBAND_MPS / speed)
+        # 데드존은 **축별**이다. 3-노름으로 걸면 리더가 수평으로 움직이기 시작하는 순간 수직·횡 축의 잡음 억제가 사라진다(이전 감사 #37).
+        # 축마다 |v_i| 에서 DB 를 빼고 부호를 되돌린다 — 한 축만 움직일 때는 노름 방식과 같다.
+        target = np.sign(v) * np.maximum(np.abs(v) - FF_DEADBAND_MPS, 0.0)
     prev = np.asarray(prev_ff, dtype=float)
     a = 1.0 - math.exp(-max(float(dt), 0.0) / max(FF_TAU_SEC, 1e-3))
     return prev + a * (target - prev)
@@ -461,20 +505,50 @@ def enforce_min_separation(cmd_fru, rel_fru):
     else:
         _evade_side = 0
 
-    lim = (MAX_VX, MAX_VY, MAX_VZ)
-    for i in range(3):
-        cmd[i] = clamp(cmd[i], -lim[i], lim[i])
+    # 축별 포화 뒤에 장벽 불변식을 다시 확인한다. 포화는 성분별이라, 시선과 반대 부호인 성분이 잘리면 시선 방향 성분이 **커질** 수 있다 —
+    # rel=[1.2,1.2,0]·cmd=[0.9,−0.9,0] 이면 장벽 뒤 [0.77,−1.03] 이 [0.35,−0.22] 로 잘려 v_along +0.09(접근) 가 됐다(이전 감사 #35).
+    # 위반이면 초과분을 시선 방향에서 빼고 다시 포화 — 몇 번 안에 수렴한다(시선 방향 성분은 단조 감소). 상자 안에서 KS·(d−d_min) 만큼의
+    # 후퇴가 불가능할 만큼 깊이 침범했을 때도 '접근하지 않는다'(v_along ≤ 0) 는 보장된다.
+    lim = np.array([MAX_VX, MAX_VY, MAX_VZ])
+    # 상자 안에서 시선 방향으로 낼 수 있는 최대 후퇴 속도. 허용치가 그보다 더 큰 후퇴를 요구하면(깊은 침범) 상자 한계까지만 — 그 이상을
+    # 고집하면 반복이 측면 회피 성분까지 깎아 먹는다.
+    nz = np.abs(u) > 1e-9
+    v_box = float(np.min(lim[nz] / np.abs(u[nz]))) if np.any(nz) else 0.0
+    v_target = max(v_allowed, -v_box)
+    for _ in range(8):
+        cmd = np.clip(cmd, -lim, lim)
+        v_along = float(cmd @ u)
+        if v_along <= v_target + 1e-6:
+            break
+        cmd = cmd + (v_target - v_along) * u
+    else:
+        cmd = np.clip(cmd, -lim, lim)
+    if v_allowed < 0.0 and float(cmd @ u) > 0.0:
+        # 마지막 보장: 바닥 안에서는 접근 성분을 0 으로 (상자 안에서 항상 가능 — 시선 성분만 빼면 크기가 줄어든다).
+        cmd = np.clip(cmd - float(cmd @ u) * u, -lim, lim)
     return cmd
 
 
+def coast_command_scale(range_coast_time):
+    """거리 측정 코스트 중 추종 항의 배율: COAST_FADE_START_SEC 까지 1, RANGE_COAST_MAX_SEC 에서 0 으로 선형. 그 뒤는 미션이 LOST_HOLD 로
+    보내 어차피 0 이다 — 이 램프가 '외삽 추정으로 2 s 전진 → 계단 정지' 를 '서서히 멈춤' 으로 바꾼다(이전 감사 #20)."""
+    t = float(range_coast_time)
+    if not math.isfinite(t) or t <= COAST_FADE_START_SEC:
+        return 1.0
+    span = max(RANGE_COAST_MAX_SEC - COAST_FADE_START_SEC, 1e-6)
+    return float(clamp(1.0 - (t - COAST_FADE_START_SEC) / span, 0.0, 1.0))
+
+
 def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance=None, leader_vel_ff=None,
-                                       v_self_fru=None):
+                                       v_self_fru=None, coast_scale=1.0):
     """IMM 추정(FRU 상대 위치·속도) → BODY_NED [vx, vy, vz, yaw_rate].
 
     축마다  cmd = KFF·v_L + Kp·e + Kd·v_rel − KV·v_self.  마지막 항이 시간간격 정책이다: 전후축에서 정상상태
     (cmd = v) 는 e = (v − KFF·(v−db) + KV·v)/Kp 라 이격이 속도에 비례해 벌어진다 (0.3 m/s 에서 0.63 m). 그 대가로
     리더 속도 변동이 뒤 기체에서 증폭되지 않는다(|Γ| ≤ 1). v_self_fru 가 None(자기 속도 미수신)이면 이 항은 0 이다.
-    불확실하면(pos_cov_trace) 전체를 감속한다.
+    상하축의 KV 는 KV_SELF_UP(0.15)이다. 불확실하면(pos_cov_trace) 추종 항을 감속하고, 거리 코스트 중이면 coast_scale(0~1)을 더 곱한다.
+    yaw 는 둘 다 곱하지 않는다 — 측정을 되찾는 유일한 채널을 불확실할 때 느리게 만들 이유가 없다(이전 감사 #41). 이격 장벽·회피는
+    배율 뒤에 적용되므로 줄지 않는다.
     """
     if target_distance is None:
         target_distance = TARGET_DISTANCE_M
@@ -494,13 +568,16 @@ def compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, targ
         scale = 0.75
     else:
         scale = 1.0
+    scale *= float(clamp(float(coast_scale), 0.0, 1.0))
 
     ff_f, ff_r, ff_u = (0.0, 0.0, 0.0) if leader_vel_ff is None else (float(v) for v in np.asarray(leader_vel_ff, dtype=float)[:3])
     cmd_forward = clamp((KFF_LEADER_VEL * ff_f + KP_FORWARD * (front - float(target_distance)) + KD_FORWARD * v_front - KV_SELF * vs_f) * scale, -MAX_VX, MAX_VX)
     cmd_right = clamp((KFF_LEADER_VEL * ff_r + KP_RIGHT * right + KD_RIGHT * v_right - KV_SELF * vs_r) * scale, -MAX_VY, MAX_VY)
-    cmd_up = clamp((KFF_LEADER_VEL * ff_u + KP_UP * up + KD_UP * v_up - KV_SELF * vs_u) * scale, -MAX_VZ, MAX_VZ)
+    cmd_up = clamp((KFF_LEADER_VEL * ff_u + KP_UP * up + KD_UP * v_up - KV_SELF_UP * vs_u) * scale, -MAX_VZ, MAX_VZ)
     # yaw: 선두 방위각을 0 으로 (시야 이탈 방지). BODY_NED yaw_rate 우회전 +, 타겟이 오른쪽이면 bearing + → 부호 일치.
-    cmd_yaw_rate = clamp(KP_YAW * math.atan2(right, max(front, 0.5)) * scale, -MAX_YAW_RATE, MAX_YAW_RATE)
+    # 분모 하한을 최소 이격(2 m)으로: 그 안에서는 '횡 오차 / 2 m' 의 각도로 돌린다 — 0.5 m 앞 0.3 m 옆이면 atan2 가 31° 로 yaw 가 포화되던 것
+    # (이전 감사 #56)을 8.5°·0.12 rad/s 로 눌러, 근접 회피 중 기수가 휘둘리지 않게 한다. 2 m 밖에서는 전과 같다.
+    cmd_yaw_rate = clamp(KP_YAW * math.atan2(right, max(front, MIN_SEPARATION_M)), -MAX_YAW_RATE, MAX_YAW_RATE)
 
     cmd_fru = enforce_min_separation(np.array([cmd_forward, cmd_right, cmd_up]), rel_fru)
     return np.append(fru_to_body_ned_velocity(cmd_fru), cmd_yaw_rate)
@@ -531,16 +608,46 @@ def _bearing_update(ekf, rel, bearing_meas, r_vis, ok_label, reject_label):
     return reject_label, d2
 
 
-def fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm):
-    """RGB-D 3D 측정 → 게이트 통과면 위치 업데이트, 아니면 bearing 으로 강등. 반환 (update_used, gate_d2)."""
+class InitConfirm:
+    """EKF 초기화 확인: 연속 n 프레임의 RGB-D 측정이 서로 tol 안에 있어야 True. 한 프레임 오검출(배경에 앉은 깊이, 새)로 추정기를 시작하면
+    그 뒤 모든 측정이 게이트에서 거부되고 2 s 코스트 뒤에야 풀렸다(이전 감사 #60). 끊기면(프레임에 후보가 없으면) 처음부터 센다."""
+
+    def __init__(self, frames=INIT_CONFIRM_FRAMES, tol_m=INIT_CONSISTENCY_M):
+        self.frames = max(int(frames), 1)
+        self.tol = float(tol_m)
+        self.reset()
+
+    def reset(self):
+        self.last_z = None
+        self.count = 0
+
+    def offer(self, z):
+        z = np.asarray(z, dtype=float)[:3]
+        if self.last_z is not None and float(np.linalg.norm(z - self.last_z)) <= self.tol:
+            self.count += 1
+        else:
+            self.count = 1
+        self.last_z = z
+        if self.count >= self.frames:
+            self.reset()
+            return True
+        return False
+
+
+def fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm, init_confirm=None):
+    """RGB-D 3D 측정 → 게이트 통과면 위치 업데이트, 아니면 bearing 으로 강등. 반환 (update_used, gate_d2).
+    init_confirm(InitConfirm)을 주면 초기화는 연속 일관 측정으로만 한다; None 이면 첫 측정으로 바로 (단위 검사·분석용)."""
     if rgbd_meas is not None and r_vis > 0.0 and r_depth > 0.0:
-        R = rel.make_R_rgbd(r_vis, r_depth) if use_mars_imm else None
+        range_m = float(np.asarray(rgbd_meas["z"], dtype=float)[2])        # 전방 깊이 — R 의 거리 배율
+        R = rel.make_R_rgbd(r_vis, r_depth, range_m) if use_mars_imm else None
         if not ekf.initialized:
+            if init_confirm is not None and not init_confirm.offer(rgbd_meas["z"]):
+                return "init_pending", None
             ekf.init(rgbd_meas["z"])
             return "init_rgbd", None
-        # 게이트는 **기본 R** 로, 신뢰도로 부풀린 R 은 갱신(칼만 이득)에만 쓴다. 같은 R 을 게이트에도 쓰면 신뢰도가 낮을수록
+        # 게이트는 **기본 R**(측정 거리에서의) 로, 신뢰도로 부풀린 R 은 갱신(칼만 이득)에만 쓴다. 같은 R 을 게이트에도 쓰면 신뢰도가 낮을수록
         # (min_reliability 0.05 → R 20배) 게이트가 함께 넓어져 품질이 나쁜 측정일수록 더 잘 통과했다(이전 감사 #26·#59, 신규 16).
-        gate_ok, d2 = rel.gate_position3d(ekf, rgbd_meas["z"], rel.R_rgbd0 if use_mars_imm else None)
+        gate_ok, d2 = rel.gate_position3d(ekf, rgbd_meas["z"], rel.R_rgbd0_at(range_m) if use_mars_imm else None)
         if gate_ok or not use_mars_imm:
             ekf.update_position3d(rgbd_meas["z"], R)
             return "rgbd", d2
@@ -548,6 +655,8 @@ def fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm)
         # 거부된 물체가 리더가 아닐 때 그 방위가 추정을 그쪽으로 끌어 결국 3-D 게이트까지 열어 버렸다(2026-10-01 감사 2번).
         # bearing 폴백은 '깊이 통계가 무효' 인 경우(아래)에만 쓴다.
         return "gate_reject_rgbd", d2
+    if init_confirm is not None and not ekf.initialized:
+        init_confirm.reset()          # 이번 프레임에 쓸 만한 거리 측정이 없었다 — 연속성이 끊겼다
     if USE_BEARING_FALLBACK and bearing_meas is not None and ekf.initialized:
         return _bearing_update(ekf, rel, bearing_meas, r_vis, "bearing", "gate_reject_bearing")
     return "none", None
@@ -684,8 +793,11 @@ def build_log_row(s):
                 "range_coast_time": ekf.range_coast_time, "vision_range_coast_time": ekf.vision_range_coast_time,
                 "initialized": ekf.initialized, "reliable": ekf.is_reliable() if ekf.initialized else False},
         "relative_fru": dict(zip(("front", "right", "up"), s["rel_fru"]), **dict(zip(("v_front", "v_right", "v_up"), s["rel_vel_fru"]))),
-        "vehicle_state": {**{k: s["vehicle_state"].get(k, {}) for k in ("gps", "global_position", "local_position", "attitude")},
-                          "gps_fresh": s["gps_fresh"], "local_position_fresh": s["local_pos_fresh"], "attitude_fresh": s["attitude_fresh"]},
+        "vehicle_state": {**{k: s["vehicle_state"].get(k, {}) for k in ("gps", "global_position", "local_position", "attitude",
+                                                                           "system_time", "rangefinder")},
+                          "gps_fresh": s["gps_fresh"], "local_position_fresh": s["local_pos_fresh"], "attitude_fresh": s["attitude_fresh"],
+                          # 고도 바닥이 실제로 쓴 고도와 출처 (rangefinder | local_position | global_position | None). system_time 은 FC 로그 정렬용.
+                          "follower_alt_m": s.get("follower_alt"), "alt_source": s.get("alt_source")},
         "control": {"send_enabled": SEND_MAVLINK_COMMANDS, "body_vx": cmd[0], "body_vy": cmd[1], "body_vz": cmd[2],
                     "yaw_rate": cmd[3], "target_distance_m": s["target_distance_m"], "vision_range_ok": s["vision_range_ok"],
                     "ff_front": s["ff_fru"][0], "ff_right": s["ff_fru"][1], "ff_up": s["ff_fru"][2]},
@@ -701,6 +813,9 @@ def main():
 
     print("[SYS] start MARS-IMM Drone Follow")
     use_mars_imm = USE_MARS_IMM_DEFAULT
+    # 설정 모순(min_separation ≥ TARGET, 이득 음수, 모르는 lost_action …)은 여기서 ValueError — 비행 중이 아니라 시동에서 멈춘다.
+    validate_config(CONFIG, target_distance_m=TARGET_DISTANCE_M, target_distance_gps_only_m=TARGET_DISTANCE_GPS_ONLY_M,
+                    max_v=(MAX_VX, MAX_VY, MAX_VZ), gains=(KP_FORWARD, KD_FORWARD, KP_RIGHT, KD_RIGHT, KP_UP, KD_UP, KP_YAW))
 
     master = connect_fc()          # FC 먼저 — 없으면 YOLO 를 올리고 카메라를 켠 채 기다리지 않게.
     detector = YoloDetector()
@@ -720,6 +835,7 @@ def main():
     scheduler = PerceptionScheduler()
     tracker = LeaderTracker()
     ekf = ImmEkf()
+    init_confirm = InitConfirm()
     mission = MissionManager(lost_action=LOST_ACTION)
     leader_rx = open_leader_receiver()
     install_signal_handlers()
@@ -738,6 +854,11 @@ def main():
     cam_fail_streak = 0
     fc_fail_t0 = None             # FC 링크 예외가 시작된 시각 (단조). None 이면 정상
     fc_last_reconnect = 0.0
+    fc_fail_last_warn = 0.0
+    last_stream_request = 0.0     # request_data_streams 재요청 타이머 (연결 시 1회는 connect_fc 가 했다)
+    last_ack_ts = None            # 마지막으로 보고한 COMMAND_ACK 의 timestamp
+    last_statustext_ts = None
+    alt_source = None
     fatal = None                  # 루프를 끝낸 치명 원인 ("camera" | "fc") — finally 에서 LOST_ACTION 을 보낼지 결정
     last_heartbeat_tx = 0.0
     fc_mode = "?"
@@ -766,8 +887,7 @@ def main():
     try:
         while True:
             now = time.monotonic()
-            # prev_time 은 프레임 획득에 성공한 뒤에 갱신한다 — 카메라/FC 실패로 continue 한 반복의
-            # 시간이 predict / range_coast 에서 사라지지 않게.
+            # dt 는 직전 반복부터의 실제 경과 — 카메라·FC 실패 프레임도 루프의 나머지를 돌므로(continue 없음) 매 반복 prev_time 을 갱신한다.
             dt = max(now - prev_time, 1e-4)
             # ---------------- 루프 워치독 ----------------
             if dt > LOOP_STALL_SEC and frame_idx > 0:
@@ -779,13 +899,17 @@ def main():
                     last_setpoint_time = now - SETPOINT_PERIOD_SEC
 
             # ---------------- Pixhawk 수신 (예외가 이어지면 재연결, FC_FAIL_SEC 뒤 포기) ----------------
+            # 실패해도 continue 하지 않는다 — 카메라·추정·미션·setpoint(송신 예외는 각자 잡는다)는 계속 돈다. 캐시된 모드는 heartbeat 신선도
+            # (3 s)로 '모름' 이 되어 모드 변경 명령이 막히고, 카메라가 루프를 30 Hz 로 묶으므로 바쁜 대기도 아니다(이전 감사 #8·#52 의 FC 쪽).
             try:
                 drain_messages(master)
                 fc_fail_t0 = None
             except Exception as exc:
                 if fc_fail_t0 is None:
                     fc_fail_t0 = now
-                print(f"[WARN] FC link: drain 실패 {now - fc_fail_t0:.1f}s: {type(exc).__name__}: {exc}")
+                if now - fc_fail_last_warn >= 1.0:
+                    fc_fail_last_warn = now
+                    print(f"[WARN] FC link: drain 실패 {now - fc_fail_t0:.1f}s: {type(exc).__name__}: {exc}")
                 if now - fc_fail_t0 >= FC_FAIL_SEC:
                     print(f"[ERR] FC 링크 {FC_FAIL_SEC:.0f}s 동안 실패 — 종료")
                     fatal = "fc"
@@ -795,9 +919,8 @@ def main():
                     new_master = reconnect_fc(master)
                     if new_master is not None:
                         master = new_master
+                        last_stream_request = now
                         print("[FC] 재연결 성공")
-                time.sleep(0.05)
-                continue
             vehicle_state = get_vehicle_state()
 
             # C2: FC 모드를 매 루프 읽는다. GUIDED/OFFBOARD 를 벗어났다 = 조종사가 탈환했다 → LAND 를 보내지 않는다.
@@ -807,6 +930,21 @@ def main():
             fc_mode = vehicle_state.get("mode", {}).get("name", "?") if mode_fresh else "?"
             fc_armed = bool(vehicle_state.get("mode", {}).get("armed", False)) and mode_fresh
             fc_accepts_setpoints = fc_mode in ("GUIDED", "OFFBOARD")
+            # FC 가 GUIDED/OFFBOARD 를 스스로 떠났으면(EKF failsafe·펜스·배터리·PX4 OFFBOARD 거부) 그 이유는 STATUSTEXT 로 온다 — 조종사 탈환과
+            # 구별해 콘솔에 남긴다(이전 감사 #3·#10). 모드 변경·NAV_LAND 의 COMMAND_ACK 가 거부면 경고(set_mode 는 ACK 없이 True 를 돌려준다, #47).
+            st_msg = vehicle_state.get("statustext", {})
+            if st_msg.get("timestamp") is not None and st_msg.get("timestamp") != last_statustext_ts:
+                last_statustext_ts = st_msg.get("timestamp")
+                if prev_fc_accepts and not fc_accepts_setpoints:
+                    print(f"[WARN] FC 가 {fc_mode} 로 바뀜 — 최근 STATUSTEXT: {st_msg.get('text')}")
+            ack = vehicle_state.get("command_ack", {})
+            if ack.get("timestamp") is not None and ack.get("timestamp") != last_ack_ts:
+                last_ack_ts = ack.get("timestamp")
+                try:
+                    if int(ack.get("command", -1)) in (MAV_CMD_DO_SET_MODE, mavutil.mavlink.MAV_CMD_NAV_LAND) and int(ack.get("result", 0)) != MAV_RESULT_ACCEPTED:
+                        print(f"[WARN] FC 가 명령 {ack.get('command')} 을 거부 (MAV_RESULT {ack.get('result')}) — 모드 변경이 먹지 않았다")
+                except (TypeError, ValueError):
+                    pass
 
             # GUIDED 진입 = 조종사가 방금 자동에게 넘긴 순간. 그 전까지 FC 는 우리 명령을 버렸으므로 그동안 쌓인
             # 상태(수동 상승 중 FAILSAFE_LAND 로 래치된 미션, 포화된 평활 버퍼)를 들고 들어가면 안 된다.
@@ -835,6 +973,14 @@ def main():
             fc_critical_warned = fc_critical
             local_pos_fresh = is_fresh(vehicle_state.get("local_position", {}), now, LOCAL_POS_MAX_AGE_SEC)
             attitude_fresh = is_fresh(vehicle_state.get("attitude", {}), now, ATTITUDE_MAX_AGE_SEC)
+            # heartbeat 는 오는데 위치·자세 스트림이 없으면 스트림 요청이 유실된 것(FC 재부팅·라우터 재연결) — 5 s 마다 다시 요청.
+            if mode_fresh and not (local_pos_fresh or gpos_fresh) and now - last_stream_request >= STREAM_REREQUEST_SEC:
+                last_stream_request = now
+                try:
+                    request_data_streams(master)
+                    print("[WARN] 위치 스트림 없음 — 데이터 스트림 재요청")
+                except Exception as exc:
+                    print(f"[WARN] FC link: 스트림 재요청 실패: {type(exc).__name__}: {exc}")
 
             # ---------------- ESP32 수신 (표시·미션용은 매 프레임, 융합은 새 패킷만) ----------------
             leader_packet = leader_rx.read_latest() if leader_rx is not None else None
@@ -857,7 +1003,8 @@ def main():
                       f"CV={p_cv:.2f} CT={p_ct:.2f} coast={ekf.coast_time:.1f}s rcoast={ekf.range_coast_time:.1f}s "
                       f"mission={mission.state} "
                       f"vL={(float(np.linalg.norm(v_leader_fru)) if v_leader_fru is not None else float('nan')):.2f} "
-                      f"ff={ff_fru[0]:+.2f} fresh=LP{int(local_pos_fresh)}/ATT{int(attitude_fresh)} {stream_rates_text(now)}")
+                      f"ff={ff_fru[0]:+.2f} fresh=LP{int(local_pos_fresh)}/ATT{int(attitude_fresh)} alt={alt_source or '-'} "
+                      f"{stream_rates_text(now)}" + (f" drain_overflow={mavlink_io.drain_overflows}" if mavlink_io.drain_overflows else ""))
                 if SEND_MAVLINK_COMMANDS and not fc_accepts_setpoints:
                     print(f"[WARN] FC mode={fc_mode}: setpoint 는 계속 보내지만 FC 가 버린다 (ArduPilot: GUIDED / PX4: OFFBOARD 필요)")
                 last_stat_print = now
@@ -909,7 +1056,7 @@ def main():
             # 함께 회전) 뒤, predict 앞에 넣어야 프레임이 맞는다. 초기화 전에도 넣는다 — init 이 초기 절대 속도로 쓴다.
             # follower_velocity_fru 는 yaw 만 돌린 수평 프레임이다. EKF 의 카메라 프레임은 roll/pitch 까지 돌아 있으므로 수평 → 기체 → 카메라
             # 로 넣는다(이전 감사 #38·#44: 기울어진 채로 두 프레임이 어긋났다).
-            v_self_fru = follower_velocity_fru(vehicle_state) if (local_pos_fresh and attitude_fresh) else None
+            v_self_fru = follower_velocity_fru(vehicle_state, now) if attitude_fresh else None     # LOCAL_POSITION_NED → GLOBAL_POSITION_INT 폴백
             ekf.set_ego_velocity_cam(level_fru_to_camera_xyz(v_self_fru, roll_lvl, pitch_lvl) if v_self_fru is not None else None)
             if ekf.initialized:
                 ekf.predict(dt)
@@ -945,13 +1092,18 @@ def main():
                 bearing_meas = meas_builder.build_bearing(track) if track is not None else None
                 r_vis = rel.vision_reliability(rgbd_meas or bearing_meas or track)
                 r_depth = rel.depth_reliability(rgbd_meas)
-                update_used, gate_d2 = fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm)
+                update_used, gate_d2 = fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm,
+                                                   init_confirm=init_confirm if use_mars_imm else None)
             # 3-D 게이트 결과를 트래커에 되먹인다: 거리 측정이 연속 GATE_REJECT_DROP_FRAMES 회 거부되면 트랙을 버려
             # (리더가 아닐 가능성) 다음 프레임에 EKF 예측점 근처에서 다시 잡게 한다. 수용되면 거부 횟수를 0 으로.
             if update_used == "rgbd":
                 tracker.note_gate_accept()
             elif update_used == "gate_reject_rgbd" and ekf.is_reliable():
                 tracker.note_gate_reject(GATE_REJECT_DROP_FRAMES)
+            # 게이트가 거부한 프레임은 '측정 없음' 과 같다 — coast_time 을 센다. 예전엔 트랙이 살아 있으면 거부가 이어져도 is_reliable() 이 영원히
+            # 참이라 재획득 힌트가 틀린 예측 주위에 갇혔다(이전 감사 #55). 2 s 뒤 is_reliable 이 꺼지면 전체 화면에서 다시 고른다.
+            if update_used.startswith("gate_reject") and ekf.initialized:
+                ekf.on_lost(dt)
 
             # read_latest() 는 새 패킷이 없으면 같은 패킷을 다시 돌려준다. 같은 관측을 매 프레임 독립 측정처럼
             # 융합하면 안 되므로 새 패킷(rx_time 변경)일 때만 융합한다.
@@ -973,12 +1125,12 @@ def main():
             if not math.isfinite(pos_cov_trace):        # NaN 공분산 = 최대 불확실 (미션 게이트 > 8.0 이 LOST_HOLD 로 보낸다)
                 pos_cov_trace = 999.0
             mu = ekf.get_model_probs() if ekf.initialized else np.array([0.0, 0.0])
-            # 제어·미션 입력은 수평(기수 정렬) 프레임 — 카메라 마운트와 기체 roll/pitch 를 편다 (camera_to_level_fru).
-            rel_fru = camera_to_level_fru(x_est[:3], roll_lvl, pitch_lvl)
+            # 제어·미션 입력은 수평(기수 정렬) 프레임 — 카메라 마운트와 기체 roll/pitch 를 편다 (camera_to_level_fru). 위치에는 레버암을 더한다.
+            rel_fru = camera_to_level_fru(x_est[:3], roll_lvl, pitch_lvl, position=True)
             # 상태의 속도는 리더 '절대' 속도. 제어 D 항·미션 폴백은 상대 속도(절대 − 자기)를 쓴다.
             rel_vel_fru = camera_to_level_fru(ekf.relative_velocity(), roll_lvl, pitch_lvl) if ekf.initialized else np.zeros(3)
 
-            follower_alt = get_follower_altitude_m(vehicle_state) if local_pos_fresh else None
+            follower_alt, alt_source = get_follower_altitude_m(vehicle_state, now)     # 거리계 → LOCAL_POSITION_NED → GLOBAL_POSITION_INT
             # 착륙 판정용 선두 고도는 AGL 근사여야 한다 (ESP32 alt 는 절대고도라 landing_z_thresh 와 비교 불가)
             # → 팔로워 AGL(LOCAL_POSITION_NED) + 상대고도.
             leader_alt_est = float(follower_alt + rel_fru[2]) if (follower_alt is not None and ekf.initialized and ekf.is_reliable()) else None
@@ -1002,7 +1154,7 @@ def main():
             # 오판한다. 자기 속도·자세가 신선하고 EKF 가 신뢰할 수 있을 때만 쓰고(아니면 상태 v 는 상대 속도에 불과),
             # 없으면 미션은 상대 속도로 폴백한다.
             v_leader_fru = None
-            if ekf.initialized and ekf.is_reliable() and local_pos_fresh and attitude_fresh and v_self_fru is not None:
+            if ekf.initialized and ekf.is_reliable() and attitude_fresh and v_self_fru is not None:
                 v_leader_fru = camera_to_level_fru(ekf.leader_velocity(), roll_lvl, pitch_lvl)
 
             mission_state, mission_policy = mission.update(
@@ -1015,6 +1167,8 @@ def main():
             # 목표 이격 램프: 추종 중(allow_follow)에만 움직인다. 소실 홀드 중에 8 m 로 올라가 버리면 재획득 순간 후퇴 과도가 생긴다.
             if mission_policy["allow_follow"]:
                 target_distance_m += clamp(target_goal - target_distance_m, -TARGET_DISTANCE_RAMP_MPS * dt, TARGET_DISTANCE_RAMP_MPS * dt)
+            else:
+                reset_evade_side()      # 추종이 끊긴 동안 회피 방향 래치를 들고 있지 않는다 — 재개 시 리더 쪽으로 비켜설 수 있었다(이전 감사 #59)
             # 리더 속도 피드포워드: 거리를 아는 추종 상태에서만. 아니면 0 으로 감쇠.
             ff_fru = leader_velocity_ff(
                 ff_fru, v_leader_fru if (mission_policy["allow_follow"] and ekf.has_range_fix()) else None, dt)
@@ -1036,8 +1190,10 @@ def main():
                     last_land_send = now
                     last_setpoint_time = now
             elif mission_policy["allow_follow"] and ekf.initialized and not range_too_far:
+                # 거리 코스트 중이면 추종 항을 서서히 0 으로 (coast_command_scale) — 장벽·회피·yaw 는 그대로.
                 desired_body_cmd = compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance_m, ff_fru,
-                                                                      v_self_fru=v_self_fru)
+                                                                      v_self_fru=v_self_fru,
+                                                                      coast_scale=coast_command_scale(ekf.range_coast_time))
 
             # 수직 축은 리더 상대 고도를 따라간다 — 트래커가 지면의 무언가를 물면 계속 하강한다. 고도 바닥(모르면 하강 금지).
             desired_body_cmd = enforce_agl_floor(desired_body_cmd, follower_alt)
@@ -1090,7 +1246,7 @@ def main():
                      f"tgt={target_distance_m:.1f}m{'' if vision_range_ok else '(GPS)'}", (220, 220, 220), 0.48),
                     (f"cmd BODY_NED vx={current_body_cmd[0]:+.2f} vy={current_body_cmd[1]:+.2f} "
                      f"vz={current_body_cmd[2]:+.2f} yr={current_body_cmd[3]:+.2f} ffF={ff_fru[0]:+.2f}", (100, 255, 100), 0.48),
-                    (f"fresh GPS/LP/ATT={int(gps_fresh)}/{int(local_pos_fresh)}/{int(attitude_fresh)}"
+                    (f"fresh GPS/LP/ATT={int(gps_fresh)}/{int(local_pos_fresh)}/{int(attitude_fresh)} alt={alt_source or '-'}"
                      + (f"  !! FC system_status={fc_sys_status}" if fc_critical else "") + (f"  stall={stall_count}" if stall_count else ""),
                      (0, 0, 255) if fc_critical else (180, 180, 255), 0.48),
                 ])
@@ -1141,7 +1297,7 @@ def main():
                     esp=esp, x_est=x_est, pos_cov_trace=pos_cov_trace, mu=mu, ekf=ekf, rel_fru=rel_fru,
                     rel_vel_fru=rel_vel_fru, vehicle_state=vehicle_state, gps_fresh=gps_fresh,
                     local_pos_fresh=local_pos_fresh, attitude_fresh=attitude_fresh, current_body_cmd=current_body_cmd,
-                    target_distance_m=target_distance_m, vision_range_ok=vision_range_ok)))
+                    target_distance_m=target_distance_m, vision_range_ok=vision_range_ok, follower_alt=follower_alt, alt_source=alt_source)))
 
     except KeyboardInterrupt:
         print("\n[SYS] KeyboardInterrupt")
@@ -1150,12 +1306,13 @@ def main():
         print(f"[SYS] shutdown{' (fatal=' + fatal + ')' if fatal else ''}")
         try:
             if SEND_MAVLINK_COMMANDS and master is not None:
-                if fatal == "camera" and fc_accepts_setpoints:
+                if fatal is not None and fc_accepts_setpoints:
                     # 컴패니언이 죽으면 ArduCopter 는 GUID_TIMEOUT 뒤 그 자리에서 무한 호버한다(이전 감사 #1·#50·#53). 카메라 사망은
-                    # '리더를 영영 못 본다' 이므로 소실과 같은 행동(LOST_ACTION)을 한 번 보내고 나간다. 조종사가 탈환한 상태면 보내지 않는다.
+                    # '리더를 영영 못 본다' 이므로 소실과 같은 행동(LOST_ACTION)을 한 번 보내고 나간다. FC 링크 사망도 같은 시도를 한다 —
+                    # 닿을 가능성은 낮지만 비용이 없다. 조종사가 탈환한 상태(마지막으로 안 모드 기준)면 보내지 않는다.
                     act = {"land": "LAND", "rtl": "RTL", "hold": None}.get(LOST_ACTION)
                     if act is not None:
-                        print(f"[SYS] 카메라 사망 종료 — {act} 송신")
+                        print(f"[SYS] {fatal} 사망 종료 — {act} 송신")
                         send_failsafe(master, act)
                 send_hold(master)
                 time.sleep(0.1)

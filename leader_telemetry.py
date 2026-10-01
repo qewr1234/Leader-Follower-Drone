@@ -520,15 +520,12 @@ def build_leader_measurement_from_packet(
 
         # 상대속도 = 선두 속도 − 후미 속도. EKF 상태 속도는 리더 절대 속도지만 속도 측정의 관측 모델이
         # h(x) = v − v_ego (ImmEkf.update_velocity3d)라 측정은 상대속도로 넘긴다(힌트가 아니라 게이트 있는 정규 측정).
-        # 후미 속도를 모르면 아래 폴백에서 리더 절대 속도가 그대로 들어가 자기 속도만큼 편향된다.
+        # 후미 속도를 모르면 상대 속도 측정은 **없음**(None) 이다 — 예전처럼 리더 절대 속도를 넣으면 관측 모델과 모순이라 자기 속도만큼
+        # 편향된 측정이 된다(이전 감사 #39). 미션용 절대 속도(leader_hspeed/vz)는 그대로 쓴다.
         if follower_vel_enu is not None:
             rel_vel_enu = leader_vel_enu - follower_vel_enu
-        else:
-            # follower 속도를 모르면 기존처럼 leader 속도로 fallback
-            rel_vel_enu = leader_vel_enu
-
-        rel_vel_fru = enu_to_body_fru(rel_vel_enu, follower_yaw)
-        rel_vel_cam = fru_to_camera_xyz(rel_vel_fru)
+            rel_vel_fru = enu_to_body_fru(rel_vel_enu, follower_yaw)
+            rel_vel_cam = fru_to_camera_xyz(rel_vel_fru)
 
         # 미션(출발/호버/착륙) 판단용은 선두의 "절대" 속도
         leader_hspeed = float(np.linalg.norm(leader_vel_enu[:2]))

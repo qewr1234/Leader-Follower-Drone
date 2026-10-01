@@ -56,13 +56,18 @@ def make_square_roi(cx, cy, size, width, height):
 
 
 def _intr(intrinsics):
-    """(fx, fy, cx, cy). RealSense 는 ppx/ppy, 일반 표기는 cx/cy — 둘 다 받는다."""
-    return (
-        intrinsics.get("fx", 384.0),
-        intrinsics.get("fy", 384.0),
-        intrinsics.get("ppx", intrinsics.get("cx", 320.0)),
-        intrinsics.get("ppy", intrinsics.get("cy", 240.0)),
-    )
+    """(fx, fy, cx, cy). RealSense 는 ppx/ppy, 일반 표기는 cx/cy — 둘 다 받는다.
+    빠진 값은 예외다 — 예전엔 fx=fy=384, 320/240 으로 조용히 대체해, 카메라가 다른 해상도·초점거리를 주면 거리·방위가 그만큼 틀린 채 날았다
+    (이전 감사 #63). camera.D435i.start() 가 네 값을 모두 채운다."""
+    try:
+        fx, fy = float(intrinsics["fx"]), float(intrinsics["fy"])
+        cx = float(intrinsics["ppx"] if "ppx" in intrinsics else intrinsics["cx"])
+        cy = float(intrinsics["ppy"] if "ppy" in intrinsics else intrinsics["cy"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"intrinsics 에 fx/fy/ppx(cx)/ppy(cy) 가 있어야 한다: {intrinsics!r}") from exc
+    if not (fx > 0 and fy > 0):
+        raise ValueError(f"intrinsics 초점거리가 양수가 아니다: fx={fx} fy={fy}")
+    return fx, fy, cx, cy
 
 
 def pixel_to_camera(u, v, depth_m, intrinsics):

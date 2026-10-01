@@ -31,9 +31,9 @@ MODE_SOJOURN_SEC = tuple(CONFIG["imm"].get("mode_sojourn_sec", (10.0, 5.0)))
 # σ 를 나중에 바꿔도 변하지 않도록 여기서 값을 고정한다.
 LEGACY_TUNING = dict(sigma_a_cv=0.8, sigma_a_ct=1.2, mode_sojourn_sec=None)
 
-SIGMA_XY = CONFIG["imm"]["sigma_xy"]
-SIGMA_Z = CONFIG["imm"]["sigma_z"]
 MAX_COAST_SEC = CONFIG["imm"]["max_coast_sec"]
+# 예측 역학에 쓰는 dt 상한. 코스트 타이머는 실제 dt 를 전부 센다 (config imm.max_predict_dt_sec).
+MAX_PREDICT_DT = float(CONFIG["imm"].get("max_predict_dt_sec", 0.5))
 # 거리 정보를 담은 측정이 끊긴 뒤 "아직 위치를 안다"고 볼 수 있는 시간.
 RANGE_COAST_MAX_SEC = CONFIG["imm"].get("range_coast_max_sec", 2.0)
 # omega 를 추정할 최소 리더 속도 [m/s]. 이 아래면 진행 방향각이 잡음이라 기존 omega 를 감쇠시킨다.
@@ -56,7 +56,8 @@ P0_VEL = 2.0
 
 H_POS = np.hstack([np.eye(3), np.zeros((3, 3))])
 H_VEL = np.hstack([np.zeros((3, 3)), np.eye(3)])
-R_DEFAULT = np.diag([SIGMA_XY**2, SIGMA_XY**2, SIGMA_Z**2])
+# R 을 넘기지 않는 호출(분석·baseline)의 기본 측정 잡음 — reliability.base_R_rgbd_diag 와 같은 값 (한 곳에서만 정한다).
+R_DEFAULT = np.diag([float(v) for v in CONFIG["reliability"]["base_R_rgbd_diag"]])
 
 
 def _make_P0():
@@ -233,6 +234,7 @@ class ImmEkf:
         # get_state() 캐시. 상태를 바꾸는 메서드(init/predict/update_*/compensate_ego_rotation/_finite_or_reset)가
         # 각자 None 으로 되돌린다.
         self._fused = None
+        self._ego_known = False       # 직전 set_ego_velocity_cam 이 실제 값이었는가 (None/비유한이면 False) — 전환 순간 상태 속도를 옮긴다
 
     def init(self, z, source="rgbd"):
         # 초기 절대 속도 = 자기 속도 (상대 속도 0 가정 — 예전과 같은 가정이다)
@@ -256,9 +258,13 @@ class ImmEkf:
         if not self.initialized:
             return
         dt = max(float(dt), 1e-4)
-        # 매 프레임 누적하고, 거리 측정이 들어올 때만 0으로 되돌린다.
+        # 매 프레임 누적하고, 거리 측정이 들어올 때만 0으로 되돌린다. (타이머는 실제 dt — 소실 판정은 스톨에도 늦지 않는다)
         self.range_coast_time += dt
         self.vision_range_coast_time += dt
+        # 역학은 dt 상한을 둔다: 카메라 스톨 뒤 수 초를 한 번에 추측항법하면 속도 오차·CT 회전이 그만큼 증폭되고 다음 측정이 게이트 밖으로
+        # 나간다(이전 감사 #57). 상한을 넘는 만큼은 불확실성(P 성장)으로만 남기지 않고, 그냥 그 시간만큼 덜 진행한 것으로 둔다 — 복귀 뒤
+        # 첫 측정들이 바로잡는다.
+        dt = min(dt, MAX_PREDICT_DT)
 
         Pi = transition_matrix(dt, self.mode_sojourn_sec)
         mu_pred = Pi.T @ self.mu
@@ -316,9 +322,19 @@ class ImmEkf:
         None(자기 속도 미수신)이면 필터는 팔로워가 정지한 것으로 보고 상태 v 는 사실상 상대 속도가 된다.
         수신이 돌아오면 다음 갱신들에서 절대 속도로 되돌아온다(속도 P0 가 아니라 갱신으로 — 수 프레임 과도).
         """
-        v = np.zeros(3) if v_cam is None else np.asarray(v_cam, dtype=float)[:3]
-        if not np.all(np.isfinite(v)):
-            v = np.zeros(3)
+        known = v_cam is not None and np.all(np.isfinite(np.asarray(v_cam, dtype=float)[:3]))
+        v = np.asarray(v_cam, dtype=float)[:3].copy() if known else np.zeros(3)
+        # 가용성이 바뀌는 순간(수신 → 끊김, 끊김 → 복귀)의 v_ego 변화는 물리가 아니라 장부 변경이다. 측정과 맞아 있던 것은 (v − v_ego) 이므로
+        # 그 차이를 보존하도록 상태 속도를 같은 양만큼 옮기고, 그 순간의 불확실성을 속도 P 에 더한다. 안 옮기면 복귀 뒤 1.5~2 s 동안
+        # leader_velocity()/relative_velocity() 가 v_ego 만큼 틀린 채 표시 없이 나갔다(이전 감사 #28). 프레임 간 정상 변화(기체 가속)는
+        # 상대 속도가 실제로 변하는 것이라 옮기지 않는다.
+        if self.initialized and known != self._ego_known:
+            delta = v - self.filters[0].ego_vel
+            for f in self.filters:
+                f.x[3:6] += delta
+                f.P[3:6, 3:6] += np.diag(delta * delta) + np.eye(3) * 0.05**2
+            self._fused = None
+        self._ego_known = known
         for f in self.filters:
             f.ego_vel = v.copy()
 

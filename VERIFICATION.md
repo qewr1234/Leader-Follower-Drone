@@ -19,7 +19,7 @@
 소스에서 이유를 찾습니다. C5가 그 사례입니다(아래).
 
 ```bash
-python3 test_fixes.py                        # 단위 250개, 하드웨어 불필요
+python3 test_fixes.py                        # 단위 293개, 하드웨어 불필요
 python3 analysis/stability_margins.py        # 안정성 여유 분석 (docs/STABILITY_MARGINS.md)
 python3 analysis/trace_check.py              # 요구도 추적성 (docs/REQUIREMENTS.md)
 python3 sitl/harness.py --all                # SITL 11개 시나리오 (px4_setmode 는 PX4 필요)
@@ -40,14 +40,14 @@ python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 | 조종사 탈환 | ✅ C2 SITL 차등 검증 (LOITER 25초 유지) |
 | 소실 판정 | ✅ 거리 기준으로 교체, 깊이 소실 10.0초 뒤 착륙 확인 |
 | 표적 신원 | ✅ 회복 시 근접 게이트 (검출률 60% 대응) |
-| PX4 경로 | ✅ C6 PX4 SITL 차등 검증 |
+| PX4 경로 | 🔶 C6(`set_mode` 3-튜플) 1건만 PX4 SITL 로 확인 — OFFBOARD 추종·스트림 요청은 미검증 |
 | 수정본 SITL 재검증 | ✅ C1·C2·C3·C4·C6·H2 차등 검증 / C5는 증상 발생 불가로 판정 |
 | Jetson 실기 (지상) | 🔶 리더 검출 → 모터 구동까지 확인 (개발자 보고) |
 | **실비행** | 🔶 미수행 — [조건부 시험 비행 가능](README.md#운용-순서) |
 
 ## 수정 완료 (2026-09-07)
 
-`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 250개). 하드웨어 없이 순수 로직만 검증합니다.
+`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 293개). 하드웨어 없이 순수 로직만 검증합니다.
 
 ### C1 — 부팅 즉시 FAILSAFE_LAND
 
@@ -101,7 +101,8 @@ uint32 필드에 튜플을 넣다가 `struct.error`가 나고, 예외 처리가 
 죽었습니다.**
 
 **수정**: `master.set_mode(mode_name)`에 위임(pymavlink가 apm/px4 자동 분기) + `try/except`로
-non-fatal화 → `MAV_CMD_NAV_LAND` fallback에 실제로 도달합니다.
+non-fatal화. `MAV_CMD_NAV_LAND` fallback 은 `set_mode` 가 **예외를 낼 때만** 도달합니다 — `set_mode` 는 ACK 를 기다리지 않고 True 를
+돌려주므로 FC 가 조용히 거부한 경우는 fallback 이 아니라 2 s 재시도(`LAND_RETRY_SEC`)와 COMMAND_ACK 거부 경고(2026-10-01)가 맡습니다.
 
 ### H2 — 호버 리더 정위치 유지가 존재하지 않음
 
@@ -556,13 +557,35 @@ heartbeat·sysid, 신뢰도가 게이트를 넓히는 구조, 레벨링. 전부 
   이상이면 STAT/HUD 경보(모드 변경은 하지 않는다).
 - **문서(13번).** GCS 의 GUIDED 이륙은 컴패니언 가동 중 쓰지 않는다는 제약을 운용 순서에 적었다.
 
-이로써 `docs/AUDIT_2026-10-01.md` 의 신규 21건은 전부 조치됐다(6번 소실 정책은 설정 노출, 나머지는 코드). 이전 67건 중 코드로 남은 것은
-2 s 코스트 중 외삽 명령(#20), sigma_z·min_reliability 의 R 설계(#26·#59 — 게이트 쪽만 분리로 해소), 자기 속도 복귀 과도(#28),
-FCR-16 축별 클램프(#35), 깊이 이중모드 ROI(#58), 초기화 무게이트(#60), time_boot_ms·MAVLink2·STATUSTEXT 류다.
+이로써 `docs/AUDIT_2026-10-01.md` 의 신규 21건은 전부 조치됐다(6번 소실 정책은 설정 노출, 나머지는 코드).
+
+### 이전 감사 잔여 31건 (2026-10-01, 보고서 3절 '남음' 전수)
+
+보고서 3절 57행을 현재 코드와 대조하니 15건 해결·11건 부분·31건 그대로였다. 아래로 코드로 가능한 것은 전부 닫았다. 단위 검사 43개 추가(총 293).
+폐루프 setpoint 스트림은 의도적으로 바뀌었다 — 코스트 페이드로 16~18 s 의 명령이 0.025 → 0 으로 감쇠하고(예전엔 0.018 에서 계단으로 0), 초기화 확인으로
+EKF 시작이 2프레임 늦어 FOLLOW 진입이 5.13 → 5.27 s 다. 14개 판정은 전부 통과(거리 오차 +0.68 m, 최소 접근 3.12 m, LAND 35.0 s).
+
+- **코스트 페이드(#20).** `coast_command_scale`: 마지막 거리 측정 뒤 0.3 s 까지 1, 2 s 에 0. 추종 항에만 곱하고 장벽·회피·yaw 는 그대로 — 가까이서 놓친
+  리더에게서는 여전히 물러난다.
+- **초기화 확인(#60).** `InitConfirm`: 연속 3프레임 0.75 m 안의 측정으로만 EKF 시작, 새 트랙은 conf ≥ 0.40.
+- **최근접 깊이 군집(#58·#30).** `measurement._nearest_cluster`: 정렬한 깊이를 0.5 m 틈으로 나눠 ≥ 20 화소인 가장 가까운 군집의 median. 유효 비율
+  0.15 아래는 신뢰도 0(예전엔 램프 포화점), 군집 몫이 작으면 비례로 깎는다.
+- **R 설계(#26·#61·#67).** 거리 의존 R(횡 ∝ z, 깊이 ∝ z², 3 m 기준이라 분석 골든 불변, 0.5~4 배), ESP32 R 의 [h,h,v] → 카메라 축 [h,v,h], imm.sigma_* 제거.
+- **자기 속도 전환(#28), predict dt 상한(#57), 게이트 거부 코스트(#55).** 전환 순간 상태 속도 이동 + P 확대; 역학 dt ≤ 0.5 s(타이머는 실제); 거부 프레임도 on_lost.
+- **FCR-16 클램프(#35).** 축별 포화 뒤 장벽 재확인(상자 안 후퇴 한계까지), 바닥 안 접근 0 보장. 재현 입력에서 +0.092 → ≤ 0.
+- **축별 데드존(#37)·상하축 KV 0.15(#36, 분석 |Γ| 0.9993, 뒤처짐 2.78 → 1.94)·yaw 분모 하한 2 m(#56)·yaw 무감속(#41).**
+- **고도·속도 출처(#62·#64).** 거리계 → LOCAL_POSITION_NED → GLOBAL_POSITION_INT. PX4 기본 스트림에서도 바닥·착륙 판정이 산다.
+- **MAVLink(#11·#3·#47·#4·#54·#65·#49·#53).** SET_MESSAGE_INTERVAL(PX4 포함), 5 s 재요청, STATUSTEXT 콘솔·이탈 사유, COMMAND_ACK 거부 경고,
+  SYSTEM_TIME·거리계 로그, drain 200개 상한, MAVLink 1 경고 + source_system 유지, `MARS_FC_BAUD`.
+- **FC 드레인 예외의 continue 제거(#8 FC 쪽), 치명 FC 종료 시에도 LOST_ACTION 시도(#1), 회피 래치 해제(#59), 레버암(#42 잔여), intrinsics 엄격(#63),
+  ESP32 상대속도 폴백 제거(#39), 설정 검증(#48), 문서 정정(#43·#46·#66).**
+
+코드로 닫지 않은 것: EST-15 설계점 미분리(#27 — 원리적 한계, 요구도 표에 기록), v_ego 불확실성의 Q 항(#33 — σ_a 가 흡수, 분석 골든 보존을 위해 생략),
+불확실성 감속 임계(#58 뒤 항목 — GPS 단독 추종이 느린 것은 의도), 컴패니언 사망 시 FC 호버(#50 — FC 의 FS_GCS 는 컴패니언 heartbeat 를 보지 않음, 체크리스트).
 
 ## 요구도 추적성 (2026-09-18)
 
-[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 에 요구도 78개(FCR 19 · EST 18 · SAF 20 · IF 15 · OPS 6)를 ID 로 두고
+[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 에 요구도 88개(FCR 21 · EST 22 · SAF 22 · IF 16 · OPS 7)를 ID 로 두고
 각각을 `test_fixes.py` 검사 이름, `test_closed_loop.py` 검사, SITL 시나리오, 분석 결과 키, 소스 문자열로 묶었습니다.
 `analysis/trace_check.py` 가 참조가 실제로 존재하는지 대조하고(`추적성:` 단위 검사), 폐루프 검사 14개는 전부
 요구도에 연결돼 있습니다. 미충족 1개(EST-12 검출률), 미검증 2개(실비행, ESP32 펌웨어), 부분 7개(SAF-05 공중 인계 미검증, SAF-06/SAF-10 시나리오 부재, FCR-07·EST-02 단위 검사 부족, EST-10/11 실기 자료 부재)가 표 3절에

@@ -270,10 +270,11 @@ check("tracker: 반대편 검출이 계속 있어도 기존 트랙을 넘겨주�
       stolen_at is None, f"{stolen_at}프레임째 탈취")
 check("tracker: 게이트 밖 검출만 계속되면 max_lost에서 트랙 폐기",
       dropped_at == tr3.max_lost + 1, f"dropped_at={dropped_at} (기대 {tr3.max_lost + 1})")
-t = tr3.update(far)
-check("tracker: 폐기 뒤에는 새 track_id로 명시적 재초기화",
-      t is not None and t["track_id"] == 2 and t["age"] == 1 and not t["is_lost"],
-      f"track_id={t and t.get('track_id')} age={t and t.get('age')}")
+_t_low = tr3.update(far)                                   # conf 0.30 < init_conf_thres 0.40 — 새 트랙을 시작하지 못한다
+t = tr3.update([{**far[0], "conf": 0.6}])
+check("tracker: 폐기 뒤에는 새 track_id로 명시적 재초기화 (시작 신뢰도 init_conf_thres 이상의 검출로만 — 0.30 은 거부)",
+      _t_low is None and t is not None and t["track_id"] == 2 and t["age"] == 1 and not t["is_lost"],
+      f"low={_t_low} track_id={t and t.get('track_id')} age={t and t.get('age')}")
 
 # 상한이 정상 회복은 막지 않아야 한다: 3프레임 놓친 뒤 대각선 2배 거리(≈113px)는 통과
 tr4 = LeaderTracker()
@@ -1551,11 +1552,12 @@ _msrc2 = open("main.py", encoding="utf-8").read()
 _cam_block = _msrc2.split("frame_ok = color_image is not None")[1].split("# ---------------- IMM predict")[0]
 check("카메라 실패 프레임: continue 없이 루프가 이어진다 — 소실 타이머·미션·setpoint 가 돈다 (예전: continue 로 전부 건너뜀)",
       not __import__("re").search(r"^\s+continue\s*$", _cam_block, __import__("re").M) and 'fatal = "camera"' in _cam_block and "if not frame_ok:" in _msrc2 and '"camera_fail"' in _msrc2)
-check("카메라 실패 프레임: 치명 종료 시 LOST_ACTION 을 한 번 보낸다 (조종사 탈환 상태면 안 보냄)",
-      'if fatal == "camera" and fc_accepts_setpoints:' in _msrc2 and "send_failsafe(master, act)" in _msrc2)
+check("카메라 실패 프레임: 치명 종료(카메라·FC 링크) 시 LOST_ACTION 을 한 번 보낸다 (조종사 탈환 상태면 안 보냄)",
+      'if fatal is not None and fc_accepts_setpoints:' in _msrc2 and "send_failsafe(master, act)" in _msrc2)
 _fc_block = _msrc2.split("# ---------------- Pixhawk 수신")[1].split("vehicle_state = get_vehicle_state()")[0]
-check("FC 링크: 예외 스트릭은 시간(FC_FAIL_SEC 15 s)으로 세고 1 s 마다 재연결을 시도한다 (예전: 30회 = 1 ms 뒤 종료, 재연결 없음)",
-      "reconnect_fc(master)" in _fc_block and "FC_FAIL_SEC" in _fc_block and main.FC_FAIL_SEC >= 5.0 and "time.sleep(0.05)" in _fc_block)
+check("FC 링크: 예외 스트릭은 시간(FC_FAIL_SEC 15 s)으로 세고 1 s 마다 재연결을 시도하며, 실패 프레임도 continue 없이 미션·setpoint 가 돈다",
+      "reconnect_fc(master)" in _fc_block and "FC_FAIL_SEC" in _fc_block and main.FC_FAIL_SEC >= 5.0
+      and not __import__("re").search(r"^\s+continue\s*$", _fc_block, __import__("re").M) and "time.sleep" not in _fc_block)
 check("FC 링크: heartbeat 가 3 s 넘게 안 오면 모드를 '모름' 으로 — 캐시된 GUIDED 로 LAND 를 보내지 않는다",
       "mode_fresh = is_fresh(vehicle_state.get(\"mode\", {}), now, HEARTBEAT_MAX_AGE_SEC)" in _msrc2 and _mio.HEARTBEAT_MAX_AGE_SEC == 3.0
       and main.is_fresh({"name": "GUIDED", "timestamp": 100.0}, 104.0, _mio.HEARTBEAT_MAX_AGE_SEC) is False)
@@ -1624,7 +1626,7 @@ check("레벨링: camera_to_level_fru ↔ level_fru_to_camera_xyz 왕복 항등"
 check("레벨링: roll=pitch=0·마운트 0 이면 예전 순열(camera_xyz_to_fru)과 같다",
       np3.allclose(main.camera_to_level_fru([0.4, -0.2, 2.5]), main.camera_xyz_to_fru([0.4, -0.2, 2.5])) and np3.allclose(main._CAM_FROM_BODY, main._CAM_PERM))
 check("레벨링: 루프의 제어·미션 입력(rel_fru·rel_vel_fru·리더 속도)과 EKF 자기 속도 입력이 레벨링을 지난다",
-      "rel_fru = camera_to_level_fru(x_est[:3], roll_lvl, pitch_lvl)" in _msrc2 and "level_fru_to_camera_xyz(v_self_fru, roll_lvl, pitch_lvl)" in _msrc2
+      "rel_fru = camera_to_level_fru(x_est[:3], roll_lvl, pitch_lvl, position=True)" in _msrc2 and "level_fru_to_camera_xyz(v_self_fru, roll_lvl, pitch_lvl)" in _msrc2
       and "camera_to_level_fru(ekf.leader_velocity(), roll_lvl, pitch_lvl)" in _msrc2)
 # 마운트: config 를 바꿔 모듈을 다시 평가하지 않고 수식으로 확인 — mount_pitch −10°(아래로 숙임)이면 C = PERM @ R_mount^T
 _Rm = main.rot_body_to_ned(0.0, _math.radians(-10.0), 0.0)
@@ -1727,6 +1729,233 @@ check("sysid 필터: 다른 기체(sysid 2)의 ATTITUDE/LOCAL_POSITION_NED 는 �
       f"yaw={_vs2['attitude'].get('yaw')} lp={_vs2['local_position']}")
 check("system_status: HEARTBEAT 의 MAV_STATE 를 저장해 CRITICAL(5) 이상이면 main 이 경보한다",
       _vs2["mode"].get("system_status") == 5 and "fc_critical = mode_fresh and fc_sys_status is not None and int(fc_sys_status) >= MAV_STATE_CRITICAL" in _msrc3)
+
+
+# ================================================================ 감사 잔여 (2026-10-01, 보고서 3절 '남음' 31건)
+_msrc4 = open("main.py", encoding="utf-8").read()
+_mio4 = open("mavlink_io.py", encoding="utf-8").read()
+import copy as _copy  # noqa: E402
+from config import validate_config as _vc  # noqa: E402
+from measurement import MeasurementBuilder as _MB4  # noqa: E402
+import utils_geometry as _ug  # noqa: E402
+
+# 설정 검증
+check("설정 검증: 현재 config 와 main 상수는 검증을 통과한다",
+      _vc(CONFIG, target_distance_m=main.TARGET_DISTANCE_M, target_distance_gps_only_m=main.TARGET_DISTANCE_GPS_ONLY_M,
+          max_v=(main.MAX_VX, main.MAX_VY, main.MAX_VZ), gains=(main.KP_FORWARD, main.KD_FORWARD, main.KP_RIGHT, main.KD_RIGHT, main.KP_UP, main.KD_UP, main.KP_YAW)) is True
+      and "validate_config(CONFIG, target_distance_m=TARGET_DISTANCE_M" in _msrc4)
+_bad_cfg = _copy.deepcopy(CONFIG); _bad_cfg["controller"]["min_separation_m"] = 3.5
+_bad_cfg2 = _copy.deepcopy(CONFIG); _bad_cfg2["controller"]["leader_vel_ff_gain"] = 1.2; _bad_cfg2["camera"]["depth_min_m"] = 20.0
+_errs = []
+for _c_ in (_bad_cfg, _bad_cfg2):
+    try:
+        _vc(_c_, target_distance_m=3.0); _errs.append(None)
+    except ValueError as _e:
+        _errs.append(str(_e))
+check("설정 검증: min_separation ≥ TARGET, KFF ≥ 1, depth_min > depth_max 는 시동 시 ValueError (여러 오류를 한 번에 나열)",
+      all(_errs) and "min_separation_m < TARGET_DISTANCE_M" in _errs[0] and "leader_vel_ff_gain" in _errs[1] and "depth_min_m" in _errs[1], f"{_errs}")
+
+# 코스트 페이드 (이전 #20)
+_cs = [main.coast_command_scale(t) for t in (0.0, 0.3, 1.15, 2.0, 5.0)]
+check("코스트 페이드: 거리 코스트 0.3 s 까지 1, 1.15 s 에 0.5, 2.0 s(RANGE_COAST_MAX) 이후 0", _cs[0] == 1.0 and _cs[1] == 1.0 and abs(_cs[2] - 0.5) < 1e-9 and _cs[3] == 0.0 and _cs[4] == 0.0, f"{_cs}")
+_c_full = main.compute_velocity_cmd_from_estimate([3.5, 0.3, 0.0], [0.0, 0.0, 0.0], 1.0, 3.0, [0.1, 0, 0], v_self_fru=[0.3, 0, 0])      # 전후 0.14 (포화 전)
+_c_half = main.compute_velocity_cmd_from_estimate([3.5, 0.3, 0.0], [0.0, 0.0, 0.0], 1.0, 3.0, [0.1, 0, 0], v_self_fru=[0.3, 0, 0], coast_scale=0.5)
+_c_zero = main.compute_velocity_cmd_from_estimate([3.5, 0.3, 0.0], [0.0, 0.0, 0.0], 1.0, 3.0, [0.1, 0, 0], v_self_fru=[0.3, 0, 0], coast_scale=0.0)
+check("코스트 페이드: coast_scale 이 추종 항(P·D·FF·KV)을 비례로 줄이고 0 이면 평행이동 명령이 0 — yaw 는 줄지 않는다 (시야 회복 채널)",
+      abs(_c_half[0] - 0.5 * _c_full[0]) < 1e-9 and abs(_c_half[1] - 0.5 * _c_full[1]) < 1e-9 and np3.allclose(_c_zero[:3], 0.0)
+      and abs(_c_zero[3] - _c_full[3]) < 1e-9 and _c_full[3] > 0.0, f"full={_c_full.round(3)} zero={_c_zero.round(3)}")
+_c_zero_near = main.compute_velocity_cmd_from_estimate([1.8, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0, 3.0, [0.3, 0, 0], coast_scale=0.0)
+check("코스트 페이드: 바닥 안(1.8 m)에서 코스트 중이어도 이격 장벽의 후퇴(−0.12)는 그대로 나간다 — 가까이서 놓친 리더에게서 물러난다",
+      abs(_c_zero_near[0] - (-main.MIN_SEPARATION_KP * 0.2)) < 1e-9, f"{_c_zero_near.round(3)}")
+check("코스트 페이드: 루프가 ekf.range_coast_time 으로 coast_scale 을 넘긴다", "coast_scale=coast_command_scale(ekf.range_coast_time)" in _msrc4)
+
+# 초기화 확인 (이전 #60)
+_ic = main.InitConfirm(frames=3, tol_m=0.75)
+_seq = [_ic.offer([0, 0, 3.0]), _ic.offer([0.1, 0, 3.1]), _ic.offer([0, 0, 3.0])]
+_ic2 = main.InitConfirm(frames=3, tol_m=0.75)
+_seq2 = [_ic2.offer([0, 0, 3.0]), _ic2.offer([0, 0, 6.0]), _ic2.offer([0, 0, 6.1]), _ic2.offer([0, 0, 6.0])]
+check("초기화 확인: 연속 3프레임이 0.75 m 안이면 세 번째에 확인, 튀면 처음부터 다시 센다",
+      _seq == [False, False, True] and _seq2 == [False, False, False, True], f"{_seq} {_seq2}")
+_eki = ImmEkf(); _reli = ReliabilityEstimator(); _ici = main.InitConfirm()
+_u1, _ = main.fuse_vision(_eki, _reli, {"z": np3.array([0, 0, 3.0])}, None, 1.0, 1.0, True, init_confirm=_ici)
+_u2, _ = main.fuse_vision(_eki, _reli, {"z": np3.array([0, 0, 3.0])}, None, 1.0, 1.0, True, init_confirm=_ici)
+_u3, _ = main.fuse_vision(_eki, _reli, {"z": np3.array([0, 0, 3.0])}, None, 1.0, 1.0, True, init_confirm=_ici)
+_eki2 = ImmEkf(); _u_now, _ = main.fuse_vision(_eki2, _reli, {"z": np3.array([0, 0, 3.0])}, None, 1.0, 1.0, True)
+check("초기화 확인: fuse_vision 은 init_pending 두 번 뒤 init_rgbd — init_confirm 없이 부르면(분석·단위) 예전처럼 즉시 초기화",
+      (_u1, _u2, _u3) == ("init_pending", "init_pending", "init_rgbd") and _eki.initialized and _u_now == "init_rgbd" and _eki2.initialized, f"{_u1} {_u2} {_u3} / {_u_now}")
+_eki3 = ImmEkf(); _ici3 = main.InitConfirm()
+main.fuse_vision(_eki3, _reli, {"z": np3.array([0, 0, 3.0])}, None, 1.0, 1.0, True, init_confirm=_ici3)
+main.fuse_vision(_eki3, _reli, None, None, 0.0, 0.0, True, init_confirm=_ici3)          # 거리 측정 없는 프레임 → 연속성 끊김
+main.fuse_vision(_eki3, _reli, {"z": np3.array([0, 0, 3.0])}, None, 1.0, 1.0, True, init_confirm=_ici3)
+_u_gap, _ = main.fuse_vision(_eki3, _reli, {"z": np3.array([0, 0, 3.0])}, None, 1.0, 1.0, True, init_confirm=_ici3)
+check("초기화 확인: 중간에 측정 없는 프레임이 끼면 연속성이 끊겨 다시 센다", _u_gap == "init_pending" and not _eki3.initialized, f"{_u_gap}")
+check("초기화 확인: 루프는 MARS 경로에서 init_confirm 을 넘긴다", "init_confirm=init_confirm if use_mars_imm else None" in _msrc4)
+
+# 깊이 군집 (이전 #58) — 배경 60 %·리더 40 % 의 이중모드 ROI
+_mb4 = _MB4({"fx": 384.0, "fy": 384.0, "ppx": 320.0, "ppy": 240.0}, depth_scale=0.001)
+_dimg4 = np3.full((480, 640), 6000, dtype=np3.uint16)                 # 배경 6 m
+_dimg4[200:280, 296:320] = 3000                                        # 리더 3 m — inner ROI(55x55, 열 292~347) 의 가로 24 px ≈ 44 %
+_st4 = _mb4._depth_stats(_dimg4, (270, 190, 370, 290))
+check("깊이 군집: 배경이 과반인 ROI 에서 median 이 아니라 최근접 군집(3 m)을 고른다 — 군집 2개, 군집 몫 ≈ 0.44",
+      _st4["depth_m"] is not None and abs(_st4["depth_m"] - 3.0) < 1e-6 and _st4["depth_clusters"] == 2 and 0.35 < _st4["depth_cluster_ratio"] < 0.55,
+      f"{_st4}")
+_dimg5 = np3.full((480, 640), 6000, dtype=np3.uint16); _dimg5[230:233, 318:322] = 1000     # 12 px 조각 (min_valid 20 미만) → 건너뜀
+_st5 = _mb4._depth_stats(_dimg5, (270, 190, 370, 290))
+check("깊이 군집: min_depth_valid_count 미만의 앞쪽 조각(먼지·프롭)은 건너뛰고 다음 군집을 쓴다", abs(_st5["depth_m"] - 6.0) < 1e-6 and _st5["depth_clusters"] == 2, f"{_st5}")
+_st6 = _mb4._depth_stats(np3.full((480, 640), 4000, dtype=np3.uint16), (270, 190, 370, 290))
+check("깊이 군집: 단일 모드 ROI 는 예전과 같다 (군집 1개, 몫 1.0, 전 화소 median)", abs(_st6["depth_m"] - 4.0) < 1e-6 and _st6["depth_clusters"] == 1 and _st6["depth_cluster_ratio"] == 1.0)
+_rel4 = ReliabilityEstimator()
+_r_small = _rel4.depth_reliability(dict(depth_m=3.0, depth_valid_ratio=0.9, depth_mad=0.01, depth_cluster_ratio=0.15))
+_r_big = _rel4.depth_reliability(dict(depth_m=3.0, depth_valid_ratio=0.9, depth_mad=0.01, depth_cluster_ratio=0.9))
+_r_lowratio = _rel4.depth_reliability(dict(depth_m=3.0, depth_valid_ratio=0.10, depth_mad=0.01))
+_r_midratio = _rel4.depth_reliability(dict(depth_m=3.0, depth_valid_ratio=0.225, depth_mad=0.01))
+check("깊이 군집: 군집 몫이 작으면(0.15) 신뢰도가 비례로 깎이고(0.5배), 유효 비율이 min_depth_valid_ratio(0.15) 아래면 0, 0.225 면 0.5 램프",
+      abs(_r_small / _r_big - 0.5) < 1e-9 and _r_lowratio == 0.0 and abs(_r_midratio / _r_big - 0.5) < 1e-9, f"{_r_small:.3f}/{_r_big:.3f} low={_r_lowratio} mid={_r_midratio:.3f}")
+
+# 거리 의존 R · 축 매핑 · 상수 단일화 (이전 #26·#61·#67)
+_R3 = _rel4.R_rgbd0_at(3.0); _R6 = _rel4.R_rgbd0_at(6.0); _R1 = _rel4.R_rgbd0_at(1.0); _R20 = _rel4.R_rgbd0_at(20.0)
+check("거리 R: 기준 3 m 에서는 base_R 그대로(분석 설계점 유지), 6 m 에서 횡 ×4·깊이 ×16, 배율은 [0.5, 4] 로 잘림(1 m → ×0.25/×0.0625, 20 m → ×16/×256)",
+      np3.allclose(_R3, _rel4.R_rgbd0) and np3.allclose(np3.diag(_R6) / np3.diag(_rel4.R_rgbd0), [4, 4, 16])
+      and np3.allclose(np3.diag(_R1) / np3.diag(_rel4.R_rgbd0), [0.25, 0.25, 0.0625]) and np3.allclose(np3.diag(_R20) / np3.diag(_rel4.R_rgbd0), [16, 16, 256]))
+check("거리 R: make_R_rgbd(range_m) 과 fuse_vision 의 게이트가 측정 깊이의 R 을 쓴다",
+      np3.allclose(_rel4.make_R_rgbd(1.0, 1.0, 6.0), _R6) and "rel.R_rgbd0_at(range_m) if use_mars_imm else None" in _msrc4)
+check("R 축: ESP32 위치·속도의 [수평, 수평, 수직] 분산이 카메라 축 [right, down, forward] = [h, v, h] 로 들어간다 (예전: 수직 분산이 전방 축에)",
+      np3.allclose(np3.diag(_rel4.R_gps0), [4.0, 9.0, 4.0]) and np3.allclose(np3.diag(_rel4.R_vel0), [0.09, 0.16, 0.09]))
+check("R 단일화: imm.sigma_xy/sigma_z 가 없어지고 imm_ekf.R_DEFAULT 는 reliability.base_R_rgbd_diag 에서 온다",
+      "sigma_xy" not in CONFIG["imm"] and "sigma_z" not in CONFIG["imm"] and np3.allclose(np3.diag(_ie.R_DEFAULT), CONFIG["reliability"]["base_R_rgbd_diag"]))
+
+# 자기 속도 전환 (이전 #28)
+_ekt = ImmEkf(); _ekt.init([0, 0, 3.0])
+for _ in range(90):
+    _ekt.set_ego_velocity_cam([0, 0, 0.3]); _ekt.predict(1 / 30); _ekt.update_position3d([0, 0, 3.0])
+_vl_before = float(_ekt.leader_velocity()[2])
+_ekt.set_ego_velocity_cam(None)
+_vl_drop, _vr_drop = float(_ekt.leader_velocity()[2]), float(_ekt.relative_velocity()[2])
+_ekt.set_ego_velocity_cam([0, 0, 0.3])
+_vl_back = float(_ekt.leader_velocity()[2])
+check("ego 전환: 자기 속도가 끊기는 순간 상태 속도를 상대 속도로(0.3 → 0), 돌아오는 순간 절대 속도로(→ 0.3) 즉시 옮긴다 — 1.5~2 s 과도 없음",
+      abs(_vl_before - 0.3) < 0.02 and abs(_vl_drop) < 0.02 and abs(_vr_drop) < 0.02 and abs(_vl_back - 0.3) < 0.02,
+      f"before={_vl_before:.3f} drop={_vl_drop:.3f} back={_vl_back:.3f}")
+_ekt2 = ImmEkf(); _ekt2.init([0, 0, 3.0]); _ekt2.set_ego_velocity_cam([0, 0, 0.3]); _x_a = _ekt2.get_state()[0].copy()
+_ekt2.set_ego_velocity_cam([0, 0, 0.5]); _x_b = _ekt2.get_state()[0].copy()
+check("ego 전환: 값 → 값 의 정상 변화(기체 가속)에서는 상태를 옮기지 않는다", np3.allclose(_x_a, _x_b))
+
+# predict dt 상한 (이전 #57)
+_ekd = ImmEkf(); _ekd.init([0, 0, 3.0]); _ekd.filters[0].x[5] = _ekd.filters[1].x[5] = 1.0; _ekd._fused = None
+_ekd.predict(3.0)
+check("predict dt 상한: 3 s 공백 뒤 코스트 타이머는 3 s 를 세지만 역학은 max_predict_dt(0.5 s)만 진행한다 (1 m/s → 0.5 m)",
+      abs(_ekd.range_coast_time - 3.0) < 1e-9 and abs(_ekd.get_state()[0][2] - 3.5) < 1e-6 and _ie.MAX_PREDICT_DT == 0.5, f"rcoast={_ekd.range_coast_time} z={_ekd.get_state()[0][2]:.3f}")
+
+# FCR-16 축별 클램프 (이전 #35)
+main.reset_evade_side()
+_cl = main.enforce_min_separation([0.9, -0.9, 0.0], [1.2, 1.2, 0.0])
+_u_ = np3.array([1.2, 1.2, 0.0]) / np3.hypot(1.2, 1.2)
+check("FCR-16 클램프: rel=[1.2,1.2]·cmd=[0.9,−0.9] — 예전엔 축별 포화 뒤 시선 성분 +0.092(접근), 이제 ≤ 0 이고 상자 안",
+      float(_cl @ _u_) <= 1e-6 and abs(_cl[0]) <= main.MAX_VX + 1e-9 and abs(_cl[1]) <= main.MAX_VY + 1e-9, f"cmd={_cl.round(3)} v_along={float(_cl @ _u_):+.3f}")
+main.reset_evade_side()
+_cl2 = main.enforce_min_separation([0.0, 0.0, 0.0], [1.2, 0.1, 0.0])
+check("FCR-16 클램프: 깊은 침범(후퇴 요구 0.48 > MAX_VX)에서는 상자 한계까지만 후퇴하고 측면 회피(≥ 0.15)를 깎지 않는다",
+      _cl2[1] > 0.15 and abs(_cl2[0] + main.MAX_VX) < 1e-6, f"{_cl2.round(3)}")
+main.reset_evade_side()
+
+# yaw: 근접 분모 하한 · 불확실성 배율 제외 (이전 #41·#56)
+_y_near = main.compute_velocity_cmd_from_estimate([0.5, 0.3, 0.0], [0, 0, 0], 1.0, 3.0)[3]
+_y_far = main.compute_velocity_cmd_from_estimate([3.0, 0.3, 0.0], [0, 0, 0], 1.0, 3.0)[3]
+_y_unc = main.compute_velocity_cmd_from_estimate([3.0, 0.3, 0.0], [0, 0, 0], 999.0, 3.0)
+check("yaw 근접: 0.5 m 앞 0.3 m 옆이면 분모 하한 2 m 로 0.12 rad/s (예전 0.35 포화), 3 m 에서는 전과 같이 KP·atan2",
+      abs(_y_near - main.KP_YAW * _math.atan2(0.3, 2.0)) < 1e-9 and abs(_y_far - main.KP_YAW * _math.atan2(0.3, 3.0)) < 1e-9, f"near={_y_near:.3f} far={_y_far:.3f}")
+check("yaw 근접: 불확실성 감속(0.55)은 평행이동에만 — yaw 는 그대로", abs(_y_unc[3] - _y_far) < 1e-9 and abs(_y_unc[0]) < abs(main.compute_velocity_cmd_from_estimate([3.0, 0.3, 0.0], [0, 0, 0], 1.0, 2.0)[0]))
+
+# 축별 데드존 (이전 #37) · 상하축 KV (이전 #36)
+_ffa = main.leader_velocity_ff([0, 0, 0], [0.3, 0.02, -0.02], 100.0)
+check("축별 데드존: 리더가 전진 중이어도 횡·수직의 0.02 m/s 잡음은 0 으로 (예전 노름 방식은 0.0167 통과), 전진은 0.25",
+      abs(_ffa[0] - 0.25) < 1e-9 and _ffa[1] == 0.0 and _ffa[2] == 0.0, f"{_ffa}")
+_c_up = main.compute_velocity_cmd_from_estimate([3.0, 0.0, 0.0], [0, 0, 0], 1.0, 3.0, None, v_self_fru=[1.0, 0.0, 1.0])
+check("KV 상하축: 자기 속도 1 m/s 에 전후축은 −0.3(포화 전), 상하축은 −0.15 (BODY_NED z +0.15) — self_vel_damping_up",
+      abs(_c_up[0] + main.KV_SELF) < 1e-9 and abs(_c_up[2] - main.KV_SELF_UP) < 1e-9 and abs(main.KV_SELF_UP - 0.15) < 1e-9, f"{_c_up.round(3)}")
+_r_up = _margins_of(kp=main.KP_UP, kd=main.KD_UP, kv=main.KV_SELF_UP)
+_r_up_grid = {(t, d): _margins_of(kp=main.KP_UP, kd=main.KD_UP, kv=main.KV_SELF_UP, tau_fc=t, Td=d)["peak"] for t in (0.3, 0.5, 0.8) for d in (0.1, 0.3)}
+check("분석 (FCR-10 상하축): KV_up 0.15 로 |Γ| ≤ 1.0, PM ≥ 45°, GM ≥ 15 dB, FC 지연 격자 전부 ≤ 1.003 (KV 0 이면 1.032 — 뒤처짐 2.78 → 1.94 m/(m/s))",
+      _r_up["peak"] <= 1.0 + 1e-3 and _r_up["pm_deg"] >= 45 and _r_up["gm_db"] >= 15 and all(v <= 1.003 for v in _r_up_grid.values())
+      and _margins_of(kp=main.KP_UP, kd=main.KD_UP, kv=0.0)["peak"] > 1.02,
+      f"Γ={_r_up['peak']:.4f} grid=" + " ".join(f"{v:.3f}" for v in _r_up_grid.values()))
+
+# 고도 출처·자기 속도 폴백 (이전 #62·#64)
+_vs_rf = {"rangefinder": {"distance": 2.2, "timestamp": 10.0}, "local_position": {"z": -15.0, "timestamp": 10.0}, "global_position": {"relative_alt": 14000, "timestamp": 10.0}}
+_vs_lp = {"local_position": {"z": -15.0, "timestamp": 10.0}, "global_position": {"relative_alt": 14000, "timestamp": 10.0}}
+_vs_gp = {"local_position": {"z": -15.0, "timestamp": 5.0}, "global_position": {"relative_alt": 14000, "timestamp": 10.0}}
+check("고도 출처: 거리계(AGL) > LOCAL_POSITION_NED > GLOBAL_POSITION_INT relative_alt — 낡은 출처는 건너뛰고, 없으면 (None, None)",
+      main.get_follower_altitude_m(_vs_rf, 10.1) == (2.2, "rangefinder") and main.get_follower_altitude_m(_vs_lp, 10.1) == (15.0, "local_position")
+      and main.get_follower_altitude_m(_vs_gp, 10.1) == (14.0, "global_position") and main.get_follower_altitude_m({}, 10.1) == (None, None)
+      and main.get_follower_altitude_m(_vs_gp, 20.0) == (None, None))
+_vf_gp = main.follower_velocity_fru({"global_position": {"vx": 100, "vy": 0, "vz": -20, "timestamp": 10.0}, "attitude": {"yaw": 0.0}}, 10.1)
+check("자기 속도 폴백: LOCAL_POSITION_NED 가 없으면 GLOBAL_POSITION_INT(cm/s)로 — 1.0 m/s 전진·0.2 m/s 상승",
+      np3.allclose(_vf_gp, [1.0, 0.0, 0.2]) and "follower_velocity_fru(vehicle_state, now) if attitude_fresh else None" in _msrc4, f"{_vf_gp}")
+
+# MAVLink: 메시지 간격 요청·STATUSTEXT·COMMAND_ACK·SYSTEM_TIME·거리계·drain 상한·MAVLink2·보레이트 (이전 #11·#3·#47·#4·#54·#65·#49·#53)
+class _IntMaster:
+    def __init__(self): self.calls = []; self.target_system = 1; self.target_component = 1; self.mav = self
+    def request_data_stream_send(self, *a): self.calls.append(("rds", a))
+    def command_long_send(self, *a): self.calls.append(("cmd", a))
+_im = _IntMaster(); _mio.request_data_streams(_im)
+_ints = [c[1] for c in _im.calls if c[0] == "cmd" and c[1][2] == 511]
+check("스트림 요청: REQUEST_DATA_STREAM 3개 + MAV_CMD_SET_MESSAGE_INTERVAL(511) 로 LOCAL_POSITION_NED(32) 10 Hz·SYSTEM_TIME(2) 1 Hz 등 — PX4 도 받는 경로",
+      len([c for c in _im.calls if c[0] == "rds"]) == 3 and any(a[4] == 32.0 and abs(a[5] - 1e5) < 1 for a in _ints) and any(a[4] == 2.0 and abs(a[5] - 1e6) < 1 for a in _ints)
+      and len(_ints) >= 6, f"intervals={len(_ints)}")
+check("스트림 요청: heartbeat 는 오는데 위치 스트림이 없으면 5 s 마다 재요청한다", "STREAM_REREQUEST_SEC" in _msrc4 and "request_data_streams(master)" in _msrc4.split("def main()")[1])
+_m3 = _M2()
+_m3._q = [_OtherMsg("STATUSTEXT", 1, severity=2, text=b"EKF variance\x00\x00"),
+          _OtherMsg("COMMAND_ACK", 1, command=176, result=4),
+          _OtherMsg("SYSTEM_TIME", 1, time_unix_usec=1700000000000000, time_boot_ms=123456),
+          _OtherMsg("DISTANCE_SENSOR", 1, orientation=0, current_distance=150, min_distance=5, max_distance=4000),      # 전방 — 무시
+          _OtherMsg("DISTANCE_SENSOR", 1, orientation=25, current_distance=220, min_distance=5, max_distance=4000)]     # 하향 → 2.2 m
+_mio.drain_messages(_m3); _vs3 = _mio.get_vehicle_state()
+check("MAVLink 메시지: STATUSTEXT(바이트 → 문자열, NUL 제거)·COMMAND_ACK·SYSTEM_TIME 저장, 하향(25) DISTANCE_SENSOR 만 거리계(cm → m)",
+      _vs3["statustext"].get("text") == "EKF variance" and _vs3["statustext"].get("severity") == 2 and _vs3["command_ack"].get("result") == 4
+      and _vs3["system_time"].get("time_boot_ms") == 123456 and abs(_vs3["rangefinder"].get("distance", 0) - 2.2) < 1e-9, f"{_vs3['statustext']} {_vs3['rangefinder']}")
+check("MAVLink 메시지: main 이 GUIDED 이탈 시 최근 STATUSTEXT 를, 모드 변경/NAV_LAND 의 거부 ACK 를 경고로 띄운다",
+      "최근 STATUSTEXT" in _msrc4 and "MAV_CMD_DO_SET_MODE, mavutil.mavlink.MAV_CMD_NAV_LAND" in _msrc4 and '"system_time", "rangefinder"' in _msrc4)
+_m4 = _M2(); _m4._q = [_OtherMsg("ATTITUDE", 1, yaw=float(i), roll=0.0, pitch=0.0, rollspeed=0.0, pitchspeed=0.0, yawspeed=0.0) for i in range(300)]
+_ov0 = _mio.drain_overflows; _mio.drain_messages(_m4)
+check("drain 상한: 한 번에 200개까지만 읽고 나머지는 다음 프레임으로 (overflow 카운터 +1) — 링크 폭주가 제어 루프를 굶기지 않는다",
+      _mio.drain_overflows == _ov0 + 1 and len(_m4._q) == 100 and _mio.DRAIN_MAX_MSGS == 200, f"left={len(_m4._q)}")
+class _V2:
+    def __init__(self, v): self._v = v
+    def mavlink20(self): return self._v
+check("MAVLink2: 연결 뒤 FC 가 v1 이면 경고(alt_ellipsoid 없음), 스텁(mavlink20 없음)은 None; 신원은 source_system/component 에도 남긴다",
+      _mio.mavlink2_active(_V2(True)) is True and _mio.mavlink2_active(_V2(False)) is False and _mio.mavlink2_active(_NoHB()) is None
+      and "master.source_system = int(master.target_system)" in _mio4 and "MAVLink 1 — GPS_RAW_INT 확장 필드" in _mio4)
+check("보레이트: MARS_FC_BAUD 환경변수로 UART 보레이트를 바꿀 수 있다 (기본 115200)", 'int(os.environ.get("MARS_FC_BAUD", "115200"))' in _mio4 and _mio.SERIAL_BAUD == 115200)
+
+# intrinsics 엄격 (이전 #63)
+try:
+    _ug.pixel_to_camera(320, 240, 3.0, {"fy": 384.0, "ppx": 320.0, "ppy": 240.0}); _intr_raised = False
+except ValueError:
+    _intr_raised = True
+check("intrinsics: fx/fy 가 빠지면 ValueError — 384/320/240 기본값으로 조용히 대체하지 않는다 (cx/cy 표기는 허용)",
+      _intr_raised and np3.allclose(_ug.pixel_to_camera(400, 240, 2.0, {"fx": 400.0, "fy": 400.0, "cx": 320.0, "cy": 240.0}), [0.4, 0.0, 2.0]))
+
+# ESP32 상대 속도: 팔로워 속도를 모르면 측정 없음 (이전 #39)
+_FOLLOWER_NOVEL = {k: dict(v) for k, v in _FOLLOWER.items()}
+_mv_novel = build_leader_measurement_from_packet(_pv, _FOLLOWER_NOVEL, now=_pv.rx_time)
+check("ESP32 상대속도 폴백: 팔로워 속도(GLOBAL_POSITION_INT vx/vy/vz)가 없으면 rel_vel_cam=None (예전: 리더 절대 속도를 상대 속도로 넣어 자기 속도만큼 편향), 미션용 절대 속도는 유지",
+      _mv_novel["available"] and _mv_novel["rel_vel_cam"] is None and _mv_novel["rel_vel_enu"] is None and abs(_mv_novel["leader_hspeed"] - 0.3) < 1e-9, f"{_mv_novel.get('rel_vel_cam')}")
+
+# 레버암 (이전 #42 잔여)
+_saved_off = main._CAM_OFFSET_FRD; main._CAM_OFFSET_FRD = np3.array([0.10, 0.0, 0.05])
+_la_pos = main.camera_to_level_fru([0.0, 0.0, 3.0], 0.0, 0.0, position=True); _la_vel = main.camera_to_level_fru([0.0, 0.0, 3.0], 0.0, 0.0)
+main._CAM_OFFSET_FRD = _saved_off
+check("레버암: camera.mount_offset_frd_m 은 상대 위치에만 더해진다 (앞 0.10·아래 0.05 → front 3.10, up −0.05), 속도 변환은 그대로",
+      np3.allclose(_la_pos, [3.10, 0.0, -0.05]) and np3.allclose(_la_vel, [3.0, 0.0, 0.0]) and "mount_offset_frd_m" in CONFIG["camera"], f"{_la_pos}")
+
+# 루프 소스 검사: 게이트 거부 코스트·회피 래치 해제·치명 FC 종료 (이전 #55·#59·#1)
+check("게이트 거부 코스트: 거부 프레임도 coast_time 을 센다 — 2 s 뒤 is_reliable 이 꺼져 재획득 힌트가 틀린 예측에 갇히지 않는다",
+      'if update_used.startswith("gate_reject") and ekf.initialized:\n                ekf.on_lost(dt)' in _msrc4)
+check("회피 래치 해제: allow_follow 가 아닌 동안 매 프레임 래치를 푼다 (재개 시 리더 쪽으로 비켜서던 결함)",
+      "else:\n                reset_evade_side()" in _msrc4.split("# ---------------- 명령 ----------------")[1][:600])
+check("문서 수정: BODY_NED docstring(기체 FRD 아님), 8 m GPS 이격의 D435i 범위 주석, README PX4 '검증' 과장 정정",
+      "BODY_NED 는 기체 FRD 가 아니다" in _msrc4 and "PX4 SITL로 검증" not in open("README.md", encoding="utf-8").read()
+      and "6 m 안으로" in _msrc4)
 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "

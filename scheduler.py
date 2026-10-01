@@ -9,7 +9,7 @@ IMM 상태 공분산 P를 영상 평면에 투영해 ROI 크기를 정하고, IM
 import numpy as np
 
 from config import CONFIG
-from utils_geometry import camera_to_pixel, make_square_roi
+from utils_geometry import _intr, camera_to_pixel, make_square_roi
 
 CHI2_2D_99 = 9.21          # chi-square df=2, p=0.99
 MIN_PIXEL_VAR = 4.0 ** 2   # detector bbox center noise 하한
@@ -86,8 +86,7 @@ class PerceptionScheduler:
         """P[:3,:3] 을 u = fx·X/Z + cx, v = fy·Y/Z + cy 의 야코비안으로 영상 평면에 투영."""
         X, Y, Z = float(x[0]), float(x[1]), float(x[2])
         Z = max(Z, 1e-4)
-        fx = intrinsics.get("fx", 384.0)
-        fy = intrinsics.get("fy", 384.0)
+        fx, fy, _, _ = _intr(intrinsics)          # 누락 시 예외 (조용한 384 기본값 없음)
         J = np.array([[fx / Z, 0.0, -fx * X / (Z * Z)],
                       [0.0, fy / Z, -fy * Y / (Z * Z)]], dtype=float)
         P_pos = 0.5 * (P[:3, :3] + P[:3, :3].T)

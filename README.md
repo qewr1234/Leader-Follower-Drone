@@ -28,8 +28,8 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **제어 정확도** | 초기 설계(KP 0.22, 피드포워드 없음)에서 리더 0.3 m/s 추종 정상상태 거리 **4.3 m — 이론값 4.36 m 와 소수 둘째 자리 일치**. 현재 설계(KP 0.30, KFF 0.8, KV 0.3) 이론값 3.63 m, SITL 재실측 전 |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측). `lost_action` 설정으로 hold/rtl 선택 가능 |
-| **회귀 스위트** | 단위 검사 250개 + SITL 시나리오 11개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
-| **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
+| **회귀 스위트** | 단위 검사 293개 + SITL 시나리오 11개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
+| **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원. PX4 는 SITL 에서 `set_mode` 경로(3-튜플 mode_mapping) 1건만 확인했고 OFFBOARD 추종은 미검증 |
 
 ## 추종 동작과 Fail-safe
 
@@ -121,7 +121,8 @@ D435i (color+depth, 640×480@30)
 ## 안전 설계
 
 비행 안전과 관련된 동작은 SITL 에서 실제 비행으로 검증했고, 2026-10-01 감사로 추가한 항목(고도 바닥 fail-closed, 수직 판정,
-재획득, yaw 불연속, 단조 시계, 소실 정책 설정, 예외 시 송신 유지·재연결, heartbeat·sysid, 게이트 분리, 레벨링, 최대 거리·천장·램프, 워치독, sysid 필터, 로그 로테이션)은 아직 단위 검사와 폐루프 시뮬레이션까지입니다.
+재획득, yaw 불연속, 단조 시계, 소실 정책 설정, 예외 시 송신 유지·재연결, heartbeat·sysid, 게이트 분리, 레벨링, 최대 거리·천장·램프, 워치독, sysid 필터, 로그 로테이션,
+코스트 페이드, 초기화 확인, 최근접 깊이 군집, 거리 의존 R, 장벽 재확인, 고도 출처 폴백, STATUSTEXT/ACK, 설정 검증)은 아직 단위 검사와 폐루프 시뮬레이션까지입니다.
 
 - **조종사가 항상 이깁니다.** 컴패니언은 FC 모드를 매 루프 확인하고, GUIDED/OFFBOARD가
   아니면 모드 변경 명령을 보내지 않습니다. 조종사가 LOITER로 탈환하면 그대로 유지됩니다
@@ -130,8 +131,19 @@ D435i (color+depth, 640×480@30)
   깊이 센서만 죽고 검출이 살아 있는 교묘한 경우까지 거리 기준(`range_coast_time`)으로 잡습니다.
 - **이륙 인계가 안전합니다.** 수동 상승 후 GUIDED로 넘기는 순간 미션·명령 버퍼를 리셋해
   깨끗한 상태로 추종을 시작합니다 (SITL 검증).
-- **고도 바닥.** `MIN_AGL_M`(1.5 m, home 기준) 아래에서는 하강 명령을 차단합니다. 고도를 모르면(LOCAL_POSITION_NED 가 낡음)
-  열어 두지 않고 막습니다(fail-closed) — 트래커가 지면의 무언가를 물고 내려가는 상황이 바로 고도 스트림까지 의심스러운 상황이기 때문입니다.
+- **고도 바닥.** `MIN_AGL_M`(1.5 m) 아래에서는 하강 명령을 차단합니다. 고도 출처는 하향 거리계(RANGEFINDER/DISTANCE_SENSOR, 진짜 AGL) →
+  LOCAL_POSITION_NED → GLOBAL_POSITION_INT relative_alt(뒤 둘은 home 기준) 순이고, 셋 다 없거나 낡으면 열어 두지 않고 막습니다(fail-closed) —
+  트래커가 지면의 무언가를 물고 내려가는 상황이 바로 고도 스트림까지 의심스러운 상황이기 때문입니다. 자기 속도도 같은 순서로 폴백합니다.
+- **거리 측정이 끊기면 서서히 멈춥니다.** 마지막 깊이 측정 뒤 0.3 초까지는 그대로, 2 초(소실 판정)에 0 이 되도록 추종 항을 줄입니다.
+  예전에는 외삽 추정으로 2 초 동안 전진하다 LOST_HOLD 에서 계단으로 섰습니다. 이격 장벽·회피·yaw 는 줄이지 않습니다.
+- **추정기는 한 프레임으로 시작하지 않습니다.** 연속 3 프레임의 깊이 측정이 0.75 m 안에 있어야 초기화하고, 새 트랙은 검출 신뢰도 0.40 이상으로만
+  시작합니다(추적 중 매칭은 0.25). 깊이는 bbox 안쪽 ROI 에서 **가장 가까운 군집**의 median 입니다 — 배경 화소가 과반이어도 배경에 앉지 않습니다.
+- **최소 이격 장벽은 포화 뒤에도 성립합니다.** 축별 속도 포화가 시선 방향 성분을 키울 수 있어(예전 재현: 1.7 m 에서 +0.09 m/s 접근), 포화 뒤
+  장벽을 다시 확인해 바닥 안에서는 접근 명령이 나가지 않습니다.
+- **FC 의 말을 듣습니다.** STATUSTEXT 를 콘솔에 띄우고 GUIDED 이탈 시 최근 메시지를 함께 보여 조종사 탈환과 FC failsafe 를 구별합니다. 모드 변경·
+  NAV_LAND 의 COMMAND_ACK 가 거부면 경고합니다. 데이터 스트림은 REQUEST_DATA_STREAM 과 MAV_CMD_SET_MESSAGE_INTERVAL 두 경로로 요청하고(PX4 도
+  LOCAL_POSITION_NED 를 보내게), 위치 스트림이 끊기면 5 초마다 재요청합니다. MAVLink 1 링크면 경고합니다.
+- **설정은 시동 때 검증합니다.** `config.validate_config` 가 최소 이격 < 목표 이격, KFF < 1, 깊이 범위, 이득 부호 같은 모순을 잡아 비행 전에 멈춥니다.
 - **수직으로 움직이는 리더도 따라갑니다.** 출발·호버 판정이 수평·수직을 합친 3차원 움직임이고 `MAX_VZ` 가 0.25 m/s 입니다.
   예전에는 수평 속도만 봐서 리더가 1.3 m 만 오르내려도 수직 시야(±21°)를 벗어나 소실 착륙으로 갔습니다. 수직 속도 상한은 '리더 운용 제한' 표.
 - **트랙을 잃은 뒤에는 추정기가 예측하는 자리에서만 다시 잡습니다.** 추정기가 믿을 수 있는 동안(코스팅 2 초 안)은 예측 화소 위치
@@ -166,8 +178,9 @@ D435i (color+depth, 640×480@30)
   정면 후퇴로는 원리적으로 벗어날 수 없기 때문입니다. 0.7 m/s 정면 접근에서 회피가 없으면 접촉, 있으면 0.41m
   (오프라인 모의). 여유 0.4m 는 안전하다는 뜻이 아니라 이 속도 제한에서의 최선입니다.
 - **GPS만으로는 붙지 않습니다.** 카메라 깊이가 끊기고 ESP32 GPS 상대위치만 남으면 이격을
-  3m에서 8m(`TARGET_DISTANCE_GPS_ONLY_M`)로 넓힙니다 — GPS 상대오차는 m 단위라 3m는
-  오차보다 작고, 8m는 깊이창(10m) 안이라 리더가 다시 보이면 비전이 이어받습니다.
+  3m에서 8m(`TARGET_DISTANCE_GPS_ONLY_M`)로 넓힙니다 — GPS 상대오차는 m 단위라 3m는 오차보다 작습니다. 8 m 는 D435i 의 실용
+  깊이 범위(약 6 m) 밖이라 그 거리에서 비전이 바로 이어받는 것은 아니고, 리더가 다시 6 m 안으로 들어올 때 깊이가 살아나 3 m 로 램프합니다.
+  더 줄이면 GPS 오차(2~5 m)가 최소 이격 2 m 를 침범하므로 8 m 를 유지합니다.
 - **기본값이 dry-run.** `SEND_MAVLINK_COMMANDS = False`가 기본이라, 켜기 전까지는 인지·추정·
   화면 표시가 전부 돌면서 명령은 전송되지 않습니다.
 - **카메라 hiccup 내성.** 프레임 드롭은 드롭으로 처리하고, 헤드리스(`MARS_SHOW_WINDOW=0`)
@@ -189,7 +202,7 @@ D435i (color+depth, 640×480@30)
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 250개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 293개 — numpy만 있으면 됨
 python3 test_closed_loop.py    # 폐루프 특성화 — 가짜 FC·가짜 시계로 실제 main.main() 결정론 실행 (--dump/--compare)
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 python3 analysis/stability_margins.py --plots   # 분석 층: 바깥 루프 선형 모델의 여유·스트링 안정성 (matplotlib)
@@ -212,7 +225,7 @@ python3 analysis/trace_check.py                 # 요구도 ↔ 검사 추적성
 주파수를 자극하지 않아 SITL 8개가 전부 통과했던 것입니다. 원인(자기 속도와 EKF 상대속도의 지연 불일치)과 수정
 (피드포워드 저역통과 2 s + 자기 속도 정합 필터 0.3 s + 소프트 데드존 → 14.4 dB, 1.13배)은
 [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) 에 있고, 정현파 리더 SITL 시나리오 `leader_sine` 이 이를
-ArduCopter 에서 검사합니다(실측: 09-18 설계 0.72배, 수정 전 코드 1.95배로 FAIL; 현재 설계는 재실행 전). 요구도 78개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
+ArduCopter 에서 검사합니다(실측: 09-18 설계 0.72배, 수정 전 코드 1.95배로 FAIL; 현재 설계는 재실행 전). 요구도 88개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 의 추적성 표에 있습니다.
 
 그리고 모든 시나리오는 **차등 검증**입니다 — 수정 전 코드에도 같은 시나리오를 돌려 대조군에서
@@ -241,7 +254,8 @@ python3 test_fixes.py          # 단위 회귀 (하드웨어 불필요)
 python3 main.py
 ```
 
-`MARS_FC_PORT` 환경변수로 FC 포트를 바꿀 수 있습니다(기본 `/dev/ttyACM0`).
+`MARS_FC_PORT` 환경변수로 FC 포트를 바꿀 수 있습니다(기본 `/dev/ttyACM0` — USB 재열거로 번호가 바뀔 수 있으니
+`/dev/serial/by-id/usb-…` 경로를 권장). 텔레메트리 UART 로 붙이면 `MARS_FC_BAUD` 를 FC 의 `SERIALn_BAUD` 와 맞춥니다(기본 115200).
 SITL에 직접 붙이려면 `MARS_FC_PORT=udpin:0.0.0.0:14551 python3 main.py`.
 
 키: `q`/`ESC` 종료 · `v` MAVLink 송신 토글 · `l` LAND · `h` HOLD
@@ -331,12 +345,14 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `FS_GCS_ENABLE` | 운용 결정 | 컴패니언 heartbeat 는 GCS sysid(255)가 아니라 이 값은 실제 GCS 링크에만 작용한다. 켜면 GCS 끊김 → RTL 로 추종이 끝난다 |
 | `SYSID_ENFORCE` | 0 (기본 유지) | 컴패니언은 기체 sysid + compid 191 로 보낸다. 1 이면 MAV_GCS_SYSID(255)가 아닌 발신자의 명령을 전부 버린다 |
 | `SYSID_THISMAV` | 팔로워 1 / 리더 2 | 리더에 MAVLink FC 를 얹을 경우 텔레메트리가 섞이지 않게 |
-| `SERIALn_PROTOCOL` | 2 (MAVLink2) | GPS_RAW_INT 확장 필드(alt_ellipsoid 등) 수신 |
+| `SERIALn_PROTOCOL` | 2 (MAVLink2) | GPS_RAW_INT 확장 필드(alt_ellipsoid 등) 수신. 1 이면 컴패니언이 시동 로그에 경고 |
+| `RNGFND1_TYPE` 등 | 하향 거리계가 있으면 설정 | 있으면 고도 바닥이 home 기준이 아니라 진짜 AGL(RANGEFINDER/DISTANCE_SENSOR)을 씁니다 |
 
 PX4 로 운용하면: `COM_OF_LOSS_T` 1.0 유지, `COM_OBL_RC_ACT` 기본 0(Position) 은 조종사 즉시 개입 전제(무인 운용이면 5 Land / 6 Hold),
-`NAV_RCL_ACT` 2(Return), `COM_LOW_BAT_ACT` 2 또는 3, `GF_ACTION`·`GF_MAX_VER_DIST`·`GF_MAX_HOR_DIST`, 그리고 컴패니언 포트의
-`MAV_x_MODE` 를 Onboard 로 해 LOCAL_POSITION_NED 가 10 Hz 이상 나오게 합니다(없으면 자기 속도·고도 바닥이 꺼집니다 — 고도를
-모르면 하강이 막히므로 하강 추종이 되지 않습니다).
+`NAV_RCL_ACT` 2(Return), `COM_LOW_BAT_ACT` 2 또는 3, `GF_ACTION`·`GF_MAX_VER_DIST`·`GF_MAX_HOR_DIST`. 컴패니언은 연결 시
+`MAV_CMD_SET_MESSAGE_INTERVAL` 로 LOCAL_POSITION_NED/ATTITUDE/GLOBAL_POSITION_INT 10 Hz 를 요청하고 끊기면 5 초마다 재요청하므로 포트 프로파일과
+무관하게 오는 것이 정상입니다 — 그래도 STAT 의 `fresh=LP0` 가 이어지면 컴패니언 포트의 `MAV_x_MODE` 를 Onboard 로 하십시오. LOCAL_POSITION_NED 가 없어도
+GLOBAL_POSITION_INT 의 relative_alt·속도로 고도 바닥과 자기 속도가 동작합니다(home 기준).
 
 ## 모듈
 
@@ -354,7 +370,7 @@ PX4 로 운용하면: `COM_OF_LOSS_T` 1.0 유지, `COM_OBL_RC_ACT` 기본 0(Posi
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회, 실외 노출 옵션·AE 측광 ROI) |
 | `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | 단위 회귀 250개 (하드웨어·FC 불필요) |
+| `test_fixes.py` | 단위 회귀 293개 (하드웨어·FC 불필요) |
 | `test_closed_loop.py` | 폐루프 특성화 테스트 — 가짜 FC·가짜 시계로 실제 `main.main()` 결정론 실행, `--dump`/`--compare`로 리팩토링 전후 스트림 비교 |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 | `docs/images/` | README 다이어그램(SVG) |
@@ -363,6 +379,6 @@ PX4 로 운용하면: `COM_OF_LOSS_T` 1.0 유지, `COM_OBL_RC_ACT` 기본 0(Posi
 
 - [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
 - [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) — 바깥 루프 선형 모델, 위상·이득 여유, 스트링 안정성, 체인 시뮬레이션, 개선안
-- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 78개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
+- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 88개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
 - [docs/images/README.md](docs/images/README.md) — README 그림 파일과 수정 방법
