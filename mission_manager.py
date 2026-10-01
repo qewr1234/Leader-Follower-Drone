@@ -89,6 +89,10 @@ class MissionManager:
 
         self.last_seen_t = now
         hspeed, vz, z_for_landing = self._extract_motion(rel_vel_est, leader_alt, leader_vel_world, leader_vel_body)
+        # 출발·호버 판정은 3차원 움직임으로 한다. 수평 속도만 보면 수직으로만 오르내리는 리더는 영원히 '정지' 라
+        # 추종이 시작되지 않고(allow_follow False → 수직 명령 0), 수직 FOV(±21°, 3 m 에서 ±1.2 m)를 벗어나 소실 착륙으로
+        # 간다(2026-10-01 감사 1번). 착륙 판정(아래)은 그대로 수평 정지 + 하강을 본다.
+        motion_speed = max(hspeed, abs(vz))
 
         # 추정 불확실성이 너무 크면 FOLLOW 금지
         if pos_cov_trace > 8.0:
@@ -110,7 +114,7 @@ class MissionManager:
             return self._go(S_LANDING_CANDIDATE)
         self.landing_candidate_t = None
 
-        started_like = hspeed > self.start_speed_thresh
+        started_like = motion_speed > self.start_speed_thresh
 
         # 출발 확인: start_confirm_sec 동안 움직여야 FOLLOW
         if self.state in (S_WAIT_LEADER, S_READY_HOVER):
@@ -124,7 +128,7 @@ class MissionManager:
         # FOLLOW ↔ LEADER_HOVER 히스테리시스 (진입 0.18, 복귀 0.25 m/s). 선두 절대 속도 기준이라 따라잡아서
         # 상대속도가 줄어도 FOLLOW 가 유지된다. 둘 다 allow_follow 라 폴백(상대 속도)으로 오판해도 제어는 안 끊긴다.
         if self.state in (S_FOLLOW, S_LEADER_HOVER):
-            if self.state == S_FOLLOW and hspeed < self.hover_speed_thresh:
+            if self.state == S_FOLLOW and motion_speed < self.hover_speed_thresh:
                 return self._go(S_LEADER_HOVER)
             if self.state == S_LEADER_HOVER and started_like:
                 return self._go(S_FOLLOW)
@@ -143,7 +147,8 @@ class MissionManager:
         return dict(_POLICY.get(self.state, _POLICY_UNKNOWN))
 
     def _extract_motion(self, rel_vel_est, leader_alt, leader_vel_world, leader_vel_body=None):
-        """(수평 속도, 수직 속도(up +), 착륙 판정용 고도). 속도 소스 우선순위: ESP32 절대(ENU) > EKF 상태 절대 속도(FRU) > 상대."""
+        """(수평 속도, 수직 속도(up +), 착륙 판정용 고도). 속도 소스 우선순위: ESP32 절대(ENU) > EKF 상태 절대 속도(FRU) > 상대.
+        ESP32 패킷에 속도가 없으면 main 이 leader_vel_world=None 으로 주므로 EKF 속도로 떨어진다."""
         v = leader_vel_world if leader_vel_world is not None else (leader_vel_body if leader_vel_body is not None else rel_vel_est)
         hspeed = vz = 0.0
         if v is not None:

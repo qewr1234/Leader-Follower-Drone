@@ -62,6 +62,7 @@ class LeaderPacket:
     rx_time: float
     seq: int = -1
     alt_frame: str = "AMSL"       # "AMSL" | "ELLIPSOID"
+    has_velocity: bool = True     # vx/vy/vz 가 패킷에 있었는가. False 면 vx/vy/vz 는 0 이고 속도는 쓰면 안 된다.
 
 
 # ============================================================
@@ -230,10 +231,10 @@ _ALT_FIELDS = (
 def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[LeaderPacket]:
     try:
         d = json.loads(text)
-        now = time.time()
+        now = time.monotonic()      # rx_time 은 main 의 루프 시계(단조)와 같은 시계여야 age 계산이 맞는다
 
-        # alias 지원
-        timestamp = float(_get_any(d, ["timestamp", "time", "t", "ts"], now))
+        # alias 지원. timestamp 는 리더 쪽 시각(로그용)이라 없으면 벽시계.
+        timestamp = float(_get_any(d, ["timestamp", "time", "t", "ts"], time.time()))
 
         lat = float(_get_any(d, ["lat", "latitude"]))
         lon = float(_get_any(d, ["lon", "lng", "longitude"]))
@@ -250,9 +251,11 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
         if alt_frame not in ("AMSL", "ELLIPSOID"):
             raise ValueError(f"unknown alt frame {alt_frame}")
 
-        vx = float(_get_any(d, ["vx", "vel_x", "v_east"], 0.0))
-        vy = float(_get_any(d, ["vy", "vel_y", "v_north"], 0.0))
-        vz = float(_get_any(d, ["vz", "vel_z", "v_up"], 0.0))
+        # 속도 세 키가 모두 없으면 '속도 없음' 으로 표시한다. 0 으로 채우면 미션이 ESP32 속도를 최우선으로 읽어
+        # 리더를 '정지' 로 판정해 FOLLOW 에 들어가지 못한다(2026-10-01 감사 9번).
+        v_raw = [_get_any(d, k) for k in (["vx", "vel_x", "v_east"], ["vy", "vel_y", "v_north"], ["vz", "vel_z", "v_up"])]
+        has_velocity = any(v is not None for v in v_raw)
+        vx, vy, vz = (float(v) if v is not None else 0.0 for v in v_raw)
 
         roll = float(_get_any(d, ["roll", "r"], 0.0))
         pitch = float(_get_any(d, ["pitch", "p"], 0.0))
@@ -274,6 +277,7 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
             rx_time=now,
             seq=seq,
             alt_frame=alt_frame,
+            has_velocity=has_velocity,
         )
 
     except Exception:
@@ -450,7 +454,7 @@ def build_leader_measurement_from_packet(
         leader_hspeed
         roll/pitch/yaw
     """
-    now = time.time() if now is None else float(now)
+    now = time.monotonic() if now is None else float(now)
 
     if packet is None:
         return {"available": False, "reason": "no_leader_packet"}
@@ -498,35 +502,37 @@ def build_leader_measurement_from_packet(
     rel_fru = enu_to_body_fru(rel_enu, follower_yaw)
     rel_cam = fru_to_camera_xyz(rel_fru)
 
-    # leader velocity
-    if leader_velocity_frame.upper() == "ENU":
-        leader_vel_enu = np.array([packet.vx, packet.vy, packet.vz], dtype=float)
-
-    elif leader_velocity_frame.upper() == "NED":
-        # NED [north, east, down] → ENU [east, north, up]
-        n, e, d = packet.vx, packet.vy, packet.vz
-        leader_vel_enu = np.array([e, n, -d], dtype=float)
-
-    else:
-        raise ValueError("leader_velocity_frame must be 'ENU' or 'NED'")
-
-    # 상대속도 = 선두 속도 − 후미 속도. EKF 상태 속도는 리더 절대 속도지만 속도 측정의 관측 모델이
-    # h(x) = v − v_ego (ImmEkf.update_velocity3d)라 측정은 상대속도로 넘긴다(힌트가 아니라 게이트 있는 정규 측정).
-    # 후미 속도를 모르면 아래 폴백에서 리더 절대 속도가 그대로 들어가 자기 속도만큼 편향된다.
+    # leader velocity. 패킷에 속도가 없으면 속도 관련 값은 전부 None — main 은 미션을 EKF 속도로 돌리고 속도 측정 갱신을 건너뛴다.
+    leader_vel_enu = rel_vel_enu = rel_vel_fru = rel_vel_cam = None
+    leader_hspeed = leader_vz_up = None
     follower_vel_enu = _follower_vel_enu_from_mavlink(follower_vehicle_state)
+    if getattr(packet, "has_velocity", True):
+        if leader_velocity_frame.upper() == "ENU":
+            leader_vel_enu = np.array([packet.vx, packet.vy, packet.vz], dtype=float)
 
-    if follower_vel_enu is not None:
-        rel_vel_enu = leader_vel_enu - follower_vel_enu
-    else:
-        # follower 속도를 모르면 기존처럼 leader 속도로 fallback
-        rel_vel_enu = leader_vel_enu
+        elif leader_velocity_frame.upper() == "NED":
+            # NED [north, east, down] → ENU [east, north, up]
+            n, e, d = packet.vx, packet.vy, packet.vz
+            leader_vel_enu = np.array([e, n, -d], dtype=float)
 
-    rel_vel_fru = enu_to_body_fru(rel_vel_enu, follower_yaw)
-    rel_vel_cam = fru_to_camera_xyz(rel_vel_fru)
+        else:
+            raise ValueError("leader_velocity_frame must be 'ENU' or 'NED'")
 
-    # 미션(출발/호버/착륙) 판단용은 선두의 "절대" 속도
-    leader_hspeed = float(np.linalg.norm(leader_vel_enu[:2]))
-    leader_vz_up = float(leader_vel_enu[2])
+        # 상대속도 = 선두 속도 − 후미 속도. EKF 상태 속도는 리더 절대 속도지만 속도 측정의 관측 모델이
+        # h(x) = v − v_ego (ImmEkf.update_velocity3d)라 측정은 상대속도로 넘긴다(힌트가 아니라 게이트 있는 정규 측정).
+        # 후미 속도를 모르면 아래 폴백에서 리더 절대 속도가 그대로 들어가 자기 속도만큼 편향된다.
+        if follower_vel_enu is not None:
+            rel_vel_enu = leader_vel_enu - follower_vel_enu
+        else:
+            # follower 속도를 모르면 기존처럼 leader 속도로 fallback
+            rel_vel_enu = leader_vel_enu
+
+        rel_vel_fru = enu_to_body_fru(rel_vel_enu, follower_yaw)
+        rel_vel_cam = fru_to_camera_xyz(rel_vel_fru)
+
+        # 미션(출발/호버/착륙) 판단용은 선두의 "절대" 속도
+        leader_hspeed = float(np.linalg.norm(leader_vel_enu[:2]))
+        leader_vz_up = float(leader_vel_enu[2])
 
     return {
         "available": True,

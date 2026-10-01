@@ -20,6 +20,7 @@ class LeaderTracker:
         self.recover_gate_frames = int(recover_gate_frames)
         self.track = None
         self.next_id = 1
+        self.gate_reject_streak = 0   # 추정기 3-D 게이트가 이 트랙의 거리 측정을 연속으로 거부한 횟수 (main 이 되먹임)
 
     def predict_only(self):
         """
@@ -33,11 +34,22 @@ class LeaderTracker:
         tr["detector_skipped"] = True
         return tr
 
-    def update(self, detections: List[Dict]) -> Optional[Dict]:
+    def update(self, detections: List[Dict], reacquire_hint=None) -> Optional[Dict]:
+        """detections: 검출 목록. reacquire_hint: 트랙이 없을 때만 쓰는 ((u, v), 반경 px) — 추정기가 예측하는 리더 화소 위치.
+        힌트가 있으면 그 반경 안의 검출 중 예측점에 가장 가까운 것으로만 새 트랙을 만들고, 안에 아무것도 없으면 트랙을 만들지
+        않는다(화면 어딘가의 더 큰 물체로 신원이 넘어가는 것을 막는다). 힌트가 없으면(추정기 미초기화·코스팅 만료) 예전처럼
+        면적×신뢰도 최대 검출로 시작한다."""
         if self.track is None:
             if not detections:
                 return None
-            self.track = self._new_track(self._choose_initial(detections))
+            if reacquire_hint is not None:
+                det = self._choose_near(detections, *reacquire_hint)
+                if det is None:
+                    return None
+            else:
+                det = self._choose_initial(detections)
+            self.track = self._new_track(det)
+            self.gate_reject_streak = 0
             return self.track.copy()
 
         best_det = self._match(detections)
@@ -63,6 +75,7 @@ class LeaderTracker:
         old = self.track.copy()
         if self.track["lost_count"] > self.max_lost:
             self.track = None
+            self.gate_reject_streak = 0
         return old
 
     def _match(self, detections):
@@ -104,8 +117,34 @@ class LeaderTracker:
         max_move = diag * (0.75 + 0.75 * grow)
         return math.hypot(dx - px, dy - py) <= max_move
 
+    def note_gate_accept(self):
+        """추정기가 이 트랙의 거리 측정을 받아들였다."""
+        self.gate_reject_streak = 0
+
+    def note_gate_reject(self, drop_after: int):
+        """추정기가 거리 측정을 거부했다. 연속 drop_after 회면 트랙을 버린다 — 다음 프레임에 reacquire_hint 로 다시 잡는다.
+        (예전에는 거부가 트래커에 돌아오지 않아, 거부된 물체를 IoU 로 계속 붙들고 진짜 리더는 후보조차 되지 않았다.)"""
+        self.gate_reject_streak += 1
+        if self.track is not None and self.gate_reject_streak >= int(drop_after):
+            self.track = None
+            self.gate_reject_streak = 0
+            return True
+        return False
+
     def _choose_initial(self, detections):
         return max(detections, key=lambda d: d.get("area", 0) * max(d.get("conf", 0.0), 0.01))
+
+    @staticmethod
+    def _choose_near(detections, center, radius_px):
+        """center 에서 radius_px 안에 있는 검출 중 가장 가까운 것. 없으면 None."""
+        cx, cy = center
+        best, best_d = None, float("inf")
+        for det in detections:
+            dx, dy = bbox_center(det["bbox"])
+            d = math.hypot(dx - cx, dy - cy)
+            if d <= radius_px and d < best_d:
+                best, best_d = det, d
+        return best
 
     def _new_track(self, det):
         tr = det.copy()

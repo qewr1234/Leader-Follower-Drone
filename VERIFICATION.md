@@ -19,7 +19,7 @@
 소스에서 이유를 찾습니다. C5가 그 사례입니다(아래).
 
 ```bash
-python3 test_fixes.py                        # 단위 181개, 하드웨어 불필요
+python3 test_fixes.py                        # 단위 207개, 하드웨어 불필요
 python3 analysis/stability_margins.py        # 안정성 여유 분석 (docs/STABILITY_MARGINS.md)
 python3 analysis/trace_check.py              # 요구도 추적성 (docs/REQUIREMENTS.md)
 python3 sitl/harness.py --all                # SITL 11개 시나리오 (px4_setmode 는 PX4 필요)
@@ -47,7 +47,7 @@ python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 
 ## 수정 완료 (2026-09-07)
 
-`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 181개). 하드웨어 없이 순수 로직만 검증합니다.
+`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 207개). 하드웨어 없이 순수 로직만 검증합니다.
 
 ### C1 — 부팅 즉시 FAILSAFE_LAND
 
@@ -482,9 +482,36 @@ NaN 이 `ego_rotation_cam` → `compensate_ego_rotation` 을 거쳐 EKF 상태 �
 없는 한계입니다. 요구도 FCR-17 을 이 범위로 고쳐 적었고, `회피 경계:` 검사가 세 점(straight 0.7 통과, pursuit 0.4 통과,
 pursuit 0.7 접촉)을 고정합니다. 그 위는 `MAX_V*` 인상 또는 리더 운용 절차의 몫입니다.
 
+### 첫 비행 전 7가지 (2026-10-01 감사의 우선순위 1군, 같은 날 적용)
+
+`docs/AUDIT_2026-10-01.md` 2절의 "첫 실비행 전" 일곱 항목을 적용했습니다. 단위 검사 26개를 추가했고(총 207), 폐루프 setpoint
+스트림은 수정 전 골든과 **바이트 단위로 같습니다** — 기존 시나리오(수평 이동 리더, 같은 고도, yaw 불연속 없음)에서는 어느 변경도
+명령을 바꾸지 않는다는 뜻이고, 새 동작은 단위 검사가 재현합니다.
+
+1. **수직 판정 + MAX_VZ 0.12 → 0.25.** 출발·호버 판정이 `max(hspeed, |vz|)` 를 봅니다(`mission_manager.update`). 수직으로만
+   0.5 m/s 움직이는 리더가 FOLLOW 에 들어가고(`미션 수직:`), 착륙 판정은 그대로 수평 정지 + 하강입니다. 리더 수직속도 상한은 README
+   '리더 운용 제한' 에 적었습니다 — 넘으면 여전히 소실입니다.
+2. **재획득·거부 되먹임·bearing 폴백.** `main.reacquire_hint` 가 추정기 예측 화소 + 99 % 타원 반경 + 60 px 를 주면 `LeaderTracker.update`
+   가 그 안의 검출로만 새 트랙을 만들고(안에 없으면 트랙 없음), `note_gate_reject` 가 3-D 게이트 연속 3회 거부에 트랙을 버립니다.
+   `fuse_vision` 은 게이트가 거부한 측정의 bearing 을 더 이상 쓰지 않습니다(`bearing_after_rgbd_gate` 경로 삭제). 추정기가 2 초 넘게
+   코스팅해 믿을 수 없으면 힌트가 없어져 예전처럼 전체 화면에서 고릅니다(`재획득:` 8개).
+3. **고도 바닥 fail-closed.** `enforce_agl_floor` 가 고도를 모르면(LOCAL_POSITION_NED 낡음) 하강을 막습니다. 대가는 LOCAL_POSITION_NED 를
+   안 주는 FC 설정(PX4 기본 포트)에서 하강 추종이 안 되는 것 — 상승·수평은 됩니다(`AGL 바닥:`).
+4. **키 게이트.** `l` 은 `fc_accepts_setpoints` 일 때만, `v` ON 은 GUIDED 진입과 같은 리셋, OFF 는 HOLD 한 번(`키 게이트:`). 재현: dry-run 중
+   리더를 10 s 놓쳐 FAILSAFE_LAND 로 래치된 뒤 `v` 를 켜면 같은 프레임에 LAND 가 나갔습니다.
+5. **ATTITUDE yaw 불연속 + ESP32 속도 누락.** `attitude_jump` 가 yawspeed·Δt 예측과 0.2 rad 넘게 어긋나는 yaw 변화(yawspeed 가 없으면
+   0.3 rad)를 센서 불연속으로 보고 그 프레임의 보상을 건너뜁니다(`자세 불연속:` 5개). `parse_leader_json` 은 vx/vy/vz 가 모두 없으면
+   `has_velocity=False` 로 표시하고, 측정의 속도 값은 None 이 되어 미션은 EKF 속도로, 속도 갱신은 생략됩니다(`ESP32 속도 없음:`).
+6. **FC 파라미터 체크리스트.** README '운용 순서' 에 ArduCopter 표와 PX4 항목, '리더 운용 제한' 표를 넣었습니다(OPS-05).
+7. **단조 시계.** 루프·신선도·setpoint 스케줄·`mavlink_io` timestamp·ESP32 `rx_time` 이 전부 `time.monotonic()` 입니다. 벽시계는 로그의
+   `time` 열과 리더 `timestamp` 기본값에만 남습니다. 폐루프 검사의 가짜 시계도 `monotonic()` 을 줍니다(`단조 시계:`).
+
+바뀌지 않은 것: 소실 10 s 뒤 LAND 정책(감사 6번, 운용 결정 필요), 카메라/FC 예외 시 setpoint 송신을 건너뛰는 continue/break 구조,
+heartbeat·sysid, 신뢰도가 게이트를 넓히는 구조, 레벨링. 전부 `docs/AUDIT_2026-10-01.md` 2절 '다음 단계' 에 있습니다.
+
 ## 요구도 추적성 (2026-09-18)
 
-[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 에 요구도 63개(FCR 17 · EST 15 · SAF 16 · IF 11 · OPS 4)를 ID 로 두고
+[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 에 요구도 68개(FCR 17 · EST 16 · SAF 18 · IF 12 · OPS 5)를 ID 로 두고
 각각을 `test_fixes.py` 검사 이름, `test_closed_loop.py` 검사, SITL 시나리오, 분석 결과 키, 소스 문자열로 묶었습니다.
 `analysis/trace_check.py` 가 참조가 실제로 존재하는지 대조하고(`추적성:` 단위 검사), 폐루프 검사 14개는 전부
 요구도에 연결돼 있습니다. 미충족 1개(EST-12 검출률), 미검증 2개(실비행, ESP32 펌웨어), 부분 7개(SAF-05 공중 인계 미검증, SAF-06/SAF-10 시나리오 부재, FCR-07·EST-02 단위 검사 부족, EST-10/11 실기 자료 부재)가 표 3절에

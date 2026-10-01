@@ -28,7 +28,7 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **제어 정확도** | 초기 설계(KP 0.22, 피드포워드 없음)에서 리더 0.3 m/s 추종 정상상태 거리 **4.3 m — 이론값 4.36 m 와 소수 둘째 자리 일치**. 현재 설계(KP 0.30, KFF 0.8, KV 0.3) 이론값 3.63 m, SITL 재실측 전 |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
-| **회귀 스위트** | 단위 검사 181개 + SITL 시나리오 11개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
+| **회귀 스위트** | 단위 검사 207개 + SITL 시나리오 11개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 추종 동작과 Fail-safe
@@ -120,7 +120,8 @@ D435i (color+depth, 640×480@30)
 
 ## 안전 설계
 
-비행 안전과 관련된 동작은 전부 SITL에서 실제 비행으로 검증했습니다.
+비행 안전과 관련된 동작은 SITL 에서 실제 비행으로 검증했고, 2026-10-01 감사로 추가한 항목(고도 바닥 fail-closed, 수직 판정,
+재획득, yaw 불연속, 단조 시계)은 아직 단위 검사와 폐루프 시뮬레이션까지입니다.
 
 - **조종사가 항상 이깁니다.** 컴패니언은 FC 모드를 매 루프 확인하고, GUIDED/OFFBOARD가
   아니면 모드 변경 명령을 보내지 않습니다. 조종사가 LOITER로 탈환하면 그대로 유지됩니다
@@ -129,7 +130,17 @@ D435i (color+depth, 640×480@30)
   깊이 센서만 죽고 검출이 살아 있는 교묘한 경우까지 거리 기준(`range_coast_time`)으로 잡습니다.
 - **이륙 인계가 안전합니다.** 수동 상승 후 GUIDED로 넘기는 순간 미션·명령 버퍼를 리셋해
   깨끗한 상태로 추종을 시작합니다 (SITL 검증).
-- **고도 바닥.** `MIN_AGL_M`(1.5m) 아래에서는 하강 명령을 차단합니다.
+- **고도 바닥.** `MIN_AGL_M`(1.5 m, home 기준) 아래에서는 하강 명령을 차단합니다. 고도를 모르면(LOCAL_POSITION_NED 가 낡음)
+  열어 두지 않고 막습니다(fail-closed) — 트래커가 지면의 무언가를 물고 내려가는 상황이 바로 고도 스트림까지 의심스러운 상황이기 때문입니다.
+- **수직으로 움직이는 리더도 따라갑니다.** 출발·호버 판정이 수평·수직을 합친 3차원 움직임이고 `MAX_VZ` 가 0.25 m/s 입니다.
+  예전에는 수평 속도만 봐서 리더가 1.3 m 만 오르내려도 수직 시야(±21°)를 벗어나 소실 착륙으로 갔습니다. 수직 속도 상한은 '리더 운용 제한' 표.
+- **트랙을 잃은 뒤에는 추정기가 예측하는 자리에서만 다시 잡습니다.** 추정기가 믿을 수 있는 동안(코스팅 2 초 안)은 예측 화소 위치
+  근처(99 % 타원 + 60 px)의 검출만 새 트랙이 되고, 거리 측정이 카이제곱 게이트에서 3번 연속 거부되면 트랙을 버리고 다시 잡습니다.
+  게이트가 거부한 측정의 방위는 쓰지 않습니다. 예전에는 0.4 초 검출 공백 뒤 화면 안의 더 큰 물체로 신원이 넘어갔습니다.
+- **FC 의 yaw 재정렬에 속지 않습니다.** ATTITUDE 의 yaw 변화가 yawspeed·Δt 로 설명되지 않으면(한 샘플에 0.2 rad 넘게 어긋남)
+  그 프레임의 자세 보상을 건너뜁니다 — 기체는 돌지 않았으므로 상대 상태는 그대로가 맞습니다.
+- **시계는 단조 시계입니다.** 루프 주기·신선도·setpoint 스케줄·ESP32 age 가 `time.monotonic()` 이라 NTP 동기나 수동 시각 설정으로
+  벽시계가 뛰어도 소실 타이머가 한꺼번에 만료되거나 송신이 멈추지 않습니다. 로그의 `time` 열은 벽시계, `mono` 열이 루프 시계입니다.
 - **근접 회피.** 리더까지 3차원 거리가 2m 안이면 접근 성분을 제거하고, 1.5m 안이면 시선에 수직인 방향으로
   비켜섭니다(`enforce_min_separation`). 후자가 실제 보호입니다 — 리더가 `MAX_VX`(0.35 m/s)보다 빠르게 다가오면
   정면 후퇴로는 원리적으로 벗어날 수 없기 때문입니다. 0.7 m/s 정면 접근에서 회피가 없으면 접촉, 있으면 0.41m
@@ -157,7 +168,7 @@ D435i (color+depth, 640×480@30)
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 181개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 207개 — numpy만 있으면 됨
 python3 test_closed_loop.py    # 폐루프 특성화 — 가짜 FC·가짜 시계로 실제 main.main() 결정론 실행 (--dump/--compare)
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 python3 analysis/stability_margins.py --plots   # 분석 층: 바깥 루프 선형 모델의 여유·스트링 안정성 (matplotlib)
@@ -180,7 +191,7 @@ python3 analysis/trace_check.py                 # 요구도 ↔ 검사 추적성
 주파수를 자극하지 않아 SITL 8개가 전부 통과했던 것입니다. 원인(자기 속도와 EKF 상대속도의 지연 불일치)과 수정
 (피드포워드 저역통과 2 s + 자기 속도 정합 필터 0.3 s + 소프트 데드존 → 14.4 dB, 1.13배)은
 [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) 에 있고, 정현파 리더 SITL 시나리오 `leader_sine` 이 이를
-ArduCopter 에서 검사합니다(실측: 09-18 설계 0.72배, 수정 전 코드 1.95배로 FAIL; 현재 설계는 재실행 전). 요구도 63개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
+ArduCopter 에서 검사합니다(실측: 09-18 설계 0.72배, 수정 전 코드 1.95배로 FAIL; 현재 설계는 재실행 전). 요구도 68개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 의 추적성 표에 있습니다.
 
 그리고 모든 시나리오는 **차등 검증**입니다 — 수정 전 코드에도 같은 시나리오를 돌려 대조군에서
@@ -248,7 +259,7 @@ yolo export model=$MARS_MODEL_DIR/leader_drone_yolo11n.pt format=engine imgsz=41
   1. python3 test_fixes.py                     통과 확인
   2. 프로펠러 제거 상태로 python3 main.py       화면의 명령값이 의도대로 나오는지 확인
   3. SEND_MAVLINK_COMMANDS = True 로 수정       (또는 실행 중 v 키)
-  4. 기체 파라미터 WP_YAW_BEHAVIOR=0
+  4. 기체 파라미터 — 아래 'FC 파라미터 체크리스트' 전부
 
 [비행]
   5. 조종기로 수동 이륙 (ALT_HOLD)              원하는 고도까지
@@ -265,7 +276,45 @@ ArduCopter는 속도 setpoint를 **GUIDED에서만** 받으므로, 조종기 3�
 | 중간 | LOITER | 비상 탈환 (위치까지 고정) |
 | 아래 | **GUIDED** | 자동 추종 |
 
-LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 검증했습니다.
+LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 검증했습니다. 화면의 `l`(수동 LAND) 키도 같은 게이트를
+지나므로 조종사가 탈환한 뒤에는 나가지 않습니다. `v`(송신 토글) 를 켜는 순간은 GUIDED 진입과 같이 미션·명령을 리셋하고,
+끄는 순간은 HOLD 를 한 번 보내 FC 가 마지막 속도를 3 초 더 유지하지 않게 합니다.
+
+### 리더 운용 제한
+
+컴패니언이 따라갈 수 있는 리더의 움직임에는 상한이 있고, 넘으면 결과는 **소실 → 10 초 뒤 자동 착륙**입니다.
+
+| 항목 | 상한 | 이유 |
+|---|---|---|
+| 수평 속도 | 0.3 m/s (최대 0.35) | `MAX_VX` 0.35 와 정상상태 이격(0.3 m/s 에서 +0.63 m) |
+| 수직 속도 | 0.2 m/s (최대 0.25) | `MAX_VZ` 0.25. 수직 시야가 ±21°(3 m 에서 ±1.2 m)라 더 빠르면 2 초 안에 시야 이탈 |
+| 상대 고도 변화 | ±1 m 안에서 | 같은 수직 시야 한계. 출발 전(READY_HOVER)에는 수직 추종이 없으므로 고도를 맞춘 뒤 출발 |
+| 선회 | 완만하게 (측면 0.22 m/s, 기수 0.35 rad/s 안) | `MAX_VY`·`MAX_YAW_RATE` |
+
+### FC 파라미터 체크리스트 (ArduCopter)
+
+컴패니언은 배터리·펜스·RC 손실을 **보지 않습니다**. 이 위험은 FC 가 지켜야 하고, 공장 기본값은 대부분 "경고만" 입니다
+(근거: `docs/AUDIT_2026-10-01.md` 4절, ArduPilot 소스 대조).
+
+| 파라미터 | 값 | 이유 |
+|---|---|---|
+| `WP_YAW_BEHAVIOR` | 0 | 기수는 yaw_rate 로 직접 준다. GUID_TIMEOUT 뒤 HOLD 와 하네스 조건 통일 |
+| `GUID_TIMEOUT` | 3.0 (기본) | 컴패니언 10 Hz 대비 충분. 더 짧으면 카메라 스톨 한 번에 정지·재출발 반복 |
+| `GUID_OPTIONS` | bit2 (IgnorePilotYaw) = 4 | 조종사 yaw 스틱이 10 Hz yaw_rate 재설정과 싸워 떨림만 만든다. bit0(송신기 시동)은 끈 채로 |
+| `FS_THR_ENABLE` | 1 (RTL) 또는 5 (LAND) | RC 손실 시 모드가 바뀌어야 컴패니언이 물러난다 |
+| `FS_OPTIONS` | bit2 "Continue if in Guided on RC failsafe" **끄기** | 켜면 RC 가 끊겨도 GUIDED 가 유지돼 조종사 탈환 수단이 사라진다 |
+| `FS_EKF_ACTION` | 1 (LAND, 기본) | 2(ALT_HOLD) 는 조종사 즉시 개입 전제 |
+| `FENCE_ENABLE` / `FENCE_TYPE` / `FENCE_ACTION` | 1 / 7 / 1(RTL) 또는 4(Brake·Land) | 리더 오인·외삽 추종으로 멀어지는 사고의 마지막 방어. `FENCE_ALT_MAX`·`FENCE_RADIUS` 는 시험장 기준 |
+| `BATT_FS_LOW_ACT` / `BATT_FS_CRT_ACT` / `BATT_LOW_VOLT` | 2(RTL) / 1(LAND) / 팩 기준 | 기본값 0 은 경고만 — 리더가 보이는 동안 컴패니언은 절대 착륙하지 않는다 |
+| `FS_GCS_ENABLE` | 운용 결정 | 컴패니언은 heartbeat 를 보내지 않아 이 값은 실제 GCS 링크에만 작용한다. 켜면 GCS 끊김 → RTL 로 추종이 끝난다 |
+| `MAV_GCS_SYSID` | 255 (기본 유지) | 컴패니언 명령이 sysid 255 로 나간다. 바꾸면 전부 묵살 |
+| `SYSID_THISMAV` | 팔로워 1 / 리더 2 | 리더에 MAVLink FC 를 얹을 경우 텔레메트리가 섞이지 않게 |
+| `SERIALn_PROTOCOL` | 2 (MAVLink2) | GPS_RAW_INT 확장 필드(alt_ellipsoid 등) 수신 |
+
+PX4 로 운용하면: `COM_OF_LOSS_T` 1.0 유지, `COM_OBL_RC_ACT` 기본 0(Position) 은 조종사 즉시 개입 전제(무인 운용이면 5 Land / 6 Hold),
+`NAV_RCL_ACT` 2(Return), `COM_LOW_BAT_ACT` 2 또는 3, `GF_ACTION`·`GF_MAX_VER_DIST`·`GF_MAX_HOR_DIST`, 그리고 컴패니언 포트의
+`MAV_x_MODE` 를 Onboard 로 해 LOCAL_POSITION_NED 가 10 Hz 이상 나오게 합니다(없으면 자기 속도·고도 바닥이 꺼집니다 — 고도를
+모르면 하강이 막히므로 하강 추종이 되지 않습니다).
 
 ## 모듈
 
@@ -283,7 +332,7 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회, 실외 노출 옵션·AE 측광 ROI) |
 | `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | 단위 회귀 181개 (하드웨어·FC 불필요) |
+| `test_fixes.py` | 단위 회귀 207개 (하드웨어·FC 불필요) |
 | `test_closed_loop.py` | 폐루프 특성화 테스트 — 가짜 FC·가짜 시계로 실제 `main.main()` 결정론 실행, `--dump`/`--compare`로 리팩토링 전후 스트림 비교 |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 | `docs/images/` | README 다이어그램(SVG) |
@@ -292,6 +341,6 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 
 - [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
 - [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) — 바깥 루프 선형 모델, 위상·이득 여유, 스트링 안정성, 체인 시뮬레이션, 개선안
-- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 63개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
+- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 68개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
 - [docs/images/README.md](docs/images/README.md) — README 그림 파일과 수정 방법

@@ -80,6 +80,10 @@ CONFIG = {
         "full_frame_interval": 20,
         "normal_detect_every": 2,
         "maneuver_detect_every": 1,
+        # 트랙을 잃은 뒤 재획득: 추정기 예측점을 영상에 투영한 99 % 타원 반경에 이 여유를 더한 원 안의 검출만 새 트랙으로 삼는다.
+        # 추정기 3-D 게이트가 거리 측정을 연속 이 횟수만큼 거부하면 트랙을 버리고 예측점 근처에서 다시 잡는다 (main.reacquire_hint).
+        "reacquire_margin_px": 60,
+        "gate_reject_drop_frames": 3,
     },
     "controller": {
         "uncertainty_slowdown_trace": 4.0,

@@ -1386,6 +1386,111 @@ check("NaN: 다음 유효 측정으로 재초기화되어(CT omega 0 으로 정�
       _ekn.initialized and np3.all(np3.isfinite(_x_re)) and abs(_x_re[2] - 3.1) < 1e-9 and _omega_re == 0.0
       and np3.all(np3.isfinite(_x_re2)) and np3.isfinite(_ekn.filters[1]._omega), f"x={_x_re.round(3)} ω={_omega_re}")
 
+
+# ================================================================ 첫 비행 전 7가지 (2026-10-01 감사)
+# 1) 출발·호버 판정에 수직 속도 포함 + MAX_VZ
+_mvz = MissionManager(); _t = 0.0
+for _ in range(12):
+    _st_vz, _ = _mvz.update(now=_t, leader_visible=True, rel_vel_est=[0, 0, 0.5], leader_vel_body=[0.0, 0.0, 0.5],
+                            leader_alt=50.0, pos_cov_trace=1.0); _t += 0.1
+check("미션 수직: 수직으로만 0.5 m/s 움직이는 리더도 출발 확인 뒤 FOLLOW (예전: 수평속도만 봐 영원히 READY_HOVER → 시야 이탈 → 소실 착륙)",
+      _st_vz == S_FOLLOW, f"state={_st_vz}")
+_st_vz2, _ = _mvz.update(now=_t, leader_visible=True, rel_vel_est=[0, 0, 0.3], leader_vel_body=[0.0, 0.0, 0.3], leader_alt=50.0, pos_cov_trace=1.0); _t += 0.1
+_st_vz3, _ = _mvz.update(now=_t, leader_visible=True, rel_vel_est=[0, 0, 0.1], leader_vel_body=[0.0, 0.0, 0.1], leader_alt=50.0, pos_cov_trace=1.0); _t += 0.1
+check("미션 수직: 호버 히스테리시스도 3차원 속도 — 수직 0.3 m/s 면 FOLLOW 유지, 0.1 m/s 면 LEADER_HOVER",
+      _st_vz2 == S_FOLLOW and _st_vz3 == S_LEADER_HOVER, f"{_st_vz2}/{_st_vz3}")
+check("미션 수직: MAX_VZ ≥ 0.25 m/s — 수직 FOV ±21°(3 m 에서 ±1.2 m)를 0.12 로는 못 따라가 2 s 안에 소실됐다",
+      main.MAX_VZ >= 0.25, f"MAX_VZ={main.MAX_VZ}")
+
+# 2) 재획득은 EKF 예측점 근처 + 게이트 거부 되먹임 + 거부된 측정의 bearing 미사용
+_big = {"bbox": (460, 260, 540, 340), "conf": 0.60, "area": 6400}
+_near = {"bbox": (301, 221, 339, 259), "conf": 0.85, "area": 1444}
+_trk = LeaderTracker()
+_got = _trk.update([_big, _near], reacquire_hint=((320.0, 240.0), 100.0))
+check("재획득: 힌트가 있으면 예측점 근처 검출로 새 트랙 (예전: 면적×신뢰도 최대 = 더 큰 물체)",
+      _got is not None and _got["bbox"] == _near["bbox"], f"{_got and _got['bbox']}")
+_trk2 = LeaderTracker()
+check("재획득: 힌트 반경 안에 검출이 없으면 트랙을 만들지 않는다 (멀리 있는 큰 물체로 신원이 넘어가지 않음)",
+      _trk2.update([_big], reacquire_hint=((320.0, 240.0), 100.0)) is None and _trk2.track is None)
+check("재획득: 힌트가 없으면(추정기 미초기화·코스팅 만료) 예전처럼 면적×신뢰도 최대",
+      LeaderTracker().update([_big, _near])["bbox"] == _big["bbox"])
+_trk3 = LeaderTracker(); _trk3.update([_near])
+_drop = [_trk3.note_gate_reject(3) for _ in range(3)]
+check("재획득: 3-D 게이트가 3회 연속 거부하면 트랙을 버린다 (예전: 거부가 트래커에 돌아오지 않아 오인 물체를 계속 붙듦)",
+      _drop == [False, False, True] and _trk3.track is None, f"{_drop}")
+_trk4 = LeaderTracker(); _trk4.update([_near]); _trk4.note_gate_reject(3); _trk4.note_gate_reject(3); _trk4.note_gate_accept()
+check("재획득: 수용되면 거부 횟수가 0 으로 돌아간다", _trk4.note_gate_reject(3) is False and _trk4.track is not None)
+_intr = {"fx": 384.0, "fy": 384.0, "ppx": 320.0, "ppy": 240.0}
+_ekr = ImmEkf()
+check("재획득: 추정기가 없으면 힌트 None", main.reacquire_hint(_ekr, _intr) is None)
+_ekr.init([0.0, 0.0, 3.0])
+for _ in range(10):
+    _ekr.set_ego_velocity_cam([0.0, 0.0, 0.0]); _ekr.predict(1 / 30); _ekr.update_position3d([0.0, 0.0, 3.0])
+_hint = main.reacquire_hint(_ekr, _intr)
+check("재획득: 힌트 = 예측 화소(화면 중앙) + 99 % 타원 반경 + 여유 60 px",
+      _hint is not None and abs(_hint[0][0] - 320) < 1e-6 and abs(_hint[0][1] - 240) < 1e-6 and main.REACQ_MARGIN_PX < _hint[1] < 400,
+      f"{_hint}")
+for _ in range(int(2.5 * 30)):
+    _ekr.predict(1 / 30); _ekr.on_lost(1 / 30)
+check("재획득: 2 s 넘게 코스팅해 믿을 수 없으면 힌트 None → 전체 화면 재획득으로 복귀", main.reacquire_hint(_ekr, _intr) is None)
+_ekg = ImmEkf(); _ekg.init([0.0, 0.0, 3.0])
+for _ in range(10):
+    _ekg.set_ego_velocity_cam([0.0, 0.0, 0.0]); _ekg.predict(1 / 30); _ekg.update_position3d([0.0, 0.0, 3.0])
+_relg = ReliabilityEstimator()
+_used_g, _d2_g = main.fuse_vision(_ekg, _relg, {"z": np3.array([2.0, 0.0, 3.0])}, {"z": np3.array([2.0 / 3.0, 0.0])}, 1.0, 1.0, True)
+_xg, _ = _ekg.get_state()
+check("재획득: 3-D 게이트가 거부한 측정의 bearing 은 쓰지 않는다 — 상태가 그쪽으로 끌리지 않음 (예전 'bearing_after_rgbd_gate')",
+      _used_g == "gate_reject_rgbd" and abs(_xg[0]) < 0.05, f"used={_used_g} d2={_d2_g} x={_xg[:3].round(3)}")
+
+# 3) 고도 바닥 fail-closed
+check("AGL 바닥: 고도를 모르면(LOCAL_POSITION_NED 낡음) 하강 명령을 막는다 (예전: 바닥이 조용히 해제)",
+      main.enforce_agl_floor([0.1, 0.0, 0.10, 0.0], None)[2] == 0.0)
+check("AGL 바닥: 1.5 m 아래에서 하강 차단, 위에서는 통과, 상승은 고도를 몰라도 통과",
+      main.enforce_agl_floor([0, 0, 0.10, 0], 1.0)[2] == 0.0 and main.enforce_agl_floor([0, 0, 0.10, 0], 5.0)[2] == 0.10
+      and main.enforce_agl_floor([0, 0, -0.10, 0], None)[2] == -0.10)
+
+# 4) v / l 키 게이트 (루프 안이라 소스로 확인)
+_msrc = open("main.py", encoding="utf-8").read()
+_lkey = _msrc.split('key == ord("l")')[1][:600]
+_vkey = _msrc.split('key == ord("v")')[1][:600]
+check("키 게이트: 'l' 수동 LAND 는 FC 가 GUIDED/OFFBOARD 일 때만 (조종사 우선 — 미션 경로와 같은 게이트)",
+      "fc_accepts_setpoints" in _lkey and "send_land(master)" in _lkey)
+check("키 게이트: 'v' 송신 ON 은 GUIDED 진입과 같은 미션/명령 리셋을 거치고, OFF 는 HOLD 를 한 번 보낸다",
+      "send_turned_on" in _msrc and "or send_turned_on" in _msrc and "send_hold(master)" in _vkey)
+
+# 5) ATTITUDE yaw 불연속 + ESP32 속도 누락
+import math  # noqa: E402
+_a0 = {"yaw": 0.0, "yawspeed": 0.0, "timestamp": 10.0}
+check("자세 불연속: yawspeed 0 인데 한 샘플에 20° 뛰면 불연속 → 보상 생략 (FC EKF yaw 재정렬)",
+      main.attitude_jump(_a0, {"yaw": math.radians(20), "yawspeed": 0.0, "timestamp": 10.1}) is True)
+check("자세 불연속: 2° 는 정상", main.attitude_jump(_a0, {"yaw": math.radians(2), "yawspeed": 0.0, "timestamp": 10.1}) is False)
+check("자세 불연속: yawspeed 3 rad/s 로 0.1 s 동안 17° 돌았으면 예측과 맞아 정상 (크기만 보면 거짓 양성)",
+      main.attitude_jump({"yaw": 0.0, "yawspeed": 3.0, "timestamp": 10.0}, {"yaw": 0.3, "yawspeed": 3.0, "timestamp": 10.1}) is False)
+check("자세 불연속: yawspeed 가 없으면 크기 0.3 rad 기준",
+      main.attitude_jump({"yaw": 0.0}, {"yaw": 0.35}) is True and main.attitude_jump({"yaw": 0.0}, {"yaw": 0.2}) is False)
+check("자세 불연속: ±π 경계를 넘는 작은 변화는 정상",
+      main.attitude_jump({"yaw": 3.1, "yawspeed": 0.0, "timestamp": 0.0}, {"yaw": -3.1, "yawspeed": 0.0, "timestamp": 0.1}) is False)
+_pnov = parse_leader_json('{"lat":35.83,"lon":128.75,"alt_msl":37.0}')
+_pv = parse_leader_json('{"lat":35.83,"lon":128.75,"alt_msl":37.0,"vx":0.3,"vy":0.0,"vz":0.0}')
+check("ESP32 속도 없음: vx/vy/vz 가 모두 없으면 has_velocity=False (예전: 0 으로 채워 미션이 '리더 정지' 로 오판)",
+      _pnov is not None and _pnov.has_velocity is False and _pv.has_velocity is True)
+_mnov = build_leader_measurement_from_packet(_pnov, _FOLLOWER, now=_pnov.rx_time)
+_mv_ = build_leader_measurement_from_packet(_pv, _FOLLOWER, now=_pv.rx_time)
+check("ESP32 속도 없음: 측정은 available 이되 속도 관련 값은 전부 None → main 이 미션을 EKF 속도로 돌리고 속도 갱신을 건너뛴다",
+      _mnov["available"] and _mnov["leader_vel_enu"] is None and _mnov["rel_vel_cam"] is None and _mnov["leader_hspeed"] is None
+      and _mv_["leader_vel_enu"] is not None and abs(_mv_["leader_hspeed"] - 0.3) < 1e-9, f"{_mnov.get('reason')}")
+_mnvm = MissionManager(); _t = 0.0
+for _ in range(12):
+    _st_nv, _ = _mnvm.update(now=_t, leader_visible=True, leader_vel_world=None, leader_vel_body=[0.5, 0, 0], leader_alt=50.0, pos_cov_trace=1.0); _t += 0.1
+check("ESP32 속도 없음: leader_vel_world=None 이면 EKF 속도(0.5 m/s)로 출발 판정 → FOLLOW", _st_nv == S_FOLLOW, f"{_st_nv}")
+
+# 7) 단조 시계
+_mio = open("mavlink_io.py", encoding="utf-8").read(); _ltl = open("leader_telemetry.py", encoding="utf-8").read()
+check("단조 시계: 루프·신선도·setpoint 스케줄·ESP32 age 는 time.monotonic() — 벽시계(time.time)는 로그의 wall 시각·리더 timestamp 기본값뿐",
+      "now = time.monotonic()" in _msrc and _msrc.count("time.time()") == 1 and "time.time(" not in _mio and _ltl.count("time.time()") == 1
+      and "rx_time=now" in _ltl and "now = time.monotonic()" in _ltl, f"main={_msrc.count('time.time()')} mio={_mio.count('time.time(')} ltl={_ltl.count('time.time()')}")
+check("단조 시계: 폐루프 검사의 가짜 시계가 monotonic 을 제공한다", "def monotonic" in open("test_closed_loop.py", encoding="utf-8").read())
+
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "
       f"({len(failures)} 실패)")

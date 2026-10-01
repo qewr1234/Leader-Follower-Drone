@@ -92,6 +92,9 @@ class FakeClock:
     def time(self):
         return self.t
 
+    def monotonic(self):
+        return self.t
+
     def sleep(self, s):
         pass
 

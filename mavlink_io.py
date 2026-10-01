@@ -62,7 +62,7 @@ _rate_t0 = None
 def stream_rates_text(now=None):
     """마지막 호출 이후의 타입별 수신율 문자열. 1초마다 STAT 에서 부른다."""
     global _rate_t0
-    now = time.time() if now is None else float(now)
+    now = time.monotonic() if now is None else float(now)
     if _rate_t0 is None:
         _rate_t0 = now
         return "rx[Hz] -"
@@ -120,7 +120,7 @@ def drain_messages(master):
         if msg is None:
             break
         mt = msg.get_type()
-        now = time.time()
+        now = time.monotonic()      # main 의 루프 시계(단조)와 같은 시계 — is_fresh 비교용
         if mt in _RATE_TYPES:
             _rate_counts[mt] = _rate_counts.get(mt, 0) + 1
 
