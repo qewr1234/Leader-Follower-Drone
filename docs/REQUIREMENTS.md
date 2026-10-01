@@ -39,6 +39,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | FCR-16 | 명령의 시선 방향 접근 속도는 모든 거리에서 KS·(d − 2.0 m) 이하다 (연속 장벽): 바닥 밖에서는 접근 상한, 안에서는 침범량에 비례한 후퇴. 특히 피드포워드가 바닥 안에서 접근 명령을 만들지 못한다 | VERIFICATION 남은 결함(선회 시 최근접 1.59 m) | T, A, I | UT[이격:]; UT[이격 장벽:]; INSPECT[config.py:"min_separation_m": 2.0] | 검증됨 (P 항만의 경로에서는 교차점 1.0 m 위에서 P 가 더 강해 놀지만, FF 파고들기(1.8 m 에서 +0.04 → −0.12)는 이 장벽만 막는다 — 단위 검사) |
 | FCR-17 | 회피 반경(1.5 m) 안에서는 시선에 수직인 수평 방향으로 비켜선다. 보증 범위: (a) 한 방향으로 지나가는 리더는 1.0 m/s 까지 접촉 없이 비킨다, (b) 재조준하며 추격하는 리더는 hypot(MAX_VX, MAX_VY)=0.41 m/s 아래에서만 — 그 위는 순수추격 기하상 어떤 제어기로도 불가능하다 | analysis/evasion_sim.py | T, A | UT[회피:]; UT[회피 경계:]; UT[회피 경계 골든]; SITL[min_separation] | 검증됨 (범위 명시. 모의: straight 0.7 m/s → 0.60 m, pursuit 0.4 → 1.81 m, pursuit 0.7 → 접촉(골든). SITL min_separation 통과 — 사용자 실행, 수치 기록 대기) |
 | FCR-18 | 제어·미션 입력(상대 위치·속도, 리더 속도)은 카메라 마운트 자세와 기체 roll/pitch 를 편 수평(기수 정렬) 프레임이고, EKF 의 자기 속도 입력은 그 역변환으로 카메라 프레임에 들어간다 — FC 가 BODY_NED 를 yaw 만 돌리는 것과 일치 | 이전 감사 #2·#22·#38·#42·#44 | T, I | UT[레벨링:]; UT[마운트:]; INSPECT[config.py:"mount_pitch_deg"] | 검증됨 (단위; 실기 마운트 각 미측정 → config 0) |
+| FCR-19 | 추정 거리가 `max_follow_dist_m`(15 m)보다 멀면 소실로 취급해 쫓지 않고, `max_alt_m`(30 m) 위에서는 상승을 막으며, 목표 이격 3 m ↔ 8 m 전환은 추종 중 0.3 m/s 램프다 | 감사 2026-10-01 12·20번, 이전 #24·#66 | T, I | UT[최대 거리:]; UT[천장:]; UT[이격 램프:]; INSPECT[config.py:"max_follow_dist_m"] | 검증됨 (단위) |
 | FCR-15 | 리더 속도가 0.25 ± 0.05 m/s, 1.15 rad/s 정현파일 때 팔로워 속도 진폭비가 1 이하다 (실제 FC 에서의 스트링 안정성) | STABILITY_MARGINS 6절, sitl/README | T | SITL[leader_sine]; AN[sitl_like.current] | 검증됨 (SITL 실측 0.43 / 0.72, 예측 0.70. 수정 전 코드 대조군 1.95 FAIL — 차등 검증) |
 
 ### EST — 인지 / 추정
@@ -54,12 +55,13 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | EST-04 | 트래커는 1프레임 소실 뒤 화면 반대편 검출을 거부하고 max_lost 뒤 새 track_id 로 재초기화한다 | VERIFICATION 트래커 신원 게이트 | T | UT[tracker:] | 검증됨 |
 | EST-16 | 트랙을 버린 뒤의 재획득은 추정기가 믿을 수 있는 동안 예측 화소 위치(99 % 타원 + 60 px) 안의 검출로만 하고, 3-D 게이트가 거리 측정을 연속 3회 거부하면 트랙을 버리며, 게이트가 거부한 측정의 bearing 은 쓰지 않는다 | 감사 2026-10-01 2번 | T | UT[재획득:]; INSPECT[config.py:"reacquire_margin_px"] | 검증됨 (단위 8개) |
 | EST-17 | 카이제곱 게이트는 기본 R 로 판정하고 신뢰도로 부풀린 R 은 칼만 이득에만 쓴다(RGB-D·bearing·ESP32 위치·속도 네 경로) — 품질이 나쁜 측정일수록 게이트가 넓어지던 결합 제거 | 이전 감사 #26·#59, 신규 16 | T | UT[게이트 분리:] | 검증됨 |
+| EST-18 | 회복 근접 게이트는 bbox 대각선 비례에 절대 하한 80 px 를 둔다 — 먼 소형 표적이 자세 과도 한 번에 폐기되지 않게 | 감사 2026-10-01 18번 | T | UT[트래커 회복 게이트:]; INSPECT[config.py:"recover_gate_min_px"] | 검증됨 |
 | EST-05 | 깊이 측정은 유효 화소 수·비율·MAD 한계로 걸러 깊이 절벽을 신뢰도 0 으로 만들고, 큰 ROI 서브샘플 오차는 1 cm 미만이다 | VERIFICATION C4 | T | UT[C4:]; UT[measurement:] | 검증됨 |
 | EST-06 | 검출을 건너뛴 프레임의 측정은 신뢰도를 0.55 배로 깎는다 | reliability.py | T | UT[skip:] | 검증됨 |
 | EST-07 | 검출기는 대상 클래스만 남겨 (conf, area) 순으로 정렬하고 ROI 오프셋을 적용하며 conf/iou/imgsz 를 매 호출 전달한다. 모델에 없는 클래스면 시작 시 경고한다 | detector.py | T | UT[detector:]; UT[검출:] | 검증됨 |
 | EST-08 | 스케줄러는 안정 상태에서 `normal_detect_every` 주기로 검출한다 | scheduler.py | T | UT[scheduler:] | 검증됨 |
 | EST-09 | EKF 융합 상태는 캐시되고 상태 변경 시 무효화된다 | imm_ekf `get_state` | T | UT[ekf:] | 검증됨 |
-| EST-10 | 컬러 센서에 AE priority off·노출 상한 8 ms·역광 보정을 적용하고, AE 측광 ROI 를 추적 bbox 1.5배로 따라간다(≤1 Hz, 10 % 이동, 소실 시 전체 복귀) | README 안전 설계 | T | UT[camera:] | 부분 (pyrealsense2 스텁 검증, 실외 실기 미검증) |
+| EST-10 | 컬러 센서에 AE priority off·역광 보정을, 깊이 센서에 프로젝터·laser_power·IR AE·AE 노출 상한(config `depth_*`)을 적용하고, AE 측광 ROI 를 추적 bbox 1.5배로 따라간다(≤1 Hz, 10 % 이동, 연속 5프레임 넘게 놓쳤을 때만 전체 복귀). 컬러 노출 상한 옵션은 librealsense 에 없어 제거했다 | README 안전 설계, 감사 2026-10-01 17·19번 | T | UT[camera:]; UT[AE ROI:] | 부분 (pyrealsense2 스텁 검증, 실외 실기 미검증) |
 | EST-11 | 카메라 파이프라인은 Jetson 에서 24 FPS 이상이다 | VERIFICATION 하드웨어 | D | HW | 부분 (개발자 보고 24~26 FPS, 로그 없음) |
 | EST-12 | 리더 검출률은 80 % 이상이다 | VERIFICATION 하드웨어 | D | HW | **미충족** (약 60 %, 데이터셋 확장 필요) |
 
@@ -85,6 +87,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | SAF-17 | ATTITUDE 의 yaw 가 yawspeed·Δt 로 설명되지 않게 뛰면(FC EKF yaw 재정렬) 그 프레임의 자세 보상을 건너뛴다 — 기체는 돌지 않았으므로 상대 상태는 그대로 | 감사 2026-10-01 5번 | T | UT[자세 불연속:]; INSPECT[main.py:ATT_YAW_JUMP_RAD] | 검증됨 |
 | SAF-18 | 루프·신선도·setpoint 스케줄·ESP32 age 는 단조 시계(time.monotonic)를 쓴다 — 벽시계 점프가 LAND 나 송신 정지를 만들지 않는다 | 이전 감사 #48·#49 | T, I | UT[단조 시계:] | 검증됨 |
 | SAF-19 | SIGTERM/SIGHUP 에도 종료 경로(finally: 마지막 HOLD·장치 닫기·CSV)가 실행된다 | 이전 감사 #51 | T | UT[종료:] | 검증됨 |
+| SAF-20 | 한 프레임이 1 s 넘게 걸리면 경고하고 3 s(GUID_TIMEOUT)를 넘기면 평활·피드포워드 상태를 0 에서 재시작한다 — 멈췄다 돌아올 때 옛 속도로 재출발하지 않는다 | 이전 감사 '루프 워치독 부재' | T, I | UT[워치독:]; INSPECT[main.py:LOOP_RESET_SEC] | 검증됨 (단일 스레드라 멈춘 동안의 처리는 없음) |
 | SAF-16 | 추정·명령 경로의 비유한 값(NaN/inf)은 '최대 속도' 가 아니라 '정지' 로 귀결된다: 송신부는 0 으로 치환하고, 제어기는 0 명령을 내며, NaN 공분산은 최대 불확실로 취급하고, EKF 는 재초기화 대기로 돌아간다 | 외부 레퍼런스 감사 2026-09-24 (clamp(nan)=hi 재현) | T, I | UT[NaN:]; INSPECT[utils_geometry.py:if x != x]; INSPECT[main.py:비유한 속도 명령] | 검증됨 (단위 6개: 와이어·제어기·공분산 게이트·자세 보정·재초기화) |
 
 ### IF — 인터페이스
@@ -104,6 +107,8 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | IF-11 | ESP32(ESP-NOW) 송신 펌웨어가 리더 절대 위치·속도를 방송한다 | README 시스템 개요 | D | — | 미검증 (펌웨어 미존재) |
 | IF-12 | ESP32 패킷에 속도가 없으면 속도를 0 으로 꾸미지 않고 '없음' 으로 넘겨 미션은 EKF 속도로, 속도 갱신은 생략한다 | 감사 2026-10-01 9번 | T | UT[ESP32 속도 없음:] | 검증됨 |
 | IF-13 | 컴패니언은 기체와 같은 sysid 와 compid 191(ONBOARD_COMPUTER) 로 송신하고 1 Hz heartbeat 를 보내며, 자기 heartbeat 를 FC 것으로 오인하지 않는다 | 이전 감사 #14·#50 | T | UT[신원:] | 검증됨 (SYSID_ENFORCE=0 전제, README 체크리스트) |
+| IF-14 | 상태 메시지(위치·자세·배터리)는 우리 FC(같은 sysid·고정 compid)에서 온 것만 받고, HEARTBEAT 의 system_status 를 저장해 CRITICAL 이상이면 경보한다. ESP32 융합은 팔로워 GLOBAL_POSITION_INT·ATTITUDE 가 신선할 때만 | 감사 2026-10-01 10·15·21번 | T | UT[sysid 필터:]; UT[system_status:]; UT[ESP32 신선도:] | 검증됨 |
+| IF-15 | 비행 로그는 1 s 마다 fsync 하고 `logger.max_mb` 마다 파일을 돌리며, CSV 변환은 스트리밍으로 전 파일을 합친다(잘린 마지막 줄 허용) | 이전 감사 '로그 내구성' | T | UT[로거:] | 검증됨 |
 
 ### OPS — 운용 / 유지
 
@@ -114,6 +119,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | OPS-03 | 모든 요구도의 검증 근거가 실제 검사·시나리오·분석 키를 가리킨다 | 이 문서 | T | UT[추적성:] | 검증됨 |
 | OPS-04 | `main.main()` 은 가짜 FC·가짜 시계로 결정론 실행되어 예외 없이 끝난다 | test_closed_loop.py | T | CL[main.main()] | 검증됨 |
 | OPS-05 | README 에 실비행 전 FC 파라미터 체크리스트(failsafe·펜스·배터리·GUIDED 옵션)와 리더 운용 제한이 있다 — 컴패니언이 보지 않는 위험은 FC 가 지킨다 | 감사 2026-10-01 4절 | I | INSPECT[README.md:FENCE_ENABLE]; INSPECT[README.md:BATT_FS_LOW_ACT] | 검증됨 (문서) |
+| OPS-06 | SITL 하네스의 가상 카메라는 기체 roll/pitch 를 투영에 반영한다 — main 의 자세 보상·레벨링이 하네스 안에서 외란이 아니라 실제 기하다 | 이전 감사 #45 | T | UT[하네스 카메라:] | 검증됨 (단위; SITL 재실행 전) |
 
 ## 2. 역추적: SITL 시나리오 → 요구도
 

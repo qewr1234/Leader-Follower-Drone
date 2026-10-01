@@ -50,27 +50,33 @@ def _set_option(sensor, name, value):
         return False
 
 
-def _exposure_unit_us(sensor):
-    """컬러 센서 노출 옵션의 단위(µs). D4xx RGB 는 범위 1~10000 인 100µs 단위, 그 외는 µs 로 본다."""
-    opt = _rs_option("exposure")
-    try:
-        if opt is not None and sensor.supports(opt) and float(sensor.get_option_range(opt).max) <= 10000:
-            return 100.0
-    except Exception:
-        pass
-    return 1.0
-
-
 def apply_color_exposure_options(sensor, cfg):
-    """실외용 컬러 AE 설정. 30fps 고정(AE priority off), 노출 상한, 역광 보정. 항목별로 독립 적용."""
+    """실외용 컬러 AE 설정. 30fps 고정(AE priority off), 역광 보정. 항목별로 독립 적용.
+    (컬러 노출 상한은 걸 수 없다 — librealsense 는 auto_exposure_limit 을 깊이 센서에만 등록해 컬러에서는 '미지원' 으로 끝났다.
+    AE priority off 가 노출을 1/fps=33 ms 로 묶는 것이 컬러 쪽의 실질 상한이다.)"""
     _set_option(sensor, "enable_auto_exposure", 1)
     _set_option(sensor, "auto_exposure_priority", 1 if cfg.get("color_auto_exposure_priority", False) else 0)
     _set_option(sensor, "backlight_compensation", 1 if cfg.get("color_backlight_compensation", True) else 0)
-    max_us = float(cfg.get("color_exposure_max_us", 0) or 0)
+
+
+def apply_depth_options(sensor, cfg):
+    """실외용 깊이(IR) 센서 설정: 프로젝터 on/off·출력, IR AE, AE 노출 상한(이 옵션은 깊이 센서에만 있다). 항목별로 독립 적용."""
+    _set_option(sensor, "emitter_enabled", 1 if cfg.get("depth_emitter_enabled", True) else 0)
+    pct = cfg.get("depth_laser_power_pct", None)
+    if pct is not None:
+        opt = _rs_option("laser_power")
+        try:
+            if opt is not None and sensor.supports(opt):
+                rng = sensor.get_option_range(opt)
+                _set_option(sensor, "laser_power", float(rng.min) + (float(rng.max) - float(rng.min)) * min(max(float(pct), 0.0), 100.0) / 100.0)
+        except Exception as exc:
+            print(f"[CAM] laser_power 설정 실패: {type(exc).__name__}: {exc}")
+    _set_option(sensor, "enable_auto_exposure", 1)
+    max_us = float(cfg.get("depth_exposure_max_us", 0) or 0)
     if max_us > 0:
         _set_option(sensor, "auto_exposure_limit_toggle", 1)          # 신버전은 토글이 있어야 limit 가 먹는다
-        if _set_option(sensor, "auto_exposure_limit", max_us / _exposure_unit_us(sensor)):
-            print(f"[CAM] 컬러 AE 노출 상한 {max_us:.0f}µs")
+        if _set_option(sensor, "auto_exposure_limit", max_us):
+            print(f"[CAM] 깊이 AE 노출 상한 {max_us:.0f}µs")
 
 
 def roi_from_bbox(bbox, width, height, scale=AE_ROI_SCALE, min_px=AE_ROI_MIN_PX):
@@ -128,6 +134,10 @@ class D435i:
             print("[CAM] 컬러 센서를 찾지 못해 노출 옵션을 건너뜁니다")
         else:
             apply_color_exposure_options(self._color_sensor, CONFIG["camera"])
+        try:
+            apply_depth_options(self.profile.get_device().first_depth_sensor(), CONFIG["camera"])
+        except Exception as exc:
+            print(f"[CAM] 깊이 센서 옵션 건너뜀: {type(exc).__name__}: {exc}")
 
     def _find_color_sensor(self):
         try:

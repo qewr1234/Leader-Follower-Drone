@@ -53,6 +53,17 @@ def is_fc_heartbeat(master, msg):
     return True
 
 
+def _from_fc(master, msg):
+    """상태 메시지(위치·자세·배터리)가 우리 FC(같은 sysid, 고정된 compid)에서 온 것인가. HEARTBEAT 만 거르고 나머지를 받으면
+    같은 링크의 다른 기체 ATTITUDE/LOCAL_POSITION_NED 가 자기 자세·속도·고도 바닥으로 들어간다(2026-10-01 감사 15번)."""
+    try:
+        if msg.get_srcSystem() != master.target_system:
+            return False
+        return master.target_component in (0, msg.get_srcComponent())
+    except Exception:
+        return True
+
+
 # 메시지 수신율 (STAT 진단용). 스트림 요청이 안 먹으면 fresh 게이트가 닫혀 피드포워드·자세보정이 조용히 꺼진다.
 _RATE_TYPES = {"HEARTBEAT": "HB", "LOCAL_POSITION_NED": "LP", "ATTITUDE": "ATT", "GLOBAL_POSITION_INT": "GP"}
 _rate_counts = {}
@@ -189,10 +200,14 @@ def drain_messages(master):
                     _vehicle_state["mode"] = {
                         "name": mavutil.mode_string_v10(msg),
                         "armed": bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED),
+                        # MAV_STATE: 5(CRITICAL)·6(EMERGENCY) 이면 FC 가 failsafe 중(배터리·EKF·RC)인데 모드는 그대로일 수 있다 — main 이 경보.
+                        "system_status": getattr(msg, "system_status", None),
                         "timestamp": now,
                     }
             except Exception:
                 pass
+        elif not _from_fc(master, msg):
+            continue          # 다른 기체·컴포넌트의 상태 메시지(공유 링크·라우터)는 자기 상태로 받지 않는다
         elif mt == "BATTERY_STATUS":
             try:
                 _set_battery(msg.battery_remaining, msg.voltages[0])

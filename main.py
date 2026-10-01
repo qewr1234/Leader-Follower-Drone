@@ -131,6 +131,20 @@ FC_FAIL_SEC = 15.0       # FC 링크(drain) 예외가 이 시간 이어지면 �
 FC_RECONNECT_SEC = 1.0
 # 리더 소실 10 s 뒤·카메라 사망 종료 시의 행동 (config controller.lost_action: land | rtl | hold).
 LOST_ACTION = str(CONFIG["controller"].get("lost_action", "land")).lower()
+# 추종 추정 거리 상한(AP_Follow FOLL_DIST_MAX 상당): 이보다 멀면 거리 측정으로 치지 않아 먼 오검출을 쫓지 않는다.
+MAX_FOLLOW_DIST_M = float(CONFIG["controller"].get("max_follow_dist_m", 15.0))
+# 상승 천장(home 기준). MIN_AGL_M 의 거울상. FC FENCE_ALT_MAX 가 1차 방어, 이것은 컴패니언 쪽 2차.
+MAX_ALT_M = float(CONFIG["controller"].get("max_alt_m", 30.0))
+# 목표 이격 3 m ↔ 8 m 전환 램프 [m/s]. 계단으로 바꾸면 P 항이 Kp·5 m 만큼 뛰어 ±MAX_VX 로 포화된다.
+TARGET_DISTANCE_RAMP_MPS = float(CONFIG["controller"].get("target_distance_ramp_mps", 0.3))
+# 루프 워치독: 한 프레임이 이보다 오래 걸리면 경고, LOOP_RESET_SEC(GUID_TIMEOUT) 를 넘으면 FC 는 이미 정지했으므로 명령 상태를
+# 0 에서 다시 시작한다 — 멈춰 있던 동안의 평활 버퍼·피드포워드로 갑자기 재출발하지 않게. 단일 스레드라 멈춘 동안 할 수 있는 일은 없고,
+# 복귀 뒤의 처리만 정한다(이전 감사 '루프 시간 워치독 부재').
+LOOP_STALL_SEC = 1.0
+LOOP_RESET_SEC = 3.0
+# AE 측광 ROI 를 전체 프레임으로 되돌리는 연속 미검출 수 (1프레임 미스마다 되돌리면 1 Hz 로 측광이 왕복한다).
+AE_ROI_RELEASE_LOST = int(CONFIG["camera"].get("ae_roi_release_lost_frames", 5))
+MAV_STATE_CRITICAL = 5
 MIN_AGL_M = 1.5          # 이 고도(home 기준, LOCAL_POSITION_NED −z) 아래에서는 하강 명령을 내지 않는다. 고도를 모르면 하강 금지(fail-closed).
 
 # ATTITUDE 불연속 판정 [rad]. FC EKF 가 비행 중 yaw 를 재정렬하면(나침반 불일치, GSF 리셋) 기체는 돌지 않았는데 보고 yaw 만
@@ -220,7 +234,9 @@ def get_follower_altitude_m(vehicle_state):
 
 
 def enforce_agl_floor(cmd_body, follower_alt):
-    """고도 바닥: follower_alt 가 MIN_AGL_M 아래이거나 **모르면**(LOCAL_POSITION_NED 가 낡거나 없음) 하강 성분(BODY_NED z > 0)을 0 으로.
+    """고도 바닥과 천장. 바닥: follower_alt 가 MIN_AGL_M 아래이거나 **모르면**(LOCAL_POSITION_NED 가 낡거나 없음) 하강 성분
+    (BODY_NED z > 0)을 0 으로. 천장: MAX_ALT_M 위에서는 상승 성분(z < 0)을 0 으로 (모르면 상승은 막지 않는다 — 수직 이동을 전부
+    막으면 안 되고, 상승 쪽 1차 방어는 FC FENCE_ALT_MAX 다).
 
     예전에는 `follower_alt is not None and ...` 이라 고도 스트림이 끊기면 바닥이 조용히 사라졌다(fail-open). 트래커가 지면의
     무언가를 물고 내려가는 상황이 바로 고도 스트림까지 의심스러운 상황이라, 모르면 막는 쪽이 맞다. 대가: LOCAL_POSITION_NED 를
@@ -228,6 +244,8 @@ def enforce_agl_floor(cmd_body, follower_alt):
     """
     cmd = np.asarray(cmd_body, dtype=float).copy()
     if (follower_alt is None or float(follower_alt) < MIN_AGL_M) and cmd[2] > 0.0:
+        cmd[2] = 0.0
+    if follower_alt is not None and float(follower_alt) > MAX_ALT_M and cmd[2] < 0.0:
         cmd[2] = 0.0
     return cmd
 
@@ -705,7 +723,8 @@ def main():
     mission = MissionManager(lost_action=LOST_ACTION)
     leader_rx = open_leader_receiver()
     install_signal_handlers()
-    log = ExperimentLogger(CONFIG["logger"]["log_dir"]) if CONFIG["logger"]["enabled"] else None
+    log = (ExperimentLogger(CONFIG["logger"]["log_dir"], max_mb=CONFIG["logger"].get("max_mb", 200.0),
+                            fsync_sec=CONFIG["logger"].get("fsync_sec", 1.0)) if CONFIG["logger"]["enabled"] else None)
 
     last_track = None
     # 루프 시계는 단조 시계다. 벽시계(time.time)는 NTP 동기·수동 시각 설정으로 앞뒤로 뛰고, 앞으로 뛰면 dt·range_coast·
@@ -723,6 +742,9 @@ def main():
     last_heartbeat_tx = 0.0
     fc_mode = "?"
     fc_accepts_setpoints = False
+    target_distance_m = TARGET_DISTANCE_M   # 램프 상태 (TARGET_DISTANCE_RAMP_MPS)
+    stall_count = 0
+    fc_critical_warned = False
     last_fused_rx_time = None     # 마지막으로 EKF 에 융합한 ESP32 패킷의 rx_time
     show_window = SHOW_WINDOW
     frame_idx = 0
@@ -747,6 +769,14 @@ def main():
             # prev_time 은 프레임 획득에 성공한 뒤에 갱신한다 — 카메라/FC 실패로 continue 한 반복의
             # 시간이 predict / range_coast 에서 사라지지 않게.
             dt = max(now - prev_time, 1e-4)
+            # ---------------- 루프 워치독 ----------------
+            if dt > LOOP_STALL_SEC and frame_idx > 0:
+                stall_count += 1
+                print(f"[WARN] 루프 지연 {dt:.2f}s (누적 {stall_count}회)" + (" — FC 는 이미 정지, 명령 상태 0 에서 재시작" if dt > LOOP_RESET_SEC else ""))
+                if dt > LOOP_RESET_SEC:
+                    prev_body_cmd = np.zeros(4)
+                    ff_fru = np.zeros(3)
+                    last_setpoint_time = now - SETPOINT_PERIOD_SEC
 
             # ---------------- Pixhawk 수신 (예외가 이어지면 재연결, FC_FAIL_SEC 뒤 포기) ----------------
             try:
@@ -790,10 +820,19 @@ def main():
                 ff_fru = np.zeros(3)
                 reset_evade_side()
                 last_land_send = 0.0
+                target_distance_m = TARGET_DISTANCE_M
                 print(f"[SYS] {'송신 ON' if send_turned_on else fc_mode + ' 진입'} — 미션/명령 리셋")
             prev_fc_accepts = fc_accepts_setpoints
 
             gps_fresh = is_fresh(vehicle_state.get("gps", {}), now, GPS_MAX_AGE_SEC)
+            gpos_fresh = is_fresh(vehicle_state.get("global_position", {}), now, GPS_MAX_AGE_SEC)
+            # FC 가 failsafe 중(MAV_STATE CRITICAL/EMERGENCY)인데 모드는 GUIDED 그대로일 수 있다(배터리 경고 action 0, FS_OPTIONS 비트 2).
+            # 컴패니언은 모드 변경을 하지 않지만 STAT/HUD 에 경보한다 — 조종사가 개입할 신호.
+            fc_sys_status = vehicle_state.get("mode", {}).get("system_status")
+            fc_critical = mode_fresh and fc_sys_status is not None and int(fc_sys_status) >= MAV_STATE_CRITICAL
+            if fc_critical and not fc_critical_warned:
+                print(f"[WARN] FC system_status={fc_sys_status} (CRITICAL 이상) — FC 가 failsafe 중. 조종사 개입 필요")
+            fc_critical_warned = fc_critical
             local_pos_fresh = is_fresh(vehicle_state.get("local_position", {}), now, LOCAL_POS_MAX_AGE_SEC)
             attitude_fresh = is_fresh(vehicle_state.get("attitude", {}), now, ATTITUDE_MAX_AGE_SEC)
 
@@ -897,7 +936,9 @@ def main():
                     track = tracker.predict_only()
                 last_track = track
                 if set_ae_roi is not None:
-                    set_ae_roi(track["bbox"] if (track is not None and not track.get("is_lost", False)) else None, now)
+                    # 짧은 미스에는 마지막 bbox 를 유지하고, 연속 AE_ROI_RELEASE_LOST 프레임 넘게 놓쳤을 때만 전체 프레임으로.
+                    keep_bbox = track is not None and int(track.get("lost_count", 0)) < AE_ROI_RELEASE_LOST
+                    set_ae_roi(track["bbox"] if keep_bbox else None, now)
 
                 # ---------------- 측정 → 융합 ----------------
                 rgbd_meas = meas_builder.build_rgbd(track, depth_image)
@@ -916,8 +957,10 @@ def main():
             # 융합하면 안 되므로 새 패킷(rx_time 변경)일 때만 융합한다.
             esp = ESP_IDLE
             esp_rx_time = leader_meas.get("rx_time", None)
+            # 팔로워 GLOBAL_POSITION_INT·ATTITUDE 가 신선할 때만 융합한다 — 상대위치는 그 둘로 만들어지므로 낡으면 '고정된 가짜 목표' 가 된다
+            # (2026-10-01 감사 10번).
             if USE_LEADER_ESP32 and leader_meas.get("available", False) and esp_rx_time is not None \
-                    and esp_rx_time != last_fused_rx_time:
+                    and esp_rx_time != last_fused_rx_time and gpos_fresh and attitude_fresh:
                 last_fused_rx_time = esp_rx_time
                 esp = fuse_esp32(ekf, rel, leader_meas)
 
@@ -946,10 +989,13 @@ def main():
 
             # 미션의 "리더가 보인다" = 거리를 아는가. bbox 유무나 is_reliable()(bearing-only 로도 참)은 거리 관측을
             # 보장하지 않아 깊이가 죽어도 소실 판정이 안 나기 때문이다. RGB-D 와 ESP32 위치만 range_coast 를 되돌린다.
-            leader_visible_for_mission = bool(ekf.has_range_fix())
-            # 추종 거리는 거리의 출처로: 카메라 깊이가 살아 있으면 3m, ESP32 GPS 뿐이면 오차 여유를 둔 8m.
+            # 추정 거리가 MAX_FOLLOW_DIST_M 보다 멀면 거리를 안다고 치지 않는다 — 먼 오검출로 초기화된 추정을 전속으로 쫓지 않게.
+            range_m = float(np.linalg.norm(rel_fru)) if ekf.initialized else float("inf")
+            range_too_far = ekf.initialized and range_m > MAX_FOLLOW_DIST_M
+            leader_visible_for_mission = bool(ekf.has_range_fix()) and not range_too_far
+            # 추종 거리는 거리의 출처로: 카메라 깊이가 살아 있으면 3m, ESP32 GPS 뿐이면 오차 여유를 둔 8m. 전환은 램프(계단이면 P 항이 뛴다).
             vision_range_ok = bool(ekf.has_vision_range_fix())
-            target_distance_m = TARGET_DISTANCE_M if vision_range_ok else TARGET_DISTANCE_GPS_ONLY_M
+            target_goal = TARGET_DISTANCE_M if vision_range_ok else TARGET_DISTANCE_GPS_ONLY_M
 
             # 리더 절대 속도(FRU) 는 EKF 상태 그대로다 (자기 속도가 예측 입력으로 들어가 있다). 미션(출발/정지/착륙
             # 판단)과 피드포워드가 같이 쓴다. 상대 속도만 보면 후미가 선두 속도를 맞추는 순간 0 이 되어 '선두 정지' 로
@@ -966,6 +1012,9 @@ def main():
                 leader_vel_body=v_leader_fru)
 
             # ---------------- 명령 ----------------
+            # 목표 이격 램프: 추종 중(allow_follow)에만 움직인다. 소실 홀드 중에 8 m 로 올라가 버리면 재획득 순간 후퇴 과도가 생긴다.
+            if mission_policy["allow_follow"]:
+                target_distance_m += clamp(target_goal - target_distance_m, -TARGET_DISTANCE_RAMP_MPS * dt, TARGET_DISTANCE_RAMP_MPS * dt)
             # 리더 속도 피드포워드: 거리를 아는 추종 상태에서만. 아니면 0 으로 감쇠.
             ff_fru = leader_velocity_ff(
                 ff_fru, v_leader_fru if (mission_policy["allow_follow"] and ekf.has_range_fix()) else None, dt)
@@ -986,7 +1035,7 @@ def main():
                         print(f"[WARN] FC link: {failsafe} 송신 실패: {type(exc).__name__}: {exc}")
                     last_land_send = now
                     last_setpoint_time = now
-            elif mission_policy["allow_follow"] and ekf.initialized:
+            elif mission_policy["allow_follow"] and ekf.initialized and not range_too_far:
                 desired_body_cmd = compute_velocity_cmd_from_estimate(rel_fru, rel_vel_fru, pos_cov_trace, target_distance_m, ff_fru,
                                                                       v_self_fru=v_self_fru)
 
@@ -1041,7 +1090,9 @@ def main():
                      f"tgt={target_distance_m:.1f}m{'' if vision_range_ok else '(GPS)'}", (220, 220, 220), 0.48),
                     (f"cmd BODY_NED vx={current_body_cmd[0]:+.2f} vy={current_body_cmd[1]:+.2f} "
                      f"vz={current_body_cmd[2]:+.2f} yr={current_body_cmd[3]:+.2f} ffF={ff_fru[0]:+.2f}", (100, 255, 100), 0.48),
-                    (f"fresh GPS/LP/ATT={int(gps_fresh)}/{int(local_pos_fresh)}/{int(attitude_fresh)}", (180, 180, 255), 0.48),
+                    (f"fresh GPS/LP/ATT={int(gps_fresh)}/{int(local_pos_fresh)}/{int(attitude_fresh)}"
+                     + (f"  !! FC system_status={fc_sys_status}" if fc_critical else "") + (f"  stall={stall_count}" if stall_count else ""),
+                     (0, 0, 255) if fc_critical else (180, 180, 255), 0.48),
                 ])
                 if ekf.initialized:
                     draw_model_bar(color_image, ekf.get_model_probs())

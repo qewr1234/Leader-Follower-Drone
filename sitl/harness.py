@@ -119,6 +119,7 @@ class World:
     # 팔로워 (local NED, m / rad)
     f_n = f_e = f_d = 0.0
     f_yaw = 0.0
+    f_roll = f_pitch = 0.0   # 가상 카메라는 기체에 고정돼 있으므로 roll/pitch 도 투영에 들어간다 (이전 감사 #45)
     have_fix = False
     have_att = False     # ATTITUDE 를 한 번이라도 받았는가. 기수를 모른 채 기준점을 잡으면 안 된다.
 
@@ -142,6 +143,7 @@ class World:
         cls.generation += 1
         cls.have_fix = False
         cls.have_att = False
+        cls.f_roll = cls.f_pitch = 0.0
         cls.f_n = cls.f_e = cls.f_d = 0.0
         cls.f_yaw = 0.0
         cls.a_n, cls.a_e = 1.0, 0.0
@@ -186,11 +188,24 @@ def in_fov():
     return World.visible and front > 0.3 and 0 <= u < W and 0 <= v < H
 
 
-def _bbox_px():
+def _camera_xyz():
+    """리더의 카메라 프레임 좌표 [right, down, forward]. relative_fru 는 수평(기수 정렬) 프레임이라 기체 roll/pitch 를 되감아
+    기체 FRD 로 돌린 뒤 카메라 축으로 순열한다 — main 이 ATTITUDE 로 하는 자세 보상·레벨링이 하네스 안에서 외란이 아니라
+    실제 기하가 되게. (이전에는 yaw 만 반영해 pitch 10° 가 가짜 리더 이동 68 px 로 보였다.)"""
     front, right, up = World.relative_fru()
-    front = max(front, 0.2)
-    u = int(CX + FX * (right / front))
-    v = int(CY - FY * (up / front))
+    v_lvl = np.array([front, right, -up])                       # 수평 FRD
+    r, pch = World.f_roll, World.f_pitch
+    cr, sr, cp, sp = np.cos(r), np.sin(r), np.cos(pch), np.sin(pch)
+    R_lvl_from_body = np.array([[cp, sp * sr, sp * cr], [0.0, cr, -sr], [-sp, cp * sr, cp * cr]])   # Ry(pitch)·Rx(roll)
+    v_body = R_lvl_from_body.T @ v_lvl
+    return v_body[1], v_body[2], v_body[0]                      # right, down, forward
+
+
+def _bbox_px():
+    x_c, y_c, z_c = _camera_xyz()
+    front = max(z_c, 0.2)
+    u = int(CX + FX * (x_c / front))
+    v = int(CY + FY * (y_c / front))
     half = max(18, int(0.35 * FX / front))     # 폭 0.7m 물체
     return u, v, half, front
 
@@ -522,6 +537,8 @@ def run_scenario(name):
                         f"리더 기수 방향 {ARGS.leader_front}m 앞")
             elif t == "ATTITUDE":
                 World.f_yaw = float(msg.yaw)
+                World.f_roll = float(getattr(msg, "roll", 0.0) or 0.0)
+                World.f_pitch = float(getattr(msg, "pitch", 0.0) or 0.0)
                 World.have_att = True
 
             if t == "VFR_HUD":

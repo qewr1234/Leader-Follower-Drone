@@ -19,7 +19,7 @@
 소스에서 이유를 찾습니다. C5가 그 사례입니다(아래).
 
 ```bash
-python3 test_fixes.py                        # 단위 235개, 하드웨어 불필요
+python3 test_fixes.py                        # 단위 250개, 하드웨어 불필요
 python3 analysis/stability_margins.py        # 안정성 여유 분석 (docs/STABILITY_MARGINS.md)
 python3 analysis/trace_check.py              # 요구도 추적성 (docs/REQUIREMENTS.md)
 python3 sitl/harness.py --all                # SITL 11개 시나리오 (px4_setmode 는 PX4 필요)
@@ -47,7 +47,7 @@ python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 
 ## 수정 완료 (2026-09-07)
 
-`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 235개). 하드웨어 없이 순수 로직만 검증합니다.
+`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 250개). 하드웨어 없이 순수 로직만 검증합니다.
 
 ### C1 — 부팅 즉시 FAILSAFE_LAND
 
@@ -534,9 +534,35 @@ heartbeat·sysid, 신뢰도가 게이트를 넓히는 구조, 레벨링. 전부 
 적용하지 않은 것: 하네스 가상 카메라의 roll/pitch 무시(이전 #45), 로그 로테이션, 루프 시간 워치독, 깊이 센서 실외 설정, 최대 추종 거리 —
 `docs/AUDIT_2026-10-01.md` 3절.
 
+### 남은 항목 (2026-10-01, 감사 보고서 3절과 낮음 등급 10·12·15·17·18·19·20·21번)
+
+단위 검사 15개 추가(총 250). 폐루프 setpoint 스트림은 직전 골든과 바이트 동일 — 아래 어느 것도 기존 시나리오(같은 고도, 수평 자세,
+비전 거리 유지)의 명령을 바꾸지 않는다. 목표 이격 램프는 처음에 소실 홀드 중에도 움직이게 했다가 재획득 순간 2 s 의 후퇴 과도가 생겨
+(setpoint #201 vx +0.010 → −0.074) 추종 중에만 램프하도록 고쳤고, 그 뒤 스트림이 다시 같아졌다.
+
+- **하네스 가상 카메라(이전 #45).** `sitl/harness.py` `_camera_xyz` 가 ATTITUDE 의 roll/pitch 로 수평 FRU 를 기체 FRD 로 되감아 투영한다.
+  pitch +10° 면 정면 리더가 화면에서 68 px 내려간다 — main 의 보상·레벨링과 상쇄되어 외란이 아니라 기하가 된다. SITL 재실행은 아직이다.
+- **로그 로테이션·내구성.** `ExperimentLogger(max_mb, fsync_sec)`: 1 s fsync, 200 MB 마다 `_partN.jsonl`, CSV 는 두 번 훑는 스트리밍으로
+  전 파일 합침, 잘린 마지막 줄 허용.
+- **루프 워치독.** `LOOP_STALL_SEC` 1 s 경고, `LOOP_RESET_SEC` 3 s 넘으면 평활·FF 를 0 에서 재시작하고 setpoint 위상을 다시 잡는다.
+- **깊이 센서 실외 설정·죽은 컬러 옵션 제거(19번).** `apply_depth_options`: emitter·laser_power(%)·IR AE·`auto_exposure_limit`(깊이 센서에만 있는
+  옵션). 컬러의 `color_exposure_max_us` 는 librealsense 가 컬러에 등록하지 않는 옵션이라 제거했다(README·EST-10 정정).
+- **최대 추종 거리(이전 #24·#66)·천장(20번)·이격 램프(12번).** `max_follow_dist_m` 15 m 밖은 소실 취급, `max_alt_m` 30 m 위 상승 차단(고도를
+  모르면 상승은 막지 않음 — 바닥과 비대칭), 3 ↔ 8 m 전환은 추종 중 0.3 m/s 램프.
+- **ESP32 융합 신선도(10번).** 팔로워 GLOBAL_POSITION_INT·ATTITUDE 가 0.7/0.3 s 안일 때만 융합.
+- **AE ROI 왕복(17번).** 연속 5프레임(`ae_roi_release_lost_frames`) 넘게 놓쳤을 때만 전체 프레임으로.
+- **트래커 회복 게이트 하한(18번).** `recover_gate_min_px` 80 — 12 px 표적이 67 px 옮겨져도 재매칭.
+- **sysid 필터·system_status(15·21번).** `mavlink_io._from_fc` 가 상태 메시지의 발신자를 거르고, HEARTBEAT 의 MAV_STATE 를 저장해 CRITICAL
+  이상이면 STAT/HUD 경보(모드 변경은 하지 않는다).
+- **문서(13번).** GCS 의 GUIDED 이륙은 컴패니언 가동 중 쓰지 않는다는 제약을 운용 순서에 적었다.
+
+이로써 `docs/AUDIT_2026-10-01.md` 의 신규 21건은 전부 조치됐다(6번 소실 정책은 설정 노출, 나머지는 코드). 이전 67건 중 코드로 남은 것은
+2 s 코스트 중 외삽 명령(#20), sigma_z·min_reliability 의 R 설계(#26·#59 — 게이트 쪽만 분리로 해소), 자기 속도 복귀 과도(#28),
+FCR-16 축별 클램프(#35), 깊이 이중모드 ROI(#58), 초기화 무게이트(#60), time_boot_ms·MAVLink2·STATUSTEXT 류다.
+
 ## 요구도 추적성 (2026-09-18)
 
-[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 에 요구도 72개(FCR 18 · EST 17 · SAF 19 · IF 13 · OPS 5)를 ID 로 두고
+[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 에 요구도 78개(FCR 19 · EST 18 · SAF 20 · IF 15 · OPS 6)를 ID 로 두고
 각각을 `test_fixes.py` 검사 이름, `test_closed_loop.py` 검사, SITL 시나리오, 분석 결과 키, 소스 문자열로 묶었습니다.
 `analysis/trace_check.py` 가 참조가 실제로 존재하는지 대조하고(`추적성:` 단위 검사), 폐루프 검사 14개는 전부
 요구도에 연결돼 있습니다. 미충족 1개(EST-12 검출률), 미검증 2개(실비행, ESP32 펌웨어), 부분 7개(SAF-05 공중 인계 미검증, SAF-06/SAF-10 시나리오 부재, FCR-07·EST-02 단위 검사 부족, EST-10/11 실기 자료 부재)가 표 3절에

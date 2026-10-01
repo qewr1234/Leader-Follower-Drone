@@ -32,12 +32,17 @@ CONFIG = {
         # ---- 실외 노출 (컬러 센서 librealsense 옵션. 펌웨어/버전이 미지원인 옵션은 건너뛰고 로그) ----
         # False: 저조도에서도 30fps 유지(노출 상한 = 1/fps). True 면 AE 가 fps 를 떨어뜨려 제어 주기가 흔들린다.
         "color_auto_exposure_priority": False,
-        # AE 노출 상한(µs). 이동 중 모션 블러 억제. 0 이면 상한 없음. (auto_exposure_limit, librealsense ≥ 2.50)
-        "color_exposure_max_us": 8000,
+        # (컬러 센서의 노출 상한 옵션은 없었다 — librealsense 는 auto_exposure_limit 을 깊이 센서에만 등록한다. 2026-10-01 감사 19번으로 제거.)
+        # ---- 깊이 센서 실외 설정 (first_depth_sensor 에 적용. 미지원 옵션은 건너뛰고 로그) ----
+        "depth_emitter_enabled": True,     # IR 프로젝터. 실외 주간에는 햇빛이 패턴을 덮지만 그늘·근거리에서는 도움.
+        "depth_laser_power_pct": 100.0,    # 프로젝터 출력(범위의 %). 실외는 최대.
+        "depth_exposure_max_us": 0,        # 깊이(IR) AE 노출 상한 µs. 0 이면 상한 없음. 모션 블러가 깊이 구멍으로 보이면 8000 부터.
         # 하늘 배경 역광에서 어두운 피사체 쪽으로 노출 보정.
         "color_backlight_compensation": True,
         # AE 측광 영역을 추적 bbox(1.5배)로 옮긴다(≤1Hz). 하늘 평균이 아니라 리더에 노출을 맞춘다. 소실 시 전체로 복귀.
         "ae_roi_follow_track": True,
+        # AE 측광 ROI 를 전체 프레임으로 되돌리는 연속 미검출 수. 1프레임 미스마다 되돌리면 1 Hz 로 측광이 왕복한다(감사 17번).
+        "ae_roi_release_lost_frames": 5,
         # 카메라 마운트 자세 [deg] — 기체 FRD 기준 카메라가 어느 쪽으로 기울어 붙었는가 (pitch +: 위를 봄, 아래로 숙여 달면 음수).
         # 제어·추정이 쓰는 기체 프레임 변환(main._CAM_FROM_BODY)에 들어간다. 0 이면 카메라 축 = 기체 축(순열만).
         "mount_roll_deg": 0.0,
@@ -85,6 +90,8 @@ CONFIG = {
         "full_frame_interval": 20,
         "normal_detect_every": 2,
         "maneuver_detect_every": 1,
+        # 회복 근접 게이트의 절대 하한 [px]. bbox 대각선에만 비례하면 먼 소형 표적(12 px)은 자세 과도 한 번(10° ≈ 68 px)에 재매칭 불가(감사 18번).
+        "recover_gate_min_px": 80,
         # 트랙을 잃은 뒤 재획득: 추정기 예측점을 영상에 투영한 99 % 타원 반경에 이 여유를 더한 원 안의 검출만 새 트랙으로 삼는다.
         # 추정기 3-D 게이트가 거리 측정을 연속 이 횟수만큼 거부하면 트랙을 버리고 예측점 근처에서 다시 잡는다 (main.reacquire_hint).
         "reacquire_margin_px": 60,
@@ -96,6 +103,13 @@ CONFIG = {
         # "hold"(제자리 유지 + 경보, 외부 팔로워 구현들의 관례 — 착륙은 조종사·FC 배터리 failsafe 에 맡김), "rtl".
         # 카메라가 죽어 컴패니언이 종료할 때도 같은 행동을 한 번 보낸다(main 의 fatal 경로).
         "lost_action": "land",
+        # 추종 추정 거리 상한 [m]. 이보다 멀면 거리 측정으로 치지 않아(소실 취급) 먼 오검출을 쫓아가지 않는다 (AP_Follow FOLL_DIST_MAX 상당).
+        # GPS 단독 이격 8 m + 오차 여유 안에 있어야 한다.
+        "max_follow_dist_m": 15.0,
+        # 상승 천장 [m, home 기준]. 이보다 높으면 상승 명령을 막는다 (MIN_AGL_M 의 거울상, 감사 20번). FC FENCE_ALT_MAX 가 1차 방어.
+        "max_alt_m": 30.0,
+        # 목표 이격이 3 m ↔ 8 m 로 바뀔 때의 램프 속도 [m/s]. 계단으로 바꾸면 P 항이 ±MAX_VX 로 뛴다(감사 12번).
+        "target_distance_ramp_mps": 0.3,
         # 최소 이격: 리더까지의 거리가 이 값 아래로 들어가면 접근 성분을 잘라내고 침범량에 비례해 물러난다.
         # 선회 중 최근접 1.59m 가 관측돼(VERIFICATION.md 「최소 이격 제약 (1단계)」) 목표 3.0m 와 충돌 사이에 바닥을 둔다.
         "min_separation_m": 2.0,
@@ -138,5 +152,7 @@ CONFIG = {
     "logger": {
         "enabled": True,
         "log_dir": "logs",
+        "max_mb": 200.0,       # JSONL 한 파일 상한. 넘으면 _part2… 로 로테이션 (CSV 는 합쳐서 하나)
+        "fsync_sec": 1.0,      # 전원 차단 대비 fsync 주기
     },
 }

@@ -912,16 +912,25 @@ class _FakeColorSensor:
         self.rois.append((r.min_x, r.min_y, r.max_x, r.max_y))
 
 
-_cfg_cam = {"color_auto_exposure_priority": False, "color_exposure_max_us": 8000, "color_backlight_compensation": True}
-_sn = _FakeColorSensor(vars(_rs.option).keys())
+_rs.option = types.SimpleNamespace(**{n: n for n in ("enable_auto_exposure", "auto_exposure_priority", "backlight_compensation",
+                                                     "auto_exposure_limit", "auto_exposure_limit_toggle", "exposure", "emitter_enabled", "laser_power")})
+_cfg_cam = {"color_auto_exposure_priority": False, "color_backlight_compensation": True,
+            "depth_emitter_enabled": True, "depth_laser_power_pct": 100.0, "depth_exposure_max_us": 8000}
+_sn = _FakeColorSensor(["enable_auto_exposure", "auto_exposure_priority", "backlight_compensation", "exposure"])
 _camera.apply_color_exposure_options(_sn, _cfg_cam)
-check("camera: AE priority off·역광보정 on·노출 상한 8000µs → 80 (RGB 100µs 단위)",
-      ("auto_exposure_priority", 0.0) in _sn.set and ("backlight_compensation", 1.0) in _sn.set
-      and ("auto_exposure_limit", 80.0) in _sn.set and ("enable_auto_exposure", 1.0) in _sn.set, f"set={_sn.set}")
-_sn_old = _FakeColorSensor(["enable_auto_exposure", "auto_exposure_priority", "backlight_compensation"])
-_camera.apply_color_exposure_options(_sn_old, _cfg_cam)
-check("camera: 구버전(auto_exposure_limit 없음)도 예외 없이 나머지 옵션 적용",
-      len(_sn_old.set) == 3 and not any(o == "auto_exposure_limit" for o, _ in _sn_old.set), f"set={_sn_old.set}")
+check("camera: 컬러는 AE priority off·역광보정 on·AE on 세 가지만 — 노출 상한은 컬러 센서에 없는 옵션이라 더 이상 시도하지 않는다(감사 19번)",
+      _sn.set == [("enable_auto_exposure", 1.0), ("auto_exposure_priority", 0.0), ("backlight_compensation", 1.0)], f"set={_sn.set}")
+_sd = _FakeColorSensor(["emitter_enabled", "laser_power", "enable_auto_exposure", "auto_exposure_limit", "auto_exposure_limit_toggle"])
+_sd.get_option_range = lambda opt: types.SimpleNamespace(min=0.0, max=360.0 if opt == "laser_power" else (200000.0 if opt == "auto_exposure_limit" else 1.0))
+_camera.apply_depth_options(_sd, _cfg_cam)
+check("camera: 깊이 센서에 프로젝터 on·laser_power 100 %(=360)·IR AE on·AE 노출 상한 8000µs 를 건다",
+      ("emitter_enabled", 1.0) in _sd.set and ("laser_power", 360.0) in _sd.set and ("enable_auto_exposure", 1.0) in _sd.set
+      and ("auto_exposure_limit", 8000.0) in _sd.set and ("auto_exposure_limit_toggle", 1.0) in _sd.set, f"set={_sd.set}")
+_sd_old = _FakeColorSensor(["emitter_enabled", "enable_auto_exposure"])
+_camera.apply_depth_options(_sd_old, _cfg_cam)
+check("camera: 구버전(laser_power·auto_exposure_limit 없음)도 예외 없이 나머지 깊이 옵션 적용",
+      _sd_old.set == [("emitter_enabled", 1.0), ("enable_auto_exposure", 1.0)], f"set={_sd_old.set}")
+check("camera: start() 가 깊이 센서(first_depth_sensor)에도 옵션을 적용한다", "apply_depth_options(self.profile.get_device().first_depth_sensor()" in open("camera.py", encoding="utf-8").read())
 
 _r = _camera.roi_from_bbox((300, 200, 340, 230), 640, 480)
 check("camera: AE ROI 는 bbox 1.5배를 프레임 안에서, 최소 32px",
@@ -1626,6 +1635,98 @@ check("마운트: 아래로 10° 숙여 단 카메라(mount_pitch −10°)의 �
       and all(k in CONFIG["camera"] for k in ("mount_roll_deg", "mount_pitch_deg", "mount_yaw_deg")), f"{_body_from_cam.round(3)}")
 check("마운트: ego_rotation_cam 이 마운트를 포함한 _CAM_FROM_BODY 로 보상한다",
       "_CAM_FROM_BODY = _CAM_PERM @ _R_BODY_FROM_MOUNT.T" in _msrc2 and "return _CAM_FROM_BODY @ d_rb @ _CAM_FROM_BODY.T" in _msrc2)
+
+
+# ================================================================ 남은 항목 (2026-10-01 감사 3절 낮음 등급·보고서 3절)
+_msrc3 = open("main.py", encoding="utf-8").read()
+# 하네스 가상 카메라가 roll/pitch 를 반영한다
+_hW = _hmod.World
+_hW.f_n = _hW.f_e = 0.0; _hW.f_d = -15.0; _hW.f_yaw = 0.0; _hW.l_n = 3.0; _hW.l_e = 0.0; _hW.l_d = -15.0
+_hW.f_roll = _hW.f_pitch = 0.0
+_u0, _v0, _, _f0 = _hmod._bbox_px()
+_hW.f_pitch = _math.radians(10.0)                       # 기수 들림 → 카메라도 위를 봄 → 리더는 화면 아래로
+_u1, _v1, _, _f1 = _hmod._bbox_px()
+_hW.f_pitch = 0.0
+check("하네스 카메라: pitch +10° 면 정면 리더가 화면 아래로 약 68 px 내려가고 깊이는 cos10° 만큼 줄어든다 (예전: yaw 만 반영해 자세 보상이 외란이 됐다)",
+      _u1 == _u0 and 60 <= _v1 - _v0 <= 72 and abs(_f1 - 3 * _math.cos(_math.radians(10))) < 0.02, f"dv={_v1 - _v0} front={_f1:.3f}")
+check("하네스 카메라: ATTITUDE 의 roll/pitch 를 World 에 저장한다", "World.f_pitch = float(getattr(msg, \"pitch\", 0.0) or 0.0)" in open("sitl/harness.py", encoding="utf-8").read())
+
+# 로거: 로테이션 + 합친 CSV + 잘린 마지막 줄 허용
+import tempfile as _tf  # noqa: E402
+import os  # noqa: E402
+import glob as _glob  # noqa: E402
+with _tf.TemporaryDirectory() as _td:
+    _lg = ExperimentLogger(_td, prefix="t", max_mb=0.001, fsync_sec=0.0)       # 1 KB 마다 로테이션
+    for _i in range(60):
+        _lg.log({"i": _i, "v": {"x": _i * 0.5}, "pad": "x" * 40})
+    with open(_lg.jsonl_path, "a") as _f:
+        _f.write('{"i": 999, "trunc')                                           # 전원 차단으로 잘린 줄
+    _lg.close()
+    _parts = sorted(_glob.glob(os.path.join(_td, "t_*.jsonl")))
+    _csv_lines = open(_lg.csv_path).read().splitlines()
+check("로거: 상한을 넘으면 _part2… 로 돌리고 CSV 는 전 파일을 합쳐 하나로, 잘린 마지막 줄은 건너뛴다",
+      len(_parts) >= 3 and len(_csv_lines) == 61 and _csv_lines[0].startswith("i,v.x,pad") and _csv_lines[-1].startswith("59,29.5"),
+      f"parts={len(_parts)} csv_rows={len(_csv_lines) - 1}")
+check("로거: config logger.max_mb / fsync_sec 가 main 에서 전달된다", "max_mb=CONFIG[\"logger\"].get(\"max_mb\"" in _msrc3 and "os.fsync" in open("logger.py", encoding="utf-8").read())
+
+# 루프 워치독
+check("워치독: 한 프레임이 1 s 넘게 걸리면 경고, 3 s(GUID_TIMEOUT) 넘으면 명령 상태를 0 에서 재시작한다",
+      main.LOOP_STALL_SEC == 1.0 and main.LOOP_RESET_SEC == 3.0 and "if dt > LOOP_RESET_SEC:" in _msrc3
+      and _msrc3.split("if dt > LOOP_RESET_SEC:")[1][:200].count("np.zeros") == 2)
+
+# 최대 추종 거리
+check("최대 거리: 추정 거리가 max_follow_dist_m(15 m)보다 멀면 거리를 안다고 치지 않고(소실 취급) 명령도 내지 않는다",
+      main.MAX_FOLLOW_DIST_M == 15.0 and "range_too_far = ekf.initialized and range_m > MAX_FOLLOW_DIST_M" in _msrc3
+      and "leader_visible_for_mission = bool(ekf.has_range_fix()) and not range_too_far" in _msrc3
+      and "and ekf.initialized and not range_too_far:" in _msrc3)
+
+# 천장
+check("천장: max_alt_m(30 m) 위에서는 상승 명령을 막고, 고도를 모르면 상승은 막지 않는다 (바닥과 비대칭 — 수직 이동을 전부 막지 않기 위해)",
+      main.enforce_agl_floor([0, 0, -0.1, 0], 31.0)[2] == 0.0 and main.enforce_agl_floor([0, 0, -0.1, 0], 10.0)[2] == -0.1
+      and main.enforce_agl_floor([0, 0, -0.1, 0], None)[2] == -0.1 and main.enforce_agl_floor([0, 0, 0.1, 0], 31.0)[2] == 0.1)
+
+# 목표 이격 램프
+check("이격 램프: 3 m ↔ 8 m 전환은 추종 중에만 0.3 m/s 로 램프한다 (소실 홀드 중에는 고정 → 재획득 순간 후퇴 과도 없음)",
+      main.TARGET_DISTANCE_RAMP_MPS == 0.3 and 'if mission_policy["allow_follow"]:\n                target_distance_m += clamp(' in _msrc3
+      and "target_distance_m = TARGET_DISTANCE_M\n" in _msrc3)
+
+# ESP32 융합 신선도
+check("ESP32 신선도: 팔로워 GLOBAL_POSITION_INT·ATTITUDE 가 신선할 때만 융합한다",
+      "esp_rx_time != last_fused_rx_time and gpos_fresh and attitude_fresh" in _msrc3)
+
+# AE ROI 왕복
+check("AE ROI: 연속 5프레임 넘게 놓쳤을 때만 전체 프레임으로 되돌린다 (1프레임 미스마다 1 Hz 왕복하던 것)",
+      main.AE_ROI_RELEASE_LOST == 5 and 'int(track.get("lost_count", 0)) < AE_ROI_RELEASE_LOST' in _msrc3)
+
+# 트래커 회복 게이트 절대 하한
+_trk_far = LeaderTracker()
+_trk_far.update([{"bbox": (314, 234, 326, 246), "conf": 0.8, "area": 144}])          # 12 px 표적
+_trk_far.update([])                                                                  # 1프레임 미스
+_got_far = _trk_far.update([{"bbox": (314 + 67, 234, 326 + 67, 246), "conf": 0.8, "area": 144}])   # 67 px 옮겨진 자리
+check("트래커 회복 게이트: 절대 하한 80 px — 12 px 표적이 자세 과도로 67 px 옮겨져도 재매칭된다 (예전 상한 3·diag ≈ 51 px 로 폐기)",
+      _got_far is not None and _got_far["lost_count"] == 0 and _got_far["track_id"] == 1, f"{_got_far}")
+
+# 상태 메시지 sysid 필터 · system_status
+class _OtherMsg:
+    def __init__(self, mt, sys_, comp=1, **f): self._mt = mt; self._s = sys_; self._c = comp; self.__dict__.update(f)
+    def get_type(self): return self._mt
+    def get_srcSystem(self): return self._s
+    def get_srcComponent(self): return self._c
+class _M2:
+    def __init__(self): self.target_system = 1; self.target_component = 1; self._q = []
+    def recv_match(self, blocking=False, **k): return self._q.pop(0) if self._q else None
+_m2 = _M2()
+_m2._q = [_OtherMsg("ATTITUDE", 1, yaw=0.1, roll=0.0, pitch=0.0, rollspeed=0.0, pitchspeed=0.0, yawspeed=0.0),
+          _OtherMsg("ATTITUDE", 2, yaw=2.5, roll=0.0, pitch=0.0, rollspeed=0.0, pitchspeed=0.0, yawspeed=0.0),
+          _OtherMsg("LOCAL_POSITION_NED", 2, x=0, y=0, z=-3.0, vx=3.0, vy=0, vz=0),
+          _OtherMsg("HEARTBEAT", 1, type=2, autopilot=3, base_mode=128, custom_mode=4, mode_name="GUIDED", system_status=5)]
+_mio.drain_messages(_m2)
+_vs2 = _mio.get_vehicle_state()
+check("sysid 필터: 다른 기체(sysid 2)의 ATTITUDE/LOCAL_POSITION_NED 는 자기 상태로 받지 않는다",
+      abs(_vs2["attitude"]["yaw"] - 0.1) < 1e-9 and _vs2["local_position"].get("z") is None or _vs2["local_position"].get("vx") != 3.0,
+      f"yaw={_vs2['attitude'].get('yaw')} lp={_vs2['local_position']}")
+check("system_status: HEARTBEAT 의 MAV_STATE 를 저장해 CRITICAL(5) 이상이면 main 이 경보한다",
+      _vs2["mode"].get("system_status") == 5 and "fc_critical = mode_fresh and fc_sys_status is not None and int(fc_sys_status) >= MAV_STATE_CRITICAL" in _msrc3)
 
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "

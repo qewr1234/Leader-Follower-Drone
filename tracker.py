@@ -8,7 +8,10 @@ tracker.py — 선두 드론 단일 타겟 트래커
 import math
 from typing import List, Dict, Optional
 
+from config import CONFIG
 from utils_geometry import iou_xyxy, bbox_area, bbox_center
+
+RECOVER_GATE_MIN_PX = float(CONFIG["scheduler"].get("recover_gate_min_px", 80))
 
 
 class LeaderTracker:
@@ -114,7 +117,8 @@ class LeaderTracker:
         dx, dy = bbox_center(det_bbox)
         diag = math.hypot(prev_bbox[2] - prev_bbox[0], prev_bbox[3] - prev_bbox[1])
         grow = min(float(lost_count), float(self.recover_gate_frames))
-        max_move = diag * (0.75 + 0.75 * grow)
+        # 절대 하한: 먼 소형 표적(8~10 m, 12~14 px)은 대각선 비례 반경(≤61 px)이 자세 과도 한 번(10° ≈ 68 px)보다 작아 재매칭이 불가능했다.
+        max_move = max(diag * (0.75 + 0.75 * grow), RECOVER_GATE_MIN_PX)
         return math.hypot(dx - px, dy - py) <= max_move
 
     def note_gate_accept(self):
