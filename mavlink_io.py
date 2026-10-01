@@ -79,7 +79,6 @@ _vehicle_state = {
     "local_position": {},
     "attitude": {},
     "mode": {},
-    "timestamp": 0.0,
 }
 
 
@@ -122,7 +121,6 @@ def drain_messages(master):
             break
         mt = msg.get_type()
         now = time.time()
-        _vehicle_state["timestamp"] = now
         if mt in _RATE_TYPES:
             _rate_counts[mt] = _rate_counts.get(mt, 0) + 1
 

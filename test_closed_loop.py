@@ -16,7 +16,7 @@ ATTITUDE / GLOBAL_POSITION_INT 를 돌려준다. 시계도 가짜라(프레임�
 시나리오 (40초, 1200프레임):
    0~1s   ALT_HOLD 로 15m 호버, 리더 4.5m 전방
    1s     조종사가 GUIDED 로 넘김           → 미션 리셋, READY_HOVER
-   3~11s  리더 0.3 m/s 전진               → FOLLOW, 거리 TARGET+v/KP 로 수렴
+   3~11s  리더 0.3 m/s 전진               → FOLLOW, 거리 TARGET + (v − KFF·(v−DB) + KV·v)/Kp 로 수렴
    11~16s 리더 정지                        → LEADER_HOVER, 거리 TARGET 로 수렴
    16~20s 리더 4초 소실(검출 없음)         → 2초 코스팅 뒤 LOST_HOLD
    20s    재검출, 리더는 호버 중           → 즉시 LEADER_HOVER (출발 확인 없이)
@@ -360,8 +360,8 @@ def front_at(t):
 
 _e105 = front_at(10.5) - main.TARGET_DISTANCE_M
 _dmin = min(d for t, d, _ in World.dist if 11.0 <= t <= 16.0)
-# 리더는 3.0s 에 출발, FOLLOW 확정은 ~5.1s 라 그 사이 0.6m 가 벌어진 채 시작한다. 같은 조건에서 P 만이면 +1.15m.
-check("FOLLOW 중(리더 0.3m/s, t=10.5s) 거리 오차 < 0.7m — 피드포워드 (KFF=0 이면 +1.15m, 정상상태 v/Kp=1.36m. FF 저역통과 2s·데드존 0.05 뒤 정상상태 0.45m)",
+# 리더는 3.0s 에 출발, FOLLOW 확정은 ~5.1s 라 그 사이 0.6m 가 벌어진 채 시작한다. 같은 조건에서 P 만(KFF=0·KV=0)이면 +0.95m, KFF 만 끄면 +1.13m.
+check("FOLLOW 중(리더 0.3m/s, t=10.5s) 거리 오차 < 0.7m — 피드포워드 (현재 KP 0.30·KFF 0.8·τ_ff 0.1s·KV 0.3·DB 0.05 의 정상상태 0.63m, 실측 +0.67m. KFF=0 이면 +1.13m, P 만(KFF=0·KV=0)이면 +0.95m, P 만의 정상상태 v/Kp=1.0m)",
       abs(_e105) < 0.7, f"front-target={_e105:+.2f}m")
 check("리더 정지 후 최소 접근 거리 ≥ 2.3m (피드포워드 오버슈트 없음)", _dmin >= 2.3, f"min={_dmin:.2f}m")
 check("추종 중(t=8s) 상태는 FOLLOW — 리더 절대 속도 기준 (상대 속도면 따라잡는 순간 LEADER_HOVER 로 오판)",

@@ -403,22 +403,19 @@ def run_px4_setmode():
         return False
 
     mapping = m.mode_mapping() or {}
-    land_key = "AUTO.LAND" if "AUTO.LAND" in mapping else "LAND"
+    land_key = "LAND"
     val = mapping.get(land_key)
     log(f"mode_mapping['{land_key}'] = {val!r} (type={type(val).__name__})")
     if not isinstance(val, tuple):
         log("!! 3-튜플이 아니다 — 이 pymavlink/기체 조합에서는 C6 전제가 성립하지 않는다")
         return False
 
-    for key in (land_key, "LAND"):
-        if key not in mapping:
-            continue
-        try:
-            r = main.set_mode(m, key)
-            log(f"set_mode({key}) -> {r} (예외 없음)")
-        except Exception as e:
-            log(f"!! FAIL C6: set_mode({key})가 {type(e).__name__}: {e}")
-            ok = False
+    try:
+        r = main.set_mode(m, land_key)
+        log(f"set_mode({land_key}) -> {r} (예외 없음)")
+    except Exception as e:
+        log(f"!! FAIL C6: set_mode({land_key})가 {type(e).__name__}: {e}")
+        ok = False
 
     try:
         main.send_land(m)

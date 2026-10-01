@@ -45,7 +45,6 @@ class MeasurementBuilder:
             return None
         u, v = bbox_center(track["bbox"])
         m = self._base(track, "rgbd", pixel_to_camera(u, v, stats["depth_m"], self.intrinsics), u, v)
-        m["bearing"] = pixel_to_bearing(u, v, self.intrinsics)
         m.update(stats)
         return m
 

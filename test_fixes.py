@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""C1~C6 + H2 회귀 테스트 — 단위 검사 97개.
+"""단위 회귀 검사 모음 — C1~C6·H2 에서 시작해 이후 수정(자세 보정, FF/시간간격, 분석 골든, NaN 방어, 회피, 이격 등)마다 추가.
+개수는 `python3 test_fixes.py | grep -c "^\\[PASS\\]"` 로 센다(README·VERIFICATION 의 숫자와 맞출 것).
 
 하드웨어도 FC도 없이 순수 로직만 검증한다. cv2 / pymavlink / pyrealsense2 등은
 sys.modules에 최소 스텁을 넣어 main.py를 import 가능하게 만든다.
@@ -69,7 +70,7 @@ from mission_manager import (                                # noqa: E402
 )
 from reliability import ReliabilityEstimator                 # noqa: E402
 
-MOVING = dict(rel_est=[3.0, 0.0, 0.0], leader_alt=50.0, pos_cov_trace=1.0)
+MOVING = dict(leader_alt=50.0, pos_cov_trace=1.0)
 
 
 # ---------------------------------------------------------------- C1
@@ -93,7 +94,7 @@ m3 = MissionManager()
 landed = False
 for i in range(200):  # 착륙 조건(하강 + 정지)을 confirm_sec 넘게 유지
     _, p = m3.update(now=100.0 + i * 0.1, leader_visible=True,
-                     rel_est=[3.0, 0.0, 0.0], rel_vel_est=[0.0, 0.0, -0.5],
+                     rel_vel_est=[0.0, 0.0, -0.5],
                      leader_alt=None, pos_cov_trace=1.0)
     landed |= p["land"]
 check("C3: 절대고도 없으면 공중 착륙판정 안 남", landed is False)
@@ -102,7 +103,7 @@ m4 = MissionManager()
 landed = False
 for i in range(200):
     _, p = m4.update(now=100.0 + i * 0.1, leader_visible=True,
-                     rel_est=[3.0, 0.0, 0.0], rel_vel_est=[0.0, 0.0, -0.5],
+                     rel_vel_est=[0.0, 0.0, -0.5],
                      leader_alt=0.2, pos_cov_trace=1.0)
     landed |= p["land"]
 check("C3: 진짜 지면 근처(0.2m)에서는 착륙판정 남", landed is True)
@@ -356,7 +357,7 @@ check("skip: bearing 측정에도 전파", b_skip.get("detector_skipped") is Tru
 # 안 돌아 리더가 천천히 시야를 벗어나면 소실 착륙으로 이어진다.
 from mission_manager import S_LOST_HOLD, S_READY_HOVER  # noqa: E402
 
-_MV = dict(rel_est=[3.0, 0.0, 0.0], leader_alt=50.0, pos_cov_trace=1.0)
+_MV = dict(leader_alt=50.0, pos_cov_trace=1.0)
 
 
 def _follow_then_lose(m, t, lose_sec):
@@ -406,7 +407,7 @@ check("재개: reset()이 '추종한 적 있음' 기억까지 지움 (인계 후
 # 첫 프레임에 (now - candidate_t)가 confirm_sec을 넘어 LAND가 나간다.
 from mission_manager import S_LANDING_CANDIDATE, S_CONFIRMED_LANDING  # noqa: E402
 
-_LANDING = dict(rel_est=[3.0, 0.0, 0.0], rel_vel_est=[0.0, 0.0, -0.5], leader_alt=0.3, pos_cov_trace=1.0)
+_LANDING = dict(rel_vel_est=[0.0, 0.0, -0.5], leader_alt=0.3, pos_cov_trace=1.0)
 m11 = MissionManager()
 t = 100.0
 for _ in range(10):                          # 착륙 후보 1.0초 (< confirm 1.8초)
@@ -414,7 +415,7 @@ for _ in range(10):                          # 착륙 후보 1.0초 (< confirm 1
 check("타이머: 1.0초 착륙 후보는 아직 LANDING_CANDIDATE",
       st == S_LANDING_CANDIDATE and p["land"] is False, f"state={st}")
 for _ in range(30):                          # 3초 소실 (< lost_hold 8초)
-    st, p = m11.update(now=t, leader_visible=False, rel_est=[3.0, 0.0, 0.0], pos_cov_trace=1.0); t += 0.1
+    st, p = m11.update(now=t, leader_visible=False, pos_cov_trace=1.0); t += 0.1
 assert st == S_LOST_HOLD, st
 t_reacq = t
 st, p = m11.update(now=t, leader_visible=True, **_LANDING); t += 0.1
@@ -705,7 +706,7 @@ check("하네스: --all이 depth_loss·handover 까지 포함",
 # 공분산이 회복된 첫 프레임에 (가려진 시간이 합산돼) CONFIRMED_LANDING 이 나지 않는다.
 m12 = MissionManager()
 t = 100.0
-_LANDING = dict(rel_est=[3.0, 0.0, 0.0], rel_vel_est=[0.0, 0.0, -0.5], leader_alt=0.3)
+_LANDING = dict(rel_vel_est=[0.0, 0.0, -0.5], leader_alt=0.3)
 for _ in range(10):                              # 1.0초 착륙 후보
     m12.update(now=t, leader_visible=True, pos_cov_trace=1.0, **_LANDING); t += 0.1
 for _ in range(30):                              # 3초 공분산 폭주 → LOST_HOLD
@@ -1006,8 +1007,8 @@ check("FF (시간간격 정책): h = KV/Kp = 1.0 s ≥ 2·τ_eff — 0.3 m/s 추
       abs(main.KV_SELF - 0.3) < 1e-9 and abs(main.KP_FORWARD - 0.30) < 1e-9 and abs(_e_theory_ff - 0.633) < 0.01,
       f"e_ss={_e_theory_ff:.3f}m")
 
-# ------------------------------------------------- 미션: 리더 절대 속도(자기 속도 + 상대 속도) 기준
-_mv = dict(rel_est=[3.0, 0.0, 0.0], leader_alt=50.0, pos_cov_trace=1.0)
+# ------------------------------------------------- 미션: 리더 절대 속도(EKF 상태) 기준
+_mv = dict(leader_alt=50.0, pos_cov_trace=1.0)
 m20 = MissionManager(); t = 0.0
 for _ in range(12):                              # 리더 출발 → FOLLOW 확정
     st, _ = m20.update(now=t, leader_visible=True, rel_vel_est=[0.3, 0, 0], leader_vel_body=[0.3, 0, 0], **_mv); t += 0.1
@@ -1022,7 +1023,7 @@ st, _ = m20.update(now=t, leader_visible=True, rel_vel_est=[0.5, 0, 0], **_mv); 
 check("미션: 둘 다 없으면 상대 속도 폴백 (0.5 → FOLLOW)", st == S_FOLLOW, f"state={st}")
 m21 = MissionManager(); t = 0.0
 for _ in range(25):                              # 후미가 하강 중이면 상대 vz 는 +, 리더 절대 vz 는 -0.5 (진짜 착륙)
-    st, p = m21.update(now=t, leader_visible=True, rel_est=[3.0, 0, 0], rel_vel_est=[0.0, 0, +0.3],
+    st, p = m21.update(now=t, leader_visible=True, rel_vel_est=[0.0, 0, +0.3],
                        leader_vel_body=[0.0, 0, -0.5], leader_alt=0.3, pos_cov_trace=1.0); t += 0.1
 check("미션: 착륙 판정도 절대 vz 로 (상대 vz 가 + 여도 리더가 하강하면 CONFIRMED_LANDING)", p["land"] is True, f"state={st}")
 
@@ -1065,8 +1066,8 @@ _rp = _margins_of(**_LEG, **_sm.PREV)
 check("분석 골든: 직전 설계(2026-09-18: FF τ 2.0s + 자기 속도 정합 0.3s, 상대속도 추정기) GM 14.4dB·|Γ| 1.13 — SITL leader_sine 0.72 로 검증된 설계의 기록",
       abs(_rp["gm_db"] - 14.4) < 0.3 and abs(_rp["peak"] - 1.126) < 0.02 and abs(_rp["self_fb_peak"] - 0.13) < 0.02,
       f"GM={_rp['gm_db']:.2f} Γ={_rp['peak']:.3f} fb={_rp['self_fb_peak']:.2f}")
-_rr = _margins_of()                      # 코드 값 (절대속도 추정기, τ_ff 0.1, KV 0.2, Kp 0.30)
-check("분석 (FCR-10): 현재 설계(절대속도 추정기 + FF τ 0.1s + 시간간격 KV 0.2 + Kp 0.30) 전 축 PM ≥ 45°, GM ≥ 15dB, Ms ≤ 1.25, "
+_rr = _margins_of()                      # 코드 값 (절대속도 추정기, τ_ff 0.1, KV 0.3, Kp 0.30)
+check("분석 (FCR-10): 현재 설계(절대속도 추정기 + FF τ 0.1s + 시간간격 KV 0.3 + Kp 0.30) 전 축 PM ≥ 45°, GM ≥ 15dB, Ms ≤ 1.25, "
       "|Γ| 피크 ≤ 1.0 (스트링 안정), FF 자기 경로 ≤ 0.15",
       all(_margins_of(kp=kp, kd=kd)["gm_db"] >= 15 and _margins_of(kp=kp, kd=kd)["pm_deg"] >= 45 and _margins_of(kp=kp, kd=kd)["peak"] <= 1.0 + 1e-3
           for kp, kd in ((main.KP_RIGHT, main.KD_RIGHT), (main.KP_UP, main.KD_UP)))
@@ -1134,7 +1135,7 @@ def _imm_follow(turn, speed=1.0, ego_on=True, T=12.0, dt=0.05):
     return ek
 
 
-_w_on_slow = _imm_follow(0.5)._omega if False else _imm_follow(0.5).filters[1]._omega
+_w_on_slow = _imm_follow(0.5).filters[1]._omega
 _w_on_fast = _imm_follow(1.0).filters[1]._omega
 _w_off_slow = _imm_follow(0.5, ego_on=False).filters[1]._omega
 _w_off_fast = _imm_follow(1.0, ego_on=False).filters[1]._omega

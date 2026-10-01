@@ -3,11 +3,11 @@ leader_telemetry.py — ESP32 leader telemetry receiver + relative measurement b
 
 선두 ESP32에서 아래 값이 온다고 가정한다.
 
-필수 필드:
-- lat, lon, alt
-- vx, vy, vz
-- roll, pitch, yaw
-- timestamp
+필수: lat, lon, alt (또는 alt_msl/alt_amsl = AMSL, alt_ellipsoid/alt_hae/alt_wgs84 = 타원체고; 그냥 alt/altitude/alt_m 이면
+수신기 default_alt_frame). 셋 중 하나라도 없으면 패킷은 버려진다(parse_leader_json → None).
+선택(없으면 0.0): vx, vy, vz(ENU m/s), roll, pitch, yaw. timestamp 없으면 수신 시각, seq 없으면 -1.
+주의: vx/vy/vz 가 빠지면 리더 속도 0 으로 처리돼 (1) 상대속도 측정이 −자기속도 로 EKF 에 들어가고
+(2) 미션이 ESP32 절대속도 0 을 최우선으로 읽어 선두를 "정지" 로 판정한다. 실제 운용 펌웨어는 vx/vy/vz 를 반드시 보낼 것.
 
 지원 입력 형식:
 1) Serial JSON line
@@ -62,7 +62,6 @@ class LeaderPacket:
     rx_time: float
     seq: int = -1
     alt_frame: str = "AMSL"       # "AMSL" | "ELLIPSOID"
-    raw: Optional[Dict[str, Any]] = None
 
 
 # ============================================================
@@ -275,7 +274,6 @@ def parse_leader_json(text: str, default_alt_frame: str = "AMSL") -> Optional[Le
             rx_time=now,
             seq=seq,
             alt_frame=alt_frame,
-            raw=d,
         )
 
     except Exception:
@@ -390,9 +388,7 @@ def enu_to_body_fru(vec_enu, follower_yaw_rad):
 
 
 def fru_to_camera_xyz(vec_fru):
-    """
-    FRU [front, right, up] → camera XYZ [right, down, forward]
-    """
+    """FRU [front, right, up] → camera XYZ [right, down, forward]. main.camera_xyz_to_fru 의 역변환."""
     front, right, up = map(float, vec_fru[:3])
     return np.array([right, -up, front], dtype=float)
 
@@ -425,8 +421,8 @@ def _follower_vel_enu_from_mavlink(vehicle_state: Dict[str, Any]):
         return None
 
 
-def _unavailable(reason, age, fresh=True):
-    return {"available": False, "fresh": fresh, "age": age, "reason": reason}
+def _unavailable(reason, age):
+    return {"available": False, "age": age, "reason": reason}
 
 
 def build_leader_measurement_from_packet(
@@ -442,7 +438,6 @@ def build_leader_measurement_from_packet(
 
     반환 dict:
         available
-        fresh
         age
         rel_enu
         rel_fru
@@ -462,7 +457,7 @@ def build_leader_measurement_from_packet(
 
     age = now - float(packet.rx_time)
     if age > max_age_sec:
-        return _unavailable("stale_leader_packet", age, fresh=False)
+        return _unavailable("stale_leader_packet", age)
 
     # follower GPS는 GPS_RAW_INT보다 GLOBAL_POSITION_INT를 우선 사용
     follower_lla = normalize_lat_lon_alt_from_mavlink(
@@ -515,9 +510,9 @@ def build_leader_measurement_from_packet(
     else:
         raise ValueError("leader_velocity_frame must be 'ENU' or 'NED'")
 
-    # 상대속도 = 선두 속도 - 후미 속도.
-    # IMM-EKF 상태가 "상대" 위치/속도이므로, 힌트도 상대속도여야
-    # 추종 중(둘 다 이동)에 후미 자신의 속도만큼 편향되지 않는다.
+    # 상대속도 = 선두 속도 − 후미 속도. EKF 상태 속도는 리더 절대 속도지만 속도 측정의 관측 모델이
+    # h(x) = v − v_ego (ImmEkf.update_velocity3d)라 측정은 상대속도로 넘긴다(힌트가 아니라 게이트 있는 정규 측정).
+    # 후미 속도를 모르면 아래 폴백에서 리더 절대 속도가 그대로 들어가 자기 속도만큼 편향된다.
     follower_vel_enu = _follower_vel_enu_from_mavlink(follower_vehicle_state)
 
     if follower_vel_enu is not None:
@@ -535,7 +530,6 @@ def build_leader_measurement_from_packet(
 
     return {
         "available": True,
-        "fresh": True,
         "age": float(age),
         "reason": "ok",
 
@@ -561,7 +555,6 @@ def build_leader_measurement_from_packet(
         "timestamp": float(packet.timestamp),
         "rx_time": float(packet.rx_time),
         "seq": int(packet.seq),
-        "raw": packet.raw or {},
     }
 
 

@@ -64,14 +64,15 @@ class MissionManager:
         # 한 번이라도 FOLLOW 에 들어갔는가. 참이면 잠깐 놓쳤다 다시 찾았을 때 출발 확인 없이 재개.
         self.has_followed = False
 
-    def update(self, now, leader_visible, rel_est=None, rel_vel_est=None,
+    def update(self, now, leader_visible, rel_vel_est=None,
                leader_alt=None, leader_vel_world=None, pos_cov_trace=999.0, leader_vel_body=None):
         """
         - leader_visible: 거리를 아는가 (RGB-D 또는 ESP32) — main 이 ekf.has_range_fix() 로 준다
-        - rel_est / rel_vel_est: 후미 기준 선두 상대 위치·속도 [front, right, up]
+        - rel_vel_est: 후미 기준 선두 상대 속도 [front, right, up]
         - leader_alt: 선두 절대(대지) 고도. None 이면 착륙 판정을 하지 않는다 (C3)
         - leader_vel_world: ESP32/GPS 선두 절대 속도 ENU (있으면 최우선)
-        - leader_vel_body: 선두 절대 속도 FRU = 후미 자기 속도(FC) + 상대 속도(EKF). ESP32 가 없을 때의 기본 소스.
+        - leader_vel_body: 선두 절대 속도 FRU — IMM-EKF 상태 속도(자기 속도는 예측 입력)를 main 이 camera→FRU 로 돌려 준다.
+          ESP32 가 없을 때의 기본 소스.
           상대 속도만 쓰면 후미가 선두 속도를 맞추는 순간 0 이 되어 '선두 정지' 로 오판한다.
         - pos_cov_trace: IMM 위치 공분산 trace
         상대 속도(rel_vel_est)는 위 둘이 모두 없을 때(자기 속도 미수신)의 폴백이다.
@@ -142,7 +143,7 @@ class MissionManager:
         return dict(_POLICY.get(self.state, _POLICY_UNKNOWN))
 
     def _extract_motion(self, rel_vel_est, leader_alt, leader_vel_world, leader_vel_body=None):
-        """(수평 속도, 수직 속도(up +), 착륙 판정용 고도). 속도 소스 우선순위: ESP32 절대(ENU) > 자기+상대(FRU) > 상대."""
+        """(수평 속도, 수직 속도(up +), 착륙 판정용 고도). 속도 소스 우선순위: ESP32 절대(ENU) > EKF 상태 절대 속도(FRU) > 상대."""
         v = leader_vel_world if leader_vel_world is not None else (leader_vel_body if leader_vel_body is not None else rel_vel_est)
         hspeed = vz = 0.0
         if v is not None:

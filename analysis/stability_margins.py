@@ -697,7 +697,7 @@ def make_plots(res, frf_data):
     for label, kw, c in (("P+D only (KFF=0)", dict(kff=0.0, kv=0.0), "gray"),
                          ("before 2026-09-18 (FF LPF 0.7s, relative-velocity EKF)", dict(kp=LEGACY_FWD[0], kd=LEGACY_FWD[1], **BEFORE), "tab:red"),
                          ("2026-09-18 fix (FF LPF 2.0s + self-vel LPF 0.3s)", dict(kp=LEGACY_FWD[0], kd=LEGACY_FWD[1], **PREV), "tab:orange"),
-                         ("current (ego-input EKF, FF LPF 0.1s, time-gap KV 0.2, Kp 0.30)", {}, "tab:green")):
+                         (f"current (ego-input EKF, FF LPF {base.tau_ff:g}s, time-gap KV {base.kv:g}, Kp {base.kp:.2f})", {}, "tab:green")):
         L = open_loop(base.copy(**kw), W, frf)
         ax[0].semilogx(W, 20 * np.log10(np.abs(L)), color=c, label=label)
         ax[1].semilogx(W, np.degrees(np.unwrap(np.angle(L))), color=c)
@@ -719,7 +719,7 @@ def make_plots(res, frf_data):
     for label, kw, c in (("KFF=0", dict(kff=0.0), "gray"), ("before 2026-09-18 (KFF 0.8, FF LPF 0.7s)", dict(**BEFORE), "tab:red"),
                          ("before, KFF=1.0", dict(kff=1.0, tau_ff=0.7, tau_m=0.0), "tab:orange"),
                          ("KFF=1.0, no LPF", dict(kff=1.0, tau_ff=1e-3, tau_m=0.0), "tab:purple"),
-                         ("current (KFF 0.8, FF LPF 2.0s + self-vel LPF 0.3s)", {}, "tab:green")):
+                         (f"current (ego-input EKF, KFF {base.kff:g}, FF LPF {base.tau_ff:g}s, time-gap KV {base.kv:g})", {}, "tab:green")):
         G = np.abs(leader_to_follower(base.copy(**kw), W, frf))
         ax.semilogx(W, G, color=c, label=f"{label}  peak {G.max():.3f}")
     ax.axhline(1.0, color="k", lw=0.8, ls="--")

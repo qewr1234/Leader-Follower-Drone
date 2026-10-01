@@ -101,7 +101,7 @@ uint32 필드에 튜플을 넣다가 `struct.error`가 나고, 예외 처리가 
 죽었습니다.**
 
 **수정**: `master.set_mode(mode_name)`에 위임(pymavlink가 apm/px4 자동 분기) + `try/except`로
-non-fatal화 → `AUTO.LAND` 재시도와 `MAV_CMD_NAV_LAND` fallback에 실제로 도달합니다.
+non-fatal화 → `MAV_CMD_NAV_LAND` fallback에 실제로 도달합니다.
 
 ### H2 — 호버 리더 정위치 유지가 존재하지 않음
 
@@ -329,7 +329,8 @@ KP 0.22 에서 P 항의 후퇴 `-KP·(3−d)` 와 제약의 허용치 `-KS·(2�
 진짜 빈 구간은 **리더가 MAX_VX 보다 빠르게 다가오는 경우**입니다. 정면 후퇴로는 원리적으로 벗어날 수 없습니다.
 실제 제어 함수로 돌린 오프라인 모의에서 0.6 m/s 정면 접근은 접촉(0.00 m), 0.7 m/s 도 접촉(0.01 m)이었습니다.
 그래서 회피 반경 1.5 m 안에서 시선에 수직인 측면 속도를 얹는 2단계를 추가했습니다. 같은 조건에서 0.54 m,
-0.41 m 로 접촉을 면합니다. SITL 시나리오 `min_separation` 이 이를 검사하며 아직 실행하지 않았습니다.
+0.41 m 로 접촉을 면합니다. SITL 시나리오 `min_separation` 이 이를 검사합니다(하네스 월드 기준점 수정 뒤 사용자 실행에서
+통과 보고, 결과 CSV 는 저장소에 없음).
 
 SITL 차등 검증에서 **회피가 실제로는 무효화되고 있었다**는 것을 찾았습니다. 대조군(회피 없음)과 현재 코드가
 똑같이 측면 속도 0.01 m/s 였습니다. 제어기는 0.22 m/s 를 명령하는데 기체가 안 움직인 것으로, 원인은 회피
@@ -486,7 +487,7 @@ pursuit 0.7 접촉)을 고정합니다. 그 위는 `MAX_V*` 인상 또는 리더
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 에 요구도 63개(FCR 17 · EST 15 · SAF 16 · IF 11 · OPS 4)를 ID 로 두고
 각각을 `test_fixes.py` 검사 이름, `test_closed_loop.py` 검사, SITL 시나리오, 분석 결과 키, 소스 문자열로 묶었습니다.
 `analysis/trace_check.py` 가 참조가 실제로 존재하는지 대조하고(`추적성:` 단위 검사), 폐루프 검사 14개는 전부
-요구도에 연결돼 있습니다. 미충족 1개(EST-12 검출률), 미검증 2개(실비행, ESP32 펌웨어), 부분 7개(FCR-10 잔여 피크 1.13 포함)가 표 3절에
+요구도에 연결돼 있습니다. 미충족 1개(EST-12 검출률), 미검증 2개(실비행, ESP32 펌웨어), 부분 7개(SAF-05 공중 인계 미검증, SAF-06/SAF-10 시나리오 부재, FCR-07·EST-02 단위 검사 부족, EST-10/11 실기 자료 부재)가 표 3절에
 필요한 조치와 함께 있습니다.
 
 ## 남은 결함
@@ -496,7 +497,7 @@ pursuit 0.7 접촉)을 고정합니다. 그 위는 `MAX_V*` 인상 또는 리더
 
 - **`handover` 의 공중 인계가 검증되지 않았습니다.** 위 절의 하네스 한계. 조종사 링크에 RC override 를 넣어
   LOITER 중 고도를 유지하게 고친 뒤 재실행해야 합니다.
-- **`depth_range` 의 평형 거리 미확인.** 35 초로는 부족합니다. `--duration 60` 이상으로 재실행하면 이론값 3.45 m
+- **`depth_range` 의 평형 거리 미확인.** 35 초로는 부족합니다. `--duration 60` 이상으로 재실행하면 이론값 3.63 m(현재 Kp 0.30·KV 0.3)
   수렴을 확인할 수 있습니다.
 - ~~**스트링 안정성 잔여 피크 1.13 (0.27 rad/s)**~~ → 해소(위 절: 절대속도 추정기 + 시간간격 정책 + FF τ 0.1 s, 전 축 ≤ 1.000).
   **SITL `leader_sine`·`depth_range`·`hover_hold` 는 직전 설계로 실측한 값이라 현재 파라미터(Kp 0.30, KV 0.3)로 재실행해야
@@ -514,6 +515,12 @@ pursuit 0.7 접촉)을 고정합니다. 그 위는 `MAX_V*` 인상 또는 리더
 복사해 `reliability.py`의 0.55 페널티가 실제로 적용됩니다(`test_fixes.py`의 `skip:` 검사).
 `leader_rx.start()` 크래시 — `open_leader_receiver()`가 `start()`를 `try`로 감싸 ESP32가 없으면
 경고 후 비전 단독으로 뜹니다.
+
+미사용 코드 정리(2026-10-01): RGB-D 측정 dict 의 `bearing` 키(어디서도 읽지 않던 프레임당 중복 계산)를 제거해
+로그 열 `measurement.bearing` 이 사라집니다 — 필요하면 `measurement.cx/cy` 와 intrinsics 로 재계산할 수 있습니다.
+그 외 제거(`ImmEkf.mark_dirty`, `MissionManager.update(rel_est=)`, `LeaderPacket.raw`/`fresh` 키, `mavlink_io` 최상위
+`timestamp`, `has_range_fix(max_age)`, `get_state_dict` 의 타이머 3개 키, `send_land` 의 `AUTO.LAND` 재시도, `m` 키 토글)는
+로그 스키마와 setpoint 스트림을 바꾸지 않습니다(폐루프 골든 바이트 동일).
 
 ## 검증 방법
 

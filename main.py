@@ -23,7 +23,8 @@ from config import CONFIG
 from detector import YoloDetector
 from imm_ekf import ImmEkf
 from leader_telemetry import (LeaderTelemetryReceiver, apply_leader_velocity_update_to_imm,
-                              build_leader_measurement_from_packet)
+                              build_leader_measurement_from_packet,
+                              fru_to_camera_xyz)  # camera_xyz_to_fru 의 역변환. analysis 가 main.fru_to_camera_xyz 로 참조
 from logger import ExperimentLogger
 from mavlink_io import battery_text, connect_fc, drain_messages, get_vehicle_state, stream_rates_text
 from measurement import MeasurementBuilder
@@ -39,13 +40,13 @@ from utils_geometry import bbox_center, clamp
 
 SHOW_WINDOW = os.environ.get("MARS_SHOW_WINDOW", "1") != "0"
 # 화면 출력(그리기+imshow+waitKey)은 비-YOLO 비용 중 가장 크다(Jetson 4~8ms). 2프레임에 한 번(15Hz)만
-# 그린다. 키 입력(q/m/v/h/l)도 그 프레임에서만 읽히므로 최대 1프레임 늦게 반응한다.
+# 그린다. 키 입력(q/v/h/l)도 그 프레임에서만 읽히므로 최대 1프레임 늦게 반응한다.
 DISPLAY_EVERY = 2
 
 # 처음에는 반드시 False. True 로 바꾸기 전: 프로펠러 제거 → Pixhawk 모드 확인 → 화면 명령값 확인 → 저속.
 SEND_MAVLINK_COMMANDS = False
 
-USE_MARS_IMM_DEFAULT = True
+USE_MARS_IMM_DEFAULT = True   # False = 연구용 baseline(고정 R, 게이트·스케줄러 우회). 시작 시에만 정하고 비행 중에는 바꿀 수 없다. 어떤 시험도 False 경로를 검증하지 않았다.
 USE_BEARING_FALLBACK = True
 
 # ESP32 선두 텔레메트리. 장치가 없거나 pyserial 이 없으면 open_leader_receiver() 가 경고만 내고 None 을
@@ -63,8 +64,9 @@ LEADER_VELOCITY_FRAME = "ENU"           # ESP32 가 vx=east,vy=north,vz=up 이�
 # 그대로 상대 고도 오차가 된다.
 LEADER_ALT_FRAME = "AMSL"
 
-# 목표 추종 거리. P 제어 정상상태 평형거리 = TARGET + v_leader/KP_FORWARD 이므로 이 값과 config 의
-# depth_max_m 간격이 곧 추종 가능한 리더 속도 상한이다 (C4).
+# 목표 추종 거리. 정상상태 이격 = TARGET + (v − KFF·(v−DB) + KV·v)/Kp (0.3 m/s 에서 +0.63 m,
+# compute_velocity_cmd_from_estimate 주석). 이 값과 config 의 depth_max_m 간격이 깊이창 안에서 추종 가능한
+# 리더 속도의 상한을 정하지만(C4), 실질 상한은 그보다 MAX_VX 가 먼저 건다.
 TARGET_DISTANCE_M = 3.0
 # 카메라 깊이 없이 ESP32 GPS 상대위치만으로 거리를 알 때의 이격. GPS 상대오차는 m 단위라 3m 는 오차보다
 # 작다. 8m 는 depth_max(10m) 안이라 리더가 다시 깊이창에 들어오면 비전이 이어받는다.
@@ -120,6 +122,7 @@ CAM_FAIL_LIMIT = 30      # 카메라 연속 실패 한계. 스톨 1회 = camera 
 FC_FAIL_LIMIT = 30       # FC 링크(drain) 연속 예외 한계
 MIN_AGL_M = 1.5          # 이 고도(AGL) 아래에서는 하강 명령을 내지 않는다
 
+# GPS_RAW_INT 신선도 — 표시·로그 전용. ESP32 융합의 팔로워 GPS 입력은 이 값으로 게이트하지 않는다(leader_telemetry 참조).
 GPS_MAX_AGE_SEC = 0.70
 LOCAL_POS_MAX_AGE_SEC = 0.40
 ATTITUDE_MAX_AGE_SEC = 0.30
@@ -158,12 +161,6 @@ def ego_rotation_cam(prev_rpy, cur_rpy):
     """
     d_rb = rot_body_to_ned(*cur_rpy).T @ rot_body_to_ned(*prev_rpy)
     return _CAM_FROM_BODY @ d_rb @ _CAM_FROM_BODY.T
-
-
-def fru_to_camera_xyz(v_fru):
-    """FRU [front, right, up] → 카메라 [right, down, forward]. camera_xyz_to_fru 의 역변환."""
-    v = np.asarray(v_fru, dtype=float)
-    return np.array([v[1], -v[2], v[0]], dtype=float)
 
 
 def fru_to_body_ned_velocity(v_fru):
@@ -241,9 +238,8 @@ def set_mode(master, mode_name):
 
 
 def send_land(master):
-    for mode_name in ("LAND", "AUTO.LAND"):        # ArduPilot / PX4
-        if set_mode(master, mode_name):
-            return
+    if set_mode(master, "LAND"):                   # pymavlink mode_mapping 키는 ArduPilot/PX4 모두 "LAND"
+        return
     print("[FC] send MAV_CMD_NAV_LAND")
     master.mav.command_long_send(master.target_system, master.target_component,
                                  mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -425,14 +421,16 @@ def fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm)
     return "none", None
 
 
+# esp_vel_hint_used: 이름은 역사적(예전 weak hint), 값은 속도 측정이 게이트를 통과했는지. 로그 호환을 위해 키 유지.
 ESP_IDLE = {"esp_update_used": "none", "esp_vel_hint_used": False, "esp_gate_d2": None,
             "esp_vel_gate_d2": None, "r_esp_gps": 0.0, "r_esp_time": 0.0}
 
 
 def fuse_esp32(ekf, rel, leader_meas):
-    """ESP32 GPS 상대위치를 게이트 후 위치 업데이트(source='gps'), 상대속도는 약한 힌트로.
-    새 패킷일 때만 불린다 — 위치뿐 아니라 속도 힌트(alpha 0.10, P 수축 0.98)도 패킷 주기(5~10Hz)로 적용되므로
-    실효 시정수는 프레임당 적용이던 때보다 길다. 같은 관측을 매 프레임 되풀이하는 것보다 이쪽이 맞다."""
+    """ESP32 GPS 상대위치를 게이트 후 위치 업데이트(source='gps')로, 상대속도는 게이트 있는 정규 칼만 속도 측정
+    (apply_leader_velocity_update_to_imm → update_velocity3d)으로 반영한다. 새 패킷(rx_time 변경)일 때만 불린다 —
+    같은 관측을 매 프레임 독립 측정처럼 되풀이하면 공분산이 거짓으로 줄어든다.
+    반환 dict 의 esp_vel_hint_used 는 이름이 역사적이고 값은 속도 게이트 통과 여부다."""
     z_esp = np.asarray(leader_meas["rel_cam"], dtype=float)
     age = float(leader_meas.get("age", 999.0))
     r_esp_time = float(np.exp(-age / max(LEADER_MAX_AGE_SEC, 1e-6)))
@@ -502,7 +500,8 @@ def draw_hud(frame, lines):
 
 
 def build_log_row(s):
-    """s: 루프의 프레임 상태 dict. 키 이름은 로그 분석 스크립트가 의존하므로 바꾸지 않는다."""
+    """s: 루프의 프레임 상태 dict → 중첩 dict(ExperimentLogger 가 'a.b.c' 로 평탄화). 키 이름은 비행 후 로그 분석
+    (저장소 밖 노트북/엑셀) 호환을 위해 바꾸지 않는다. 저장소 안에서 이 JSONL/CSV 를 읽는 스크립트는 없다."""
     lm, esp, cmd = s["leader_meas"], s["esp"], s["current_body_cmd"]
     avail = lm.get("available", False)
     ekf = s["ekf"]
@@ -586,7 +585,7 @@ def main():
     v_leader_fru = None           # 리더 절대 속도 추정 (FRU). STAT 진단용으로 루프 밖에서도 참조
 
     print("=" * 90)
-    print("[INFO] q/ESC 종료 | m: MARS-IMM on/off | v: MAVLink velocity 송신 on/off | l: LAND | h: HOLD")
+    print("[INFO] q/ESC 종료 | v: MAVLink velocity 송신 on/off | l: LAND | h: HOLD")
     print(f"[INFO] SEND_MAVLINK_COMMANDS={SEND_MAVLINK_COMMANDS}  USE_LEADER_ESP32={USE_LEADER_ESP32} ({LEADER_TELEMETRY_KIND})")
     print("[INFO] 실제 비행 전 반드시 프로펠러 제거 상태에서 확인")
     print("=" * 90)
@@ -755,7 +754,7 @@ def main():
 
             mission_state, mission_policy = mission.update(
                 now=now, leader_visible=leader_visible_for_mission,
-                rel_est=rel_fru if ekf.initialized else None, rel_vel_est=rel_vel_fru if ekf.initialized else None,
+                rel_vel_est=rel_vel_fru if ekf.initialized else None,
                 leader_alt=leader_alt_est, leader_vel_world=leader_vel_world, pos_cov_trace=pos_cov_trace,
                 leader_vel_body=v_leader_fru)
 
@@ -844,9 +843,6 @@ def main():
                     key = 255
                 if key in (ord("q"), 27):
                     break
-                elif key == ord("m"):
-                    use_mars_imm = not use_mars_imm
-                    print(f"[SYS] MARS-IMM -> {'ON' if use_mars_imm else 'OFF'}")
                 elif key == ord("v"):
                     SEND_MAVLINK_COMMANDS = not SEND_MAVLINK_COMMANDS
                     print(f"[SYS] SEND_MAVLINK_COMMANDS -> {SEND_MAVLINK_COMMANDS}")

@@ -5,7 +5,10 @@
   mask 1479 (수정 후, YAW_RATE_IGNORE clear + yaw_rate=0) → "현재 기수 유지"
   mask 3527 (수정 전, YAW_RATE_IGNORE set)               → FC의 WP_YAW_BEHAVIOR가 결정
 
-WP_YAW_BEHAVIOR=3(LOOK_AHEAD)이면 _look_ahead_yaw_rad의 초기값 0(정북)으로 끌려가야 한다.
+WP_YAW_BEHAVIOR=3(LOOK_AHEAD)이면 _look_ahead_yaw_rad 초기값 0(정북)으로 끌려갈 것 — 이것이 조사 전 가설이었다.
+실제로는 autoyaw.cpp 의 set_mode(LOOK_AHEAD) 가 진입 시 현재 기수(ahrs.get_yaw_rad())로 초기화하고,
+look_ahead_yaw_rad() 는 지면속도가 YAW_LOOK_AHEAD_MIN_SPEED_MS(1 m/s)를 넘을 때만 갱신하므로 정지 setpoint 중에는
+두 마스크 모두 기수를 유지한다(실측 1479: 5.0°, 3527: 1.0°). 자세한 근거는 VERIFICATION.md C5 절과 sitl/README.md C5 절.
 """
 import sys
 import time

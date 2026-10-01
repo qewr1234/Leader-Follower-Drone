@@ -34,7 +34,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | FCR-10 | 리더→팔로워 속도 전달 \|Γ(jω)\| 이 모든 주파수에서 1 이하다 (스트링 안정, 다중 기체 체인 전제) | STABILITY_MARGINS 6·7절 | A, T | AN[axes.forward.peak]; AN[validation]; AN[sitl_like.current]; UT[분석 (FCR-10)]; UT[분석 (FCR-10 강건성)]; SITL[leader_sine] | 검증됨 (분석: 1.000 / 1.000 / 0.999 — 절대속도 추정기 + FF τ 0.1 s + 시간간격 KV 0.3(h 1.0 s ≥ 2τ_eff). KV=0 이면 1.14, τ 2.0 이면 1.08, KV 0.2 는 τ_fc 0.5 s 에서 1.014 — 골든·강건성 검사가 기록. SITL leader_sine 은 직전 설계 실측 0.72, 현재 설계 재실행 필요) |
 | FCR-11 | FC ATTITUDE 의 roll/pitch/yaw 변화량으로 매 프레임 EKF 상대 상태를 역회전해 기체 기울어짐이 리더 이동으로 보이지 않게 하고, 그 보정이 CT 각속도로 새지 않는다 | README 안전 설계 | T | UT[자세보정:]; UT[ego-yaw:] | 검증됨 (실기 미검증) |
 | FCR-12 | 비전 거리가 없고 GPS 상대위치만 있으면 이격을 8 m 로 넓힌다 | README 안전 설계 | T | UT[gps-only:] | 검증됨 |
-| FCR-13 | 출발·정지·착륙 판단은 리더 절대 속도(ESP32 > 자기+상대 > 상대 폴백) 로 한다 | README 안전 설계 | T | UT[미션:]; CL[리더 출발 후]; CL[추종 중(t=8s)]; SITL[depth_range] | 검증됨 |
+| FCR-13 | 출발·정지·착륙 판단은 리더 절대 속도(ESP32 > EKF 절대속도 > 상대 폴백) 로 한다 | README 안전 설계 | T | UT[미션:]; CL[리더 출발 후]; CL[추종 중(t=8s)]; SITL[depth_range] | 검증됨 |
 | FCR-14 | 피드포워드·시간간격 항을 뺀 P+D 기준선은 PM ≥ 45°, GM ≥ 6 dB, Ms ≤ 1.5, 스트링 안정을 만족한다 | STABILITY_MARGINS 1절 | A | AN[kff_sweep.kff0.gm_db]; UT[분석: P+D] | 검증됨 (분석: GM 24.6 dB, \|Γ\| 1.000) |
 | FCR-16 | 명령의 시선 방향 접근 속도는 모든 거리에서 KS·(d − 2.0 m) 이하다 (연속 장벽): 바닥 밖에서는 접근 상한, 안에서는 침범량에 비례한 후퇴. 특히 피드포워드가 바닥 안에서 접근 명령을 만들지 못한다 | VERIFICATION 남은 결함(선회 시 최근접 1.59 m) | T, A, I | UT[이격:]; UT[이격 장벽:]; INSPECT[config.py:"min_separation_m": 2.0] | 검증됨 (P 항만의 경로에서는 교차점 1.0 m 위에서 P 가 더 강해 놀지만, FF 파고들기(1.8 m 에서 +0.04 → −0.12)는 이 장벽만 막는다 — 단위 검사) |
 | FCR-17 | 회피 반경(1.5 m) 안에서는 시선에 수직인 수평 방향으로 비켜선다. 보증 범위: (a) 한 방향으로 지나가는 리더는 1.0 m/s 까지 접촉 없이 비킨다, (b) 재조준하며 추격하는 리더는 hypot(MAX_VX, MAX_VY)=0.41 m/s 아래에서만 — 그 위는 순수추격 기하상 어떤 제어기로도 불가능하다 | analysis/evasion_sim.py | T, A | UT[회피:]; UT[회피 경계:]; UT[회피 경계 골든]; SITL[min_separation] | 검증됨 (범위 명시. 모의: straight 0.7 m/s → 0.60 m, pursuit 0.4 → 1.81 m, pursuit 0.7 → 접촉(골든). SITL min_separation 통과 — 사용자 실행, 수치 기록 대기) |
@@ -46,7 +46,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 |---|---|---|---|---|---|
 | EST-01 | IMM-EKF(CV+CT) 가 상대 위치·속도를 추정하고 속도 추정의 63 % 응답이 0.5 s 이내이며 램프에 위치 지연이 없다 | imm_ekf.py | A, T | AN[ekf_step.t63_velocity_s]; UT[분석: IMM-EKF] | 검증됨 (0.30 s) |
 | EST-15 | 모드 확률이 리더 기동에 따라 움직여 "mode-aware" 추정이 실제로 동작한다: 추종 중 직진 p_ct < 0.2, 선회 0.5 rad/s > 0.4, 1.0 rad/s > 0.7 | 프로젝트 이름(MARS-IMM) | T | UT[IMM (EST-15)]; UT[IMM: 전이확률]; UT[IMM: 상태 속도] | 검증됨 (0.11 / 0.72 / 0.86. 두 가지가 필요했다 — 상태 속도를 리더 절대 속도로(자기 속도는 예측 입력), 전이확률을 체류시간 기반으로. 둘 중 하나만으로는 각각 0.35 / 0.11 — VERIFICATION 참조) |
-| EST-02 | 측정은 신뢰도로 R 을 적응하고 카이제곱 게이트(3D 11.34, 2D 9.21)로 거른다. RGB-D, bearing, ESP32 위치, ESP32 속도 네 경로 모두 같은 게이트를 지난다 | config `reliability` | T | UT[C4: MAD]; UT[C4: 정상]; UT[ESP32 속도:] | 검증됨 |
+| EST-02 | 측정은 신뢰도로 R 을 적응하고 카이제곱 게이트(3D 11.34, 2D 9.21)로 거른다. RGB-D, bearing, ESP32 위치, ESP32 속도 네 경로 모두 같은 게이트를 지난다 | config `reliability` | T | UT[C4: MAD]; UT[C4: 정상]; UT[ESP32 속도:] | 부분 (게이트 통과/거부 검사는 있음 — UT[ESP32 속도:], 임계 11.34/9.21 경계값 검사 없음) |
 | EST-13 | ESP32 상대 속도는 필터 상태 직접 대입이 아니라 정규 칼만 속도 측정 갱신으로 반영한다. 게이트를 통과한 것만 쓰고, 공분산은 임의 축소가 아니라 갱신 결과로 줄어든다 | VERIFICATION 남은 결함 | T | UT[ESP32 속도:] | 검증됨 |
 | EST-14 | CT 모델의 회전율은 리더 절대 속도(상대 + 자기 속도)로 추정한다. 상대 속도만 쓰면 추종이 정착할수록 방향각이 정의되지 않아 회전율이 실제와 무관해진다 | VERIFICATION 남은 결함 | T | UT[IMM:] | 검증됨 |
 | EST-03 | 거리 측정이 끊기면 2 s 코스트 후 소실로 판정하고, bearing-only 는 거리 확보로 치지 않는다 | config `imm.range_coast_max_sec` | T, I | UT[rcoast:]; INSPECT[config.py:"range_coast_max_sec": 2.0] | 검증됨 |
@@ -92,7 +92,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | IF-05 | ESP32 장치나 pyserial 이 없어도 비전 단독으로 기동한다 | main.py `open_leader_receiver` | T | UT[ESP32:] | 검증됨 |
 | IF-06 | 리더 고도 기준계(AMSL / 타원체)를 팔로워의 같은 기준계와만 뺀다 | leader_telemetry.py | T | UT[alt:]; UT[lla:] | 검증됨 |
 | IF-07 | 헤드리스(`MARS_SHOW_WINDOW=0`) 로 동작한다 | main.py | T | UT[헤드리스:] | 검증됨 |
-| IF-08 | LOCAL_POSITION_NED 0.4 s, ATTITUDE 0.3 s, GLOBAL_POSITION 0.7 s 이내의 값만 신선한 것으로 쓴다 | main.py `*_MAX_AGE_SEC` | I, T | INSPECT[main.py:LOCAL_POS_MAX_AGE_SEC = 0.40]; SITL[depth_range] | 검증됨 (STAT `fresh=LP1/ATT1` 실측) |
+| IF-08 | LOCAL_POSITION_NED 0.4 s, ATTITUDE 0.3 s 이내의 값만 자기 속도·자세 보정·피드포워드에 쓴다. GPS_RAW_INT 의 0.7 s 신선도(GPS_MAX_AGE_SEC)는 HUD·로그에 표시만 하며 ESP32 상대위치 융합(leader_telemetry)의 팔로워 GPS 입력을 게이트하지 않는다 | main.py `*_MAX_AGE_SEC` | I, T | INSPECT[main.py:LOCAL_POS_MAX_AGE_SEC = 0.40]; SITL[depth_range] | 검증됨 (STAT `fresh=LP1/ATT1` 실측) |
 | IF-09 | 배터리 전압 미보고(65535)는 전압으로 쓰지 않는다 | mavlink_io `battery_text` | T | UT[BAT:] | 검증됨 |
 | IF-10 | 실험 로그는 평탄화된 행으로 기록된다 | logger.py | T | UT[logger:] | 검증됨 |
 | IF-11 | ESP32(ESP-NOW) 송신 펌웨어가 리더 절대 위치·속도를 방송한다 | README 시스템 개요 | D | — | 미검증 (펌웨어 미존재) |
@@ -101,7 +101,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 
 | ID | 요구도 | 출처 | 방법 | 검증 근거 | 상태 |
 |---|---|---|---|---|---|
-| OPS-01 | SITL 하네스 `--all` 은 ArduCopter 로 도는 9개 시나리오를 모두 포함한다 | sitl/README | T | UT[하네스:] | 검증됨 |
+| OPS-01 | SITL 하네스 `--all` 은 ArduCopter 로 도는 10개 시나리오를 모두 포함한다 | sitl/README | T | UT[하네스:] | 검증됨 |
 | OPS-02 | 모터 테스트 프로토타입 등 죽은 코드가 없다 | VERIFICATION | I | UT[정리:] | 검증됨 |
 | OPS-03 | 모든 요구도의 검증 근거가 실제 검사·시나리오·분석 키를 가리킨다 | 이 문서 | T | UT[추적성:] | 검증됨 |
 | OPS-04 | `main.main()` 은 가짜 FC·가짜 시계로 결정론 실행되어 예외 없이 끝난다 | test_closed_loop.py | T | CL[main.main()] | 검증됨 |
@@ -135,7 +135,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | SAF-10 | 부분 | 카메라 스톨 30 회 → HOLD → 종료 폐루프 시나리오 |
 | SAF-15 | 미검증 | 폐루프 실비행(안전줄·저고도부터) |
 | SAF-05 | 부분 | 하네스 조종사 링크에 RC override 를 넣어 LOITER 중 고도를 유지하게 고치고 `handover` 재실행 (sitl/README 6절) |
-| FCR-02 | 확인 필요 | `depth_range` 를 `--duration 60` 이상으로 재실행해 평형 거리 3.45 m 수렴 확인 |
+| FCR-02 | 확인 필요 | `depth_range` 를 `--duration 60` 이상으로 재실행해 평형 거리 3.63 m 수렴 확인 |
 | IF-11 | 미검증 | ESP32 펌웨어 작성, 패킷 포맷 고정 |
 
 ## 4. 검사 방법

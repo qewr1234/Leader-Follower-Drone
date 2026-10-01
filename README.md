@@ -24,8 +24,8 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | | |
 |---|---|
 | **Jetson 실기** | 카메라 파이프라인 **24~26 FPS**, 선두 드론 탐지 → **모터 구동까지 지상 확인** |
-| **SITL 비행** | ArduCopter SITL에서 **실제 `main.main()`을 그대로 비행**시켜 **8개 시나리오 전부 통과** |
-| **제어 정확도** | 리더 0.3 m/s 추종 시 정상상태 거리 **4.3m — 이론값 4.36m와 소수 둘째 자리 일치** |
+| **SITL 비행** | ArduCopter SITL에서 **실제 `main.main()`을 그대로 비행**시켜 **9개 시나리오 전부 통과**(2026-09-20 실행. 현재 하네스는 ArduCopter 10 + PX4 1 — `min_separation` 은 사용자 실행 통과만 보고되고 수치 기록 전, 현재 파라미터 재실행 전) |
+| **제어 정확도** | 초기 설계(KP 0.22, 피드포워드 없음)에서 리더 0.3 m/s 추종 정상상태 거리 **4.3 m — 이론값 4.36 m 와 소수 둘째 자리 일치**. 현재 설계(KP 0.30, KFF 0.8, KV 0.3) 이론값 3.63 m, SITL 재실측 전 |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
 | **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
 | **회귀 스위트** | 단위 검사 181개 + SITL 시나리오 11개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
@@ -95,18 +95,19 @@ D435i (color+depth, 640×480@30)
 처음 설계는 `v_L` 을 자기 속도 + EKF 상대 속도로 만들었고, 두 항의 지연 차이(EKF 속도 추정 63 % 응답 0.30 s 실측)만큼
 자기 속도가 명령에 양성 되먹임되어 이득여유 4.9 dB, 1.15 rad/s 에서 리더 속도 변동을 1.8배 증폭하는 스트링 불안정
 설계였습니다. 2026-09-18 에 저역통과로 눌러 14.4 dB / 1.13 으로 만들었고(SITL `leader_sine` 실측 0.72배, 수정 전 코드
-1.95배), 2026-09-19 에 추정기가 리더 절대 속도를 직접 추정하도록 바꾸면서 그 경로 자체가 사라졌습니다(이득여유 26.6 dB).
+1.95배), 2026-09-19 에 추정기가 리더 절대 속도를 직접 추정하도록 바꾸면서 그 경로 자체가 사라졌습니다(이득여유 26.6 dB; 이후 KV 0.3 도입 뒤 16.4 dB).
 남은 피크 1.14 는 등간격 정책의 고유한 것이라 시간간격 항 `KV` 로 눌렀고, 전 축 **|Γ| ≤ 1.000** 입니다. 데드밴드는
 국소 기울기가 3 이던 램프 대신 기울기 1 인 소프트 데드존(0.05 m/s)입니다. 실제 코드로 돌린 4단 체인 시뮬레이션이
 선형 예측과 7 % 안에서 맞습니다(현재 파라미터의 SITL 재실행은 아직입니다 — 예측 0.82배).
 
 <p align="center">
-  <img src="docs/images/readme_string_stability.png" alt="리더→팔로워 속도 이득: 선형 모델 곡선(P+D 단독 / 수정 전 / 현재)과 ArduCopter SITL 실측점" width="100%">
+  <img src="docs/images/readme_string_stability.png" alt="리더→팔로워 속도 이득: 선형 모델 곡선(P+D 단독 / 수정 전 / 2026-09-18 설계 / 현재)과 ArduCopter SITL 실측점" width="100%">
 </p>
 
 리더 속도 변동이 팔로워에서 몇 배가 되는가(`|Γ(jω)|`). 회색이 P+D 단독, 주황이 수정 전 피드포워드(1.15 rad/s 에서
-1.80배), 파랑이 현재(최대 1.13배). 점은 같은 주파수에서 ArduCopter SITL 로 실측한 값으로, 수정 전 코드 1.95배(FAIL),
-현재 코드 0.72 / 0.43배(PASS). 곡선은 `analysis/stability_margins.py`, 그림은 `analysis/readme_figures.py` 가 만듭니다.
+1.80배), 노랑이 2026-09-18 설계(최대 1.13배, 0.27 rad/s), 파랑이 현재(최대 1.000 — 스트링 안정, 이득여유 16.4 dB).
+점은 같은 주파수에서 ArduCopter SITL 로 실측한 값으로, 수정 전 코드 1.95배(FAIL), 09-18 설계 0.72 / 0.43배(PASS).
+현재 설계의 SITL 실측은 아직 없다(비선형 예측 0.82). 곡선은 `analysis/stability_margins.py`, 그림은 `analysis/readme_figures.py` 가 만듭니다.
 
 <p align="center">
   <img src="docs/images/sitl_leader_sine.png" alt="ArduCopter SITL 의 leader_sine 시나리오: 수정 전 코드와 현재 코드의 리더·팔로워 속도" width="100%">
@@ -179,7 +180,7 @@ python3 analysis/trace_check.py                 # 요구도 ↔ 검사 추적성
 주파수를 자극하지 않아 SITL 8개가 전부 통과했던 것입니다. 원인(자기 속도와 EKF 상대속도의 지연 불일치)과 수정
 (피드포워드 저역통과 2 s + 자기 속도 정합 필터 0.3 s + 소프트 데드존 → 14.4 dB, 1.13배)은
 [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) 에 있고, 정현파 리더 SITL 시나리오 `leader_sine` 이 이를
-ArduCopter 에서 검사합니다(실측: 현재 코드 0.72배, 수정 전 코드 1.95배로 FAIL). 요구도 62개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
+ArduCopter 에서 검사합니다(실측: 09-18 설계 0.72배, 수정 전 코드 1.95배로 FAIL; 현재 설계는 재실행 전). 요구도 63개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 의 추적성 표에 있습니다.
 
 그리고 모든 시나리오는 **차등 검증**입니다 — 수정 전 코드에도 같은 시나리오를 돌려 대조군에서
@@ -211,7 +212,7 @@ python3 main.py
 `MARS_FC_PORT` 환경변수로 FC 포트를 바꿀 수 있습니다(기본 `/dev/ttyACM0`).
 SITL에 직접 붙이려면 `MARS_FC_PORT=udpin:0.0.0.0:14551 python3 main.py`.
 
-키: `q`/`ESC` 종료 · `m` MARS-IMM 토글 · `v` MAVLink 송신 토글 · `l` LAND · `h` HOLD
+키: `q`/`ESC` 종료 · `v` MAVLink 송신 토글 · `l` LAND · `h` HOLD
 
 ### Jetson 배포 — TensorRT가 실제로 도는지 확인하기
 
@@ -291,6 +292,6 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 
 - [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
 - [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) — 바깥 루프 선형 모델, 위상·이득 여유, 스트링 안정성, 체인 시뮬레이션, 개선안
-- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 62개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
+- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 63개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
 - [docs/images/README.md](docs/images/README.md) — README 그림 파일과 수정 방법

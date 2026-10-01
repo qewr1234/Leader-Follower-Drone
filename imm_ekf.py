@@ -25,7 +25,10 @@ SIGMA_A_CV = float(CONFIG["imm"].get("sigma_a_cv", 0.8))
 SIGMA_A_CT = float(CONFIG["imm"].get("sigma_a_ct", 1.2))
 # 모드 체류 시간 [s] (CV, CT). 프레임당 전이확률 = dt/체류시간. 정상분포 p_ct = τ_ct/(τ_cv+τ_ct) = 1/3 을 유지한다.
 MODE_SOJOURN_SEC = tuple(CONFIG["imm"].get("mode_sojourn_sec", (10.0, 5.0)))
-# 2026-09-19 이전 추정기 (분석의 '수정 전' 대조군이 이 값으로 FRF 를 잰다 — SITL 실측과 대조된 골든이라 보존)
+# 2026-09-19 이전 추정기 재현용. 이 dict 가 바꾸는 것은 전이행렬뿐(프레임당 고정, TRANS_PROB_LEGACY); σ_a 는 그때도 0.8/1.2 로
+# 현재 config 와 같다. 예전 추정기의 다른 차이(자기 속도를 예측 입력으로 넣지 않는 상대속도 상태)는 analysis/stability_margins.py 가
+# ego_input=False(set_ego_velocity_cam 미호출)로 재현한다. '수정 전·직전' 대조군 FRF 는 SITL 실측과 대조된 골든이라, config 의
+# σ 를 나중에 바꿔도 변하지 않도록 여기서 값을 고정한다.
 LEGACY_TUNING = dict(sigma_a_cv=0.8, sigma_a_ct=1.2, mode_sojourn_sec=None)
 
 SIGMA_XY = CONFIG["imm"]["sigma_xy"]
@@ -214,7 +217,8 @@ class ImmEkf:
     N_MODELS = 2
 
     def __init__(self, sigma_a_cv=None, sigma_a_ct=None, mode_sojourn_sec=MODE_SOJOURN_SEC):
-        """튜닝 인자는 분석용(analysis/stability_margins.py 가 LEGACY_TUNING 으로 예전 추정기를 만든다). 운용은 기본값."""
+        """튜닝 인자는 분석용 — analysis/stability_margins.py 가 LEGACY_TUNING 으로 예전 추정기를 만든다
+        (σ 는 현재와 같고 전이행렬만 다르다; 인자는 골든을 config 변경에서 격리하는 핀). 운용(main.py)은 기본값."""
         self.filters = [_SingleEKF(0, sigma_a_cv), _SingleEKF(1, sigma_a_ct)]
         self.mode_sojourn_sec = mode_sojourn_sec
         self.mu = MU0.copy()
@@ -226,10 +230,8 @@ class ImmEkf:
         # 그중 카메라 깊이(RGB-D)로 거리를 본 뒤 흐른 시간. ESP32 GPS 상대위치도 거리를 담지만
         # 오차가 m 단위라, 그것만으로 3m 추종을 계속하면 안 된다 — 제어기가 이격 거리를 정할 때 쓴다.
         self.vision_range_coast_time = 0.0
-        self._fused = None      # get_state() 캐시. 상태가 바뀌는 곳마다 mark_dirty().
-
-    def mark_dirty(self):
-        """filters[i].x / P / mu 를 바깥에서 직접 고쳤으면 호출 (leader_telemetry 의 속도 힌트)."""
+        # get_state() 캐시. 상태를 바꾸는 메서드(init/predict/update_*/compensate_ego_rotation/_finite_or_reset)가
+        # 각자 None 으로 되돌린다.
         self._fused = None
 
     def init(self, z, source="rgbd"):
@@ -408,7 +410,9 @@ class ImmEkf:
         self._fused = None
 
     def compensate_ego_yaw(self, dpsi):
-        """yaw 만 바뀐 경우(우회전 +). 타겟은 카메라 프레임에서 왼쪽으로: [x'; z'] = [[c,-s],[s,c]] @ [x; z]."""
+        """yaw 만 바뀐 경우의 compensate_ego_rotation 래퍼(우회전 +): T = [[c,0,-s],[0,1,0],[s,0,c]].
+        운영 경로는 쓰지 않는다 — main 은 roll/pitch/yaw 를 한꺼번에 ego_rotation_cam() 으로 만들어
+        compensate_ego_rotation() 을 부른다. test_fixes(ego-yaw:, ekf: 캐시)와 analysis/evasion_sim.py 의 2D 회피 모의가 쓴다."""
         if abs(float(dpsi)) < 1e-6:
             return
         c, s = np.cos(dpsi), np.sin(dpsi)
@@ -450,9 +454,6 @@ class ImmEkf:
             "P": P,
             "mode_probs": self.mu.copy(),
             "initialized": self.initialized,
-            "coast_time": self.coast_time,
-            "range_coast_time": self.range_coast_time,
-            "vision_range_coast_time": self.vision_range_coast_time,
         }
 
     def get_model_probs(self):
@@ -461,13 +462,11 @@ class ImmEkf:
     def is_reliable(self):
         return self.initialized and (self.coast_time <= MAX_COAST_SEC)
 
-    def has_range_fix(self, max_age=None):
+    def has_range_fix(self):
         """거리를 아직 안다고 볼 수 있는가 (RGB-D 또는 ESP32 GPS). 미션의 소실 판정용."""
-        limit = RANGE_COAST_MAX_SEC if max_age is None else float(max_age)
-        return self.initialized and (self.range_coast_time <= limit)
+        return self.initialized and (self.range_coast_time <= RANGE_COAST_MAX_SEC)
 
-    def has_vision_range_fix(self, max_age=None):
+    def has_vision_range_fix(self):
         """카메라 깊이로 거리를 본 지 오래되지 않았는가. 추종 이격 거리를 정할 때 쓴다 —
         GPS 링크가 살아 있으면 착륙할 이유는 없지만, GPS만으로 3m 이격은 GPS 오차보다 작다."""
-        limit = RANGE_COAST_MAX_SEC if max_age is None else float(max_age)
-        return self.initialized and (self.vision_range_coast_time <= limit)
+        return self.initialized and (self.vision_range_coast_time <= RANGE_COAST_MAX_SEC)
