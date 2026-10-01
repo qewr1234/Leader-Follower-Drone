@@ -12,6 +12,7 @@ Pixhawk BODY_NED 속도 setpoint (10Hz). 단일 스레드 while 루프 하나.
 
 import math
 import os
+import signal
 import time
 
 import cv2
@@ -26,7 +27,8 @@ from leader_telemetry import (LeaderTelemetryReceiver, apply_leader_velocity_upd
                               build_leader_measurement_from_packet,
                               fru_to_camera_xyz)  # camera_xyz_to_fru 의 역변환. analysis 가 main.fru_to_camera_xyz 로 참조
 from logger import ExperimentLogger
-from mavlink_io import battery_text, connect_fc, drain_messages, get_vehicle_state, stream_rates_text
+from mavlink_io import (HEARTBEAT_MAX_AGE_SEC, battery_text, connect_fc, drain_messages, get_vehicle_state, reconnect_fc,
+                        send_heartbeat, stream_rates_text)
 from measurement import MeasurementBuilder
 from mission_manager import MissionManager
 from reliability import ReliabilityEstimator
@@ -124,8 +126,11 @@ def reset_evade_side():
 SETPOINT_PERIOD_SEC = 0.10
 # C2: LAND 가 먹지 않았을 때만 이 간격으로 재시도. 100ms 연타는 조종사 탈환을 덮어쓴다.
 LAND_RETRY_SEC = 2.0
-CAM_FAIL_LIMIT = 30      # 카메라 연속 실패 한계. 스톨 1회 = camera 타임아웃 0.5s 라 약 15초 뒤 포기 (그동안 FC 의 GUID_TIMEOUT 이 먼저 든다)
-FC_FAIL_LIMIT = 30       # FC 링크(drain) 연속 예외 한계
+CAM_FAIL_LIMIT = 30      # 카메라 연속 실패 한계(실패 프레임에도 미션·setpoint 는 계속 돈다 — 소실로 취급). 넘으면 LOST_ACTION 을 한 번 보내고 종료.
+FC_FAIL_SEC = 15.0       # FC 링크(drain) 예외가 이 시간 이어지면 포기 (예전: 횟수 30회 = 1 ms). 그 사이 FC_RECONNECT_SEC 마다 재연결 시도.
+FC_RECONNECT_SEC = 1.0
+# 리더 소실 10 s 뒤·카메라 사망 종료 시의 행동 (config controller.lost_action: land | rtl | hold).
+LOST_ACTION = str(CONFIG["controller"].get("lost_action", "land")).lower()
 MIN_AGL_M = 1.5          # 이 고도(home 기준, LOCAL_POSITION_NED −z) 아래에서는 하강 명령을 내지 않는다. 고도를 모르면 하강 금지(fail-closed).
 
 # ATTITUDE 불연속 판정 [rad]. FC EKF 가 비행 중 yaw 를 재정렬하면(나침반 불일치, GSF 리셋) 기체는 돌지 않았는데 보고 yaw 만
@@ -152,10 +157,6 @@ def camera_xyz_to_fru(x_cam):
     return np.array([x[2], x[0], -x[1]], dtype=float)
 
 
-# 카메라 프레임(x=우, y=하, z=전) ← 기체 FRD(x=전, y=우, z=하)
-_CAM_FROM_BODY = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
-
-
 def rot_body_to_ned(roll, pitch, yaw):
     """MAVLink ATTITUDE(ZYX 오일러) → 기체→NED 회전행렬 Rz(yaw)·Ry(pitch)·Rx(roll)."""
     cr, sr = math.cos(roll), math.sin(roll)
@@ -164,6 +165,36 @@ def rot_body_to_ned(roll, pitch, yaw):
     return np.array([[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
                      [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
                      [-sp, cp * sr, cp * cr]])
+
+
+# 카메라 프레임(x=우, y=하, z=전) ← 카메라 마운트에 정렬된 기체 FRD(x=전, y=우, z=하): 축 순열.
+_CAM_PERM = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
+# 카메라 마운트 자세(config camera.mount_*_deg): 기체 FRD 벡터를 마운트 정렬 프레임으로 돌리는 R_mount^T 를 순열 앞에 둔다.
+# 마운트가 0 이면 _CAM_FROM_BODY 는 순열 그대로다. 아래로 10° 숙여 단 카메라(mount_pitch −10°)는 전방 3 m 의 리더를 카메라에서
+# 0.52 m '위' 로 보는데, 이 회전이 없으면 그만큼 상승 명령이 나간다(이전 감사 #42).
+_CAM_MOUNT_RPY = tuple(math.radians(float(CONFIG["camera"].get(k, 0.0))) for k in ("mount_roll_deg", "mount_pitch_deg", "mount_yaw_deg"))
+_R_BODY_FROM_MOUNT = rot_body_to_ned(*_CAM_MOUNT_RPY)        # 마운트 프레임 → 기체 FRD (같은 ZYX 합성)
+_CAM_FROM_BODY = _CAM_PERM @ _R_BODY_FROM_MOUNT.T              # 기체 FRD → 카메라
+
+
+def level_from_body(roll, pitch):
+    """기체 FRD → 수평(기수 정렬, roll/pitch 를 편) 프레임: Ry(pitch)·Rx(roll). FC 의 BODY_NED 속도는 yaw 만 돌리고 z 는 지구 하방이라,
+    제어 입력은 이 수평 프레임에 있어야 한다(이전 감사 #2·#22: 기울어진 카메라 프레임을 그대로 쓰면 pitch 가 수직 명령으로 샌다)."""
+    return rot_body_to_ned(roll, pitch, 0.0)
+
+
+def camera_to_level_fru(x_cam, roll=0.0, pitch=0.0):
+    """카메라 [right, down, forward] → 수평 FRU [front, right, up] (마운트와 기체 roll/pitch 를 편 것). roll=pitch=0·마운트 0 이면
+    camera_xyz_to_fru 와 같다."""
+    v_frd = level_from_body(roll, pitch) @ (_CAM_FROM_BODY.T @ np.asarray(x_cam, dtype=float)[:3])
+    return np.array([v_frd[0], v_frd[1], -v_frd[2]], dtype=float)
+
+
+def level_fru_to_camera_xyz(v_fru, roll=0.0, pitch=0.0):
+    """수평 FRU → 카메라 [right, down, forward]. camera_to_level_fru 의 역변환 (EKF 의 자기 속도 입력은 카메라 프레임이어야 한다)."""
+    v = np.asarray(v_fru, dtype=float)[:3]
+    v_frd_level = np.array([v[0], v[1], -v[2]], dtype=float)
+    return _CAM_FROM_BODY @ (level_from_body(roll, pitch).T @ v_frd_level)
 
 
 def ego_rotation_cam(prev_rpy, cur_rpy):
@@ -290,6 +321,39 @@ def send_land(master):
     print("[FC] send MAV_CMD_NAV_LAND")
     master.mav.command_long_send(master.target_system, master.target_component,
                                  mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+def send_failsafe(master, action):
+    """미션의 failsafe 정책(None | "LAND" | "RTL")을 FC 에 보낸다. None(hold)이면 아무것도 보내지 않는다(0 속도 setpoint 가 흐른다)."""
+    if action == "LAND":
+        send_land(master)
+    elif action == "RTL":
+        if not set_mode(master, "RTL"):
+            print("[FC] RTL 모드 없음 — LAND 로 대체")
+            send_land(master)
+
+
+_SIGNAL_INSTALLED = False
+
+
+def install_signal_handlers():
+    """SIGTERM/SIGHUP 을 KeyboardInterrupt 로 바꿔 main 의 finally(마지막 HOLD·카메라/포트 닫기·CSV)가 실행되게 한다
+    (이전 감사 #51: SIGTERM 은 finally 를 건너뛰었다). 메인 스레드가 아니거나 플랫폼이 거부하면 조용히 건너뛴다."""
+    global _SIGNAL_INSTALLED
+
+    def _raise(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _raise)
+            _SIGNAL_INSTALLED = True
+        except (ValueError, OSError):
+            pass
+    return _SIGNAL_INSTALLED
 
 
 # ============================================================
@@ -442,7 +506,7 @@ def smooth_velocity_cmd(prev_cmd, new_cmd, alpha=0.28, dt=None):
 
 def _bearing_update(ekf, rel, bearing_meas, r_vis, ok_label, reject_label):
     Rb = rel.make_R_bearing(r_vis)
-    gate_ok, d2 = rel.gate_bearing2d(ekf, bearing_meas["z"], Rb)
+    gate_ok, d2 = rel.gate_bearing2d(ekf, bearing_meas["z"], rel.R_bearing0)   # 게이트는 기본 R, 신뢰도는 이득(Rb)에만
     if gate_ok:
         ekf.update_bearing2d(bearing_meas["z"], Rb)
         return ok_label, d2
@@ -456,7 +520,9 @@ def fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm)
         if not ekf.initialized:
             ekf.init(rgbd_meas["z"])
             return "init_rgbd", None
-        gate_ok, d2 = rel.gate_position3d(ekf, rgbd_meas["z"], R)
+        # 게이트는 **기본 R** 로, 신뢰도로 부풀린 R 은 갱신(칼만 이득)에만 쓴다. 같은 R 을 게이트에도 쓰면 신뢰도가 낮을수록
+        # (min_reliability 0.05 → R 20배) 게이트가 함께 넓어져 품질이 나쁜 측정일수록 더 잘 통과했다(이전 감사 #26·#59, 신규 16).
+        gate_ok, d2 = rel.gate_position3d(ekf, rgbd_meas["z"], rel.R_rgbd0 if use_mars_imm else None)
         if gate_ok or not use_mars_imm:
             ekf.update_position3d(rgbd_meas["z"], R)
             return "rgbd", d2
@@ -490,7 +556,7 @@ def fuse_esp32(ekf, rel, leader_meas):
         ekf.init(z_esp, source="gps")
         used = "init_esp_gps"
     else:
-        gate_ok, d2 = rel.gate_position3d(ekf, z_esp, R_esp)
+        gate_ok, d2 = rel.gate_position3d(ekf, z_esp, rel.R_gps0)     # 게이트는 기본 R (위 fuse_vision 과 같은 이유)
         if gate_ok:
             ekf.update_position3d(z_esp, R_esp, source="gps")
         used = "esp_gps" if gate_ok else "gate_reject_esp_gps"
@@ -636,8 +702,9 @@ def main():
     scheduler = PerceptionScheduler()
     tracker = LeaderTracker()
     ekf = ImmEkf()
-    mission = MissionManager()
+    mission = MissionManager(lost_action=LOST_ACTION)
     leader_rx = open_leader_receiver()
+    install_signal_handlers()
     log = ExperimentLogger(CONFIG["logger"]["log_dir"]) if CONFIG["logger"]["enabled"] else None
 
     last_track = None
@@ -649,7 +716,13 @@ def main():
     last_setpoint_time = 0.0
     last_land_send = 0.0          # C2: LAND 재시도 타이머
     prev_fc_accepts = False       # GUIDED 진입 에지 검출용
-    cam_fail_streak = fc_fail_streak = 0
+    cam_fail_streak = 0
+    fc_fail_t0 = None             # FC 링크 예외가 시작된 시각 (단조). None 이면 정상
+    fc_last_reconnect = 0.0
+    fatal = None                  # 루프를 끝낸 치명 원인 ("camera" | "fc") — finally 에서 LOST_ACTION 을 보낼지 결정
+    last_heartbeat_tx = 0.0
+    fc_mode = "?"
+    fc_accepts_setpoints = False
     last_fused_rx_time = None     # 마지막으로 EKF 에 융합한 ESP32 패킷의 rx_time
     show_window = SHOW_WINDOW
     frame_idx = 0
@@ -675,22 +748,34 @@ def main():
             # 시간이 predict / range_coast 에서 사라지지 않게.
             dt = max(now - prev_time, 1e-4)
 
-            # ---------------- Pixhawk 수신 ----------------
+            # ---------------- Pixhawk 수신 (예외가 이어지면 재연결, FC_FAIL_SEC 뒤 포기) ----------------
             try:
                 drain_messages(master)
-                fc_fail_streak = 0
+                fc_fail_t0 = None
             except Exception as exc:
-                fc_fail_streak += 1
-                print(f"[WARN] FC link: drain 실패 {fc_fail_streak}회: {type(exc).__name__}: {exc}")
-                if fc_fail_streak >= FC_FAIL_LIMIT:
-                    print(f"[ERR] FC 링크 연속 실패 {FC_FAIL_LIMIT}회 — 종료")
+                if fc_fail_t0 is None:
+                    fc_fail_t0 = now
+                print(f"[WARN] FC link: drain 실패 {now - fc_fail_t0:.1f}s: {type(exc).__name__}: {exc}")
+                if now - fc_fail_t0 >= FC_FAIL_SEC:
+                    print(f"[ERR] FC 링크 {FC_FAIL_SEC:.0f}s 동안 실패 — 종료")
+                    fatal = "fc"
                     break
+                if now - fc_last_reconnect >= FC_RECONNECT_SEC:
+                    fc_last_reconnect = now
+                    new_master = reconnect_fc(master)
+                    if new_master is not None:
+                        master = new_master
+                        print("[FC] 재연결 성공")
+                time.sleep(0.05)
                 continue
             vehicle_state = get_vehicle_state()
 
             # C2: FC 모드를 매 루프 읽는다. GUIDED/OFFBOARD 를 벗어났다 = 조종사가 탈환했다 → LAND 를 보내지 않는다.
-            fc_mode = vehicle_state.get("mode", {}).get("name", "?")
-            fc_armed = vehicle_state.get("mode", {}).get("armed", False)
+            # heartbeat 가 HEARTBEAT_MAX_AGE_SEC 넘게 안 오면 모드를 '모름' 으로 — 조용히 죽은 링크의 캐시된 GUIDED 를 믿지 않는다
+            # (이전 감사 #13). setpoint 스트림은 계속 나가고(FC 가 받으면 받는 것), 모드 변경 명령만 막힌다.
+            mode_fresh = is_fresh(vehicle_state.get("mode", {}), now, HEARTBEAT_MAX_AGE_SEC)
+            fc_mode = vehicle_state.get("mode", {}).get("name", "?") if mode_fresh else "?"
+            fc_armed = bool(vehicle_state.get("mode", {}).get("armed", False)) and mode_fresh
             fc_accepts_setpoints = fc_mode in ("GUIDED", "OFFBOARD")
 
             # GUIDED 진입 = 조종사가 방금 자동에게 넘긴 순간. 그 전까지 FC 는 우리 명령을 버렸으므로 그동안 쌓인
@@ -718,6 +803,13 @@ def main():
                 packet=leader_packet, follower_vehicle_state=vehicle_state, now=now,
                 max_age_sec=LEADER_MAX_AGE_SEC, leader_velocity_frame=LEADER_VELOCITY_FRAME)
 
+            if now - last_heartbeat_tx >= 1.0:
+                last_heartbeat_tx = now
+                try:
+                    send_heartbeat(master)
+                except Exception as exc:
+                    print(f"[WARN] FC link: heartbeat 송신 실패: {type(exc).__name__}: {exc}")
+
             if now - last_stat_print >= 1.0:
                 p_cv, p_ct = ekf.get_model_probs() if ekf.initialized else (0.0, 0.0)
                 print(f"[STAT] {battery_text()} FPS={fps_display:.1f} MARS={'ON' if use_mars_imm else 'OFF'} "
@@ -737,26 +829,32 @@ def main():
             except Exception as exc:
                 color_image, depth_image = None, None
                 print(f"[WARN] 카메라 프레임 실패 {cam_fail_streak + 1}회: {type(exc).__name__}: {exc}")
-            if color_image is None:          # 예외도, 컬러/깊이 결손(None)도 같은 드롭 — 둘 다 연속 실패로 센다
+            frame_ok = color_image is not None   # 예외도, 컬러/깊이 결손(None)도 같은 드롭 — 둘 다 연속 실패로 센다
+            if not frame_ok:
                 cam_fail_streak += 1
                 if cam_fail_streak >= CAM_FAIL_LIMIT:
-                    print(f"[ERR] 카메라 연속 실패 {CAM_FAIL_LIMIT}회 — 종료")
+                    print(f"[ERR] 카메라 연속 실패 {CAM_FAIL_LIMIT}회 — 종료 (LOST_ACTION={LOST_ACTION})")
+                    fatal = "camera"
                     break
-                continue
-            cam_fail_streak = 0
+                # 실패 프레임도 루프의 나머지(예측·소실 타이머·미션·setpoint)는 돈다 — 예전의 continue 는 setpoint 송신과 소실 타이머를
+                # 통째로 건너뛰어 FC 가 마지막 속도를 3 s 유지하고 소실 판정이 얼어붙었다(이전 감사 #8·#52). 카메라가 죽으면 '리더를 못
+                # 본다' 와 같고, 그 경로(코스트 → LOST_HOLD → 10 s 뒤 LOST_ACTION)가 그대로 적용된다.
+            else:
+                cam_fail_streak = 0
+                frame_idx += 1
+                fps_counter += 1
 
             prev_time = now
-            frame_idx += 1
-            H, W = color_image.shape[:2]
-            fps_counter += 1
             if now - fps_t0 >= 1.0:
                 fps_display = fps_counter / max(now - fps_t0, 1e-6)
                 fps_counter, fps_t0 = 0, now
 
             # ---------------- IMM predict (팔로워 자세 변화만큼 상대상태를 역회전한 뒤) ----------------
             att = vehicle_state.get("attitude", {})
+            roll_lvl = pitch_lvl = 0.0            # 제어 입력 레벨링용. 자세가 신선하지 않으면 수평으로 본다
             if attitude_fresh and att.get("yaw") is not None:
                 cur_rpy = (float(att.get("roll") or 0.0), float(att.get("pitch") or 0.0), float(att["yaw"]))
+                roll_lvl, pitch_lvl = cur_rpy[0], cur_rpy[1]
                 if prev_rpy_for_comp is not None and ekf.initialized:
                     if attitude_jump(prev_att_for_comp, att):
                         # FC 의 yaw 재정렬: 기체(카메라)는 돌지 않았으므로 상대 상태는 그대로가 맞다. 보상을 건너뛴다.
@@ -770,34 +868,43 @@ def main():
                 prev_att_for_comp = None
             # 자기 속도는 EKF 예측의 입력이다 (상대 위치 = ∫(리더 절대 속도 − 자기 속도)). 보상(위에서 ego_vel 도
             # 함께 회전) 뒤, predict 앞에 넣어야 프레임이 맞는다. 초기화 전에도 넣는다 — init 이 초기 절대 속도로 쓴다.
+            # follower_velocity_fru 는 yaw 만 돌린 수평 프레임이다. EKF 의 카메라 프레임은 roll/pitch 까지 돌아 있으므로 수평 → 기체 → 카메라
+            # 로 넣는다(이전 감사 #38·#44: 기울어진 채로 두 프레임이 어긋났다).
             v_self_fru = follower_velocity_fru(vehicle_state) if (local_pos_fresh and attitude_fresh) else None
-            ekf.set_ego_velocity_cam(fru_to_camera_xyz(v_self_fru) if v_self_fru is not None else None)
+            ekf.set_ego_velocity_cam(level_fru_to_camera_xyz(v_self_fru, roll_lvl, pitch_lvl) if v_self_fru is not None else None)
             if ekf.initialized:
                 ekf.predict(dt)
 
-            # ---------------- 스케줄러 → 검출/추적 ----------------
-            if use_mars_imm:
-                policy = scheduler.decide(ekf.get_state_dict(), color_image.shape, intrinsics, last_track)
+            # ---------------- 스케줄러 → 검출/추적 (프레임이 없으면 '검출 없음' 프레임으로) ----------------
+            if not frame_ok:
+                policy = {"run_detector": False, "use_full_frame": True, "roi": None, "detect_every": 1, "reason": "camera_fail"}
+                track = None
+                rgbd_meas = bearing_meas = None
+                r_vis = r_depth = 0.0
+                update_used, gate_d2 = "camera_fail", None
             else:
-                policy = {"run_detector": True, "use_full_frame": True, "roi": None, "detect_every": 1, "reason": "baseline_full_frame"}
+                if use_mars_imm:
+                    policy = scheduler.decide(ekf.get_state_dict(), color_image.shape, intrinsics, last_track)
+                else:
+                    policy = {"run_detector": True, "use_full_frame": True, "roi": None, "detect_every": 1, "reason": "baseline_full_frame"}
 
-            if policy["run_detector"]:
-                # 트랙이 없을 때의 재획득은 EKF 예측점 근처에서만 (reacquire_hint). 트랙이 있으면 힌트는 쓰이지 않는다.
-                hint = reacquire_hint(ekf, intrinsics) if tracker.track is None else None
-                track = tracker.update(detector.detect(color_image, roi=None if policy["use_full_frame"] else policy["roi"]),
-                                       reacquire_hint=hint)
-            else:
-                track = tracker.predict_only()
-            last_track = track
-            if set_ae_roi is not None:
-                set_ae_roi(track["bbox"] if (track is not None and not track.get("is_lost", False)) else None, now)
+                if policy["run_detector"]:
+                    # 트랙이 없을 때의 재획득은 EKF 예측점 근처에서만 (reacquire_hint). 트랙이 있으면 힌트는 쓰이지 않는다.
+                    hint = reacquire_hint(ekf, intrinsics) if tracker.track is None else None
+                    track = tracker.update(detector.detect(color_image, roi=None if policy["use_full_frame"] else policy["roi"]),
+                                           reacquire_hint=hint)
+                else:
+                    track = tracker.predict_only()
+                last_track = track
+                if set_ae_roi is not None:
+                    set_ae_roi(track["bbox"] if (track is not None and not track.get("is_lost", False)) else None, now)
 
-            # ---------------- 측정 → 융합 ----------------
-            rgbd_meas = meas_builder.build_rgbd(track, depth_image)
-            bearing_meas = meas_builder.build_bearing(track) if track is not None else None
-            r_vis = rel.vision_reliability(rgbd_meas or bearing_meas or track)
-            r_depth = rel.depth_reliability(rgbd_meas)
-            update_used, gate_d2 = fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm)
+                # ---------------- 측정 → 융합 ----------------
+                rgbd_meas = meas_builder.build_rgbd(track, depth_image)
+                bearing_meas = meas_builder.build_bearing(track) if track is not None else None
+                r_vis = rel.vision_reliability(rgbd_meas or bearing_meas or track)
+                r_depth = rel.depth_reliability(rgbd_meas)
+                update_used, gate_d2 = fuse_vision(ekf, rel, rgbd_meas, bearing_meas, r_vis, r_depth, use_mars_imm)
             # 3-D 게이트 결과를 트래커에 되먹인다: 거리 측정이 연속 GATE_REJECT_DROP_FRAMES 회 거부되면 트랙을 버려
             # (리더가 아닐 가능성) 다음 프레임에 EKF 예측점 근처에서 다시 잡게 한다. 수용되면 거부 횟수를 0 으로.
             if update_used == "rgbd":
@@ -823,9 +930,10 @@ def main():
             if not math.isfinite(pos_cov_trace):        # NaN 공분산 = 최대 불확실 (미션 게이트 > 8.0 이 LOST_HOLD 로 보낸다)
                 pos_cov_trace = 999.0
             mu = ekf.get_model_probs() if ekf.initialized else np.array([0.0, 0.0])
-            rel_fru = camera_xyz_to_fru(x_est[:3])
+            # 제어·미션 입력은 수평(기수 정렬) 프레임 — 카메라 마운트와 기체 roll/pitch 를 편다 (camera_to_level_fru).
+            rel_fru = camera_to_level_fru(x_est[:3], roll_lvl, pitch_lvl)
             # 상태의 속도는 리더 '절대' 속도. 제어 D 항·미션 폴백은 상대 속도(절대 − 자기)를 쓴다.
-            rel_vel_fru = camera_xyz_to_fru(ekf.relative_velocity()) if ekf.initialized else np.zeros(3)
+            rel_vel_fru = camera_to_level_fru(ekf.relative_velocity(), roll_lvl, pitch_lvl) if ekf.initialized else np.zeros(3)
 
             follower_alt = get_follower_altitude_m(vehicle_state) if local_pos_fresh else None
             # 착륙 판정용 선두 고도는 AGL 근사여야 한다 (ESP32 alt 는 절대고도라 landing_z_thresh 와 비교 불가)
@@ -849,7 +957,7 @@ def main():
             # 없으면 미션은 상대 속도로 폴백한다.
             v_leader_fru = None
             if ekf.initialized and ekf.is_reliable() and local_pos_fresh and attitude_fresh and v_self_fru is not None:
-                v_leader_fru = camera_xyz_to_fru(ekf.leader_velocity())
+                v_leader_fru = camera_to_level_fru(ekf.leader_velocity(), roll_lvl, pitch_lvl)
 
             mission_state, mission_policy = mission.update(
                 now=now, leader_visible=leader_visible_for_mission,
@@ -863,15 +971,19 @@ def main():
                 ff_fru, v_leader_fru if (mission_policy["allow_follow"] and ekf.has_range_fix()) else None, dt)
 
             desired_body_cmd = np.zeros(4)
-            if mission_policy["land"]:
-                # C2: 모드 게이트가 곧 latch 다 — LAND 가 먹으면 FC 가 GUIDED 를 벗어나 이 분기가 더 실행되지
+            failsafe = mission_policy.get("failsafe")          # None | "LAND" | "RTL"
+            # 모드 변경은 FC 가 setpoint 를 받는 동안에만 스트림을 대신한다. 수동 모드에서는 스트림을 계속 흘려 PX4 의 OFFBOARD
+            # 진입 전제를 깨지 않는다(2026-10-01 감사 14번: 수동 중 FAILSAFE 래치가 스트림을 끊어 OFFBOARD 전환이 거부됐다).
+            suppress_stream = failsafe is not None and fc_accepts_setpoints
+            if failsafe is not None:
+                # C2: 모드 게이트가 곧 latch 다 — LAND/RTL 이 먹으면 FC 가 GUIDED 를 벗어나 이 분기가 더 실행되지
                 # 않는다. 여전히 여기 있다는 건 명령이 먹지 않았다는 뜻이라 그때만 LAND_RETRY_SEC 간격으로 재시도
                 # (조종사 탈환 시엔 fc_accepts_setpoints=False 라 아예 보내지 않는다).
                 if SEND_MAVLINK_COMMANDS and fc_accepts_setpoints and now - last_land_send >= LAND_RETRY_SEC:
                     try:
-                        send_land(master)
+                        send_failsafe(master, failsafe)
                     except Exception as exc:
-                        print(f"[WARN] FC link: LAND 송신 실패: {type(exc).__name__}: {exc}")
+                        print(f"[WARN] FC link: {failsafe} 송신 실패: {type(exc).__name__}: {exc}")
                     last_land_send = now
                     last_setpoint_time = now
             elif mission_policy["allow_follow"] and ekf.initialized:
@@ -886,8 +998,9 @@ def main():
 
             # 속도 setpoint 에는 모드 게이트를 걸지 않는다: GUIDED/OFFBOARD 가 아니면 FC 가 조용히 버리고, PX4 는
             # OFFBOARD 진입 전에 이 스트림이 먼저 흐르고 있어야 한다. 조종사를 뺏는 건 모드 변경(LAND)이며 그쪽만 막는다.
-            if not mission_policy["land"]:
-                last_land_send = 0.0
+            if not suppress_stream:
+                if failsafe is None:
+                    last_land_send = 0.0
                 if now - last_setpoint_time >= SETPOINT_PERIOD_SEC:
                     if SEND_MAVLINK_COMMANDS:
                         try:
@@ -900,7 +1013,8 @@ def main():
                     last_setpoint_time = max(last_setpoint_time + SETPOINT_PERIOD_SEC, now - SETPOINT_PERIOD_SEC)
 
             # ---------------- 화면 (DISPLAY_EVERY 프레임마다) ----------------
-            if show_window and frame_idx % DISPLAY_EVERY == 0:
+            if show_window and frame_ok and frame_idx % DISPLAY_EVERY == 0:
+                H, W = color_image.shape[:2]
                 raw_depth_m = rgbd_meas.get("depth_m") if rgbd_meas else None
                 ekf_depth_m = float(x_est[2]) if ekf.initialized and ekf.is_reliable() else None
                 if track is not None and not track.get("is_lost", False):
@@ -982,9 +1096,16 @@ def main():
         print("\n[SYS] KeyboardInterrupt")
 
     finally:
-        print("[SYS] shutdown")
+        print(f"[SYS] shutdown{' (fatal=' + fatal + ')' if fatal else ''}")
         try:
-            if SEND_MAVLINK_COMMANDS:
+            if SEND_MAVLINK_COMMANDS and master is not None:
+                if fatal == "camera" and fc_accepts_setpoints:
+                    # 컴패니언이 죽으면 ArduCopter 는 GUID_TIMEOUT 뒤 그 자리에서 무한 호버한다(이전 감사 #1·#50·#53). 카메라 사망은
+                    # '리더를 영영 못 본다' 이므로 소실과 같은 행동(LOST_ACTION)을 한 번 보내고 나간다. 조종사가 탈환한 상태면 보내지 않는다.
+                    act = {"land": "LAND", "rtl": "RTL", "hold": None}.get(LOST_ACTION)
+                    if act is not None:
+                        print(f"[SYS] 카메라 사망 종료 — {act} 송신")
+                        send_failsafe(master, act)
                 send_hold(master)
                 time.sleep(0.1)
         except Exception as exc:

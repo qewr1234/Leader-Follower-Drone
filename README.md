@@ -27,8 +27,8 @@ D435i ─▶ YOLO11n ─▶ 트래커 ─▶ IMM-EKF ─▶ 미션 상태머신 
 | **SITL 비행** | ArduCopter SITL에서 **실제 `main.main()`을 그대로 비행**시켜 **9개 시나리오 전부 통과**(2026-09-20 실행. 현재 하네스는 ArduCopter 10 + PX4 1 — `min_separation` 은 사용자 실행 통과만 보고되고 수치 기록 전, 현재 파라미터 재실행 전) |
 | **제어 정확도** | 초기 설계(KP 0.22, 피드포워드 없음)에서 리더 0.3 m/s 추종 정상상태 거리 **4.3 m — 이론값 4.36 m 와 소수 둘째 자리 일치**. 현재 설계(KP 0.30, KFF 0.8, KV 0.3) 이론값 3.63 m, SITL 재실측 전 |
 | **조종사 우선** | 비행 중 조종사가 스위치로 탈환하면 컴패니언이 즉시 물러남 (SITL 25초 유지 검증) |
-| **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측) |
-| **회귀 스위트** | 단위 검사 207개 + SITL 시나리오 11개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
+| **자동 안전 착륙** | 선두를 놓치면 **정확히 10.0초 뒤 자동 LAND** (SITL 실측). `lost_action` 설정으로 hold/rtl 선택 가능 |
+| **회귀 스위트** | 단위 검사 235개 + SITL 시나리오 11개 + 선형 모델 안정성 여유 분석, 전부 **차등 검증** 방식 |
 | **PX4 호환** | ArduCopter·PX4 양쪽 모드 프로토콜 지원, PX4 SITL로 검증 |
 
 ## 추종 동작과 Fail-safe
@@ -121,7 +121,7 @@ D435i (color+depth, 640×480@30)
 ## 안전 설계
 
 비행 안전과 관련된 동작은 SITL 에서 실제 비행으로 검증했고, 2026-10-01 감사로 추가한 항목(고도 바닥 fail-closed, 수직 판정,
-재획득, yaw 불연속, 단조 시계)은 아직 단위 검사와 폐루프 시뮬레이션까지입니다.
+재획득, yaw 불연속, 단조 시계, 소실 정책 설정, 예외 시 송신 유지·재연결, heartbeat·sysid, 게이트 분리, 레벨링)은 아직 단위 검사와 폐루프 시뮬레이션까지입니다.
 
 - **조종사가 항상 이깁니다.** 컴패니언은 FC 모드를 매 루프 확인하고, GUIDED/OFFBOARD가
   아니면 모드 변경 명령을 보내지 않습니다. 조종사가 LOITER로 탈환하면 그대로 유지됩니다
@@ -139,6 +139,19 @@ D435i (color+depth, 640×480@30)
   게이트가 거부한 측정의 방위는 쓰지 않습니다. 예전에는 0.4 초 검출 공백 뒤 화면 안의 더 큰 물체로 신원이 넘어갔습니다.
 - **FC 의 yaw 재정렬에 속지 않습니다.** ATTITUDE 의 yaw 변화가 yawspeed·Δt 로 설명되지 않으면(한 샘플에 0.2 rad 넘게 어긋남)
   그 프레임의 자세 보상을 건너뜁니다 — 기체는 돌지 않았으므로 상대 상태는 그대로가 맞습니다.
+- **소실 뒤 행동은 설정입니다.** `config.py` `controller.lost_action`: `land`(기본, 위 '선두 소실 시 자동 착륙'), `hold`(제자리 유지 + 경보 —
+  AP_Follow·PX4 follow-me 등 외부 구현의 관례, 착륙은 조종사·FC 배터리 failsafe 에 맡김), `rtl`. 카메라가 죽어 컴패니언이 종료할 때도
+  같은 행동을 한 번 보냅니다 — 예전에는 아무것도 보내지 않아 FC 가 그 자리에서 무한 호버했습니다.
+- **카메라·FC 가 흔들려도 루프는 멈추지 않습니다.** 카메라 프레임이 실패한 프레임에도 예측·소실 타이머·미션·setpoint 가 돌고(소실로 취급),
+  FC 링크 예외는 15 초 동안 1 초마다 재연결을 시도합니다. heartbeat 가 3 초 넘게 없으면 모드를 '모름' 으로 봐 캐시된 GUIDED 로 모드 변경을
+  보내지 않습니다. SIGTERM 에도 종료 경로(마지막 HOLD·장치 닫기·CSV)가 실행됩니다.
+- **컴패니언의 MAVLink 신원.** 기체와 같은 sysid, compid 191(ONBOARD_COMPUTER), 1 Hz heartbeat — pymavlink 기본값(255/0, GCS 사칭)이
+  아닙니다. ArduPilot `SYSID_ENFORCE` 는 0 이어야 합니다(체크리스트).
+- **게이트는 기본 R 로 판정합니다.** 신뢰도로 부풀린 R 은 칼만 이득에만 들어갑니다. 같은 R 을 게이트에도 쓰면 품질이 나쁜 측정일수록
+  게이트가 넓어져 더 잘 통과했습니다.
+- **제어 입력은 수평 프레임입니다.** 카메라 마운트 자세(`config.py` `camera.mount_*_deg`)와 기체 roll/pitch 를 편 기수 정렬 프레임으로
+  상대 위치·속도를 돌린 뒤 제어·미션에 넣습니다. FC 는 BODY_NED 속도의 수평 성분을 yaw 만 돌리고 수직은 지구 하방으로 해석하므로,
+  기울어진 카메라 프레임을 그대로 쓰면 pitch 가 수직 명령으로 샜습니다.
 - **시계는 단조 시계입니다.** 루프 주기·신선도·setpoint 스케줄·ESP32 age 가 `time.monotonic()` 이라 NTP 동기나 수동 시각 설정으로
   벽시계가 뛰어도 소실 타이머가 한꺼번에 만료되거나 송신이 멈추지 않습니다. 로그의 `time` 열은 벽시계, `mono` 열이 루프 시계입니다.
 - **근접 회피.** 리더까지 3차원 거리가 2m 안이면 접근 성분을 제거하고, 1.5m 안이면 시선에 수직인 방향으로
@@ -168,7 +181,7 @@ D435i (color+depth, 640×480@30)
 상태머신·제어·MAVLink 송신은 저장소의 실제 코드가 그대로 돈다**는 점입니다.
 
 ```bash
-python3 test_fixes.py          # 단위 207개 — numpy만 있으면 됨
+python3 test_fixes.py          # 단위 235개 — numpy만 있으면 됨
 python3 test_closed_loop.py    # 폐루프 특성화 — 가짜 FC·가짜 시계로 실제 main.main() 결정론 실행 (--dump/--compare)
 python3 sitl/harness.py --all  # ArduCopter SITL에 붙여 실제로 비행
 python3 analysis/stability_margins.py --plots   # 분석 층: 바깥 루프 선형 모델의 여유·스트링 안정성 (matplotlib)
@@ -191,7 +204,7 @@ python3 analysis/trace_check.py                 # 요구도 ↔ 검사 추적성
 주파수를 자극하지 않아 SITL 8개가 전부 통과했던 것입니다. 원인(자기 속도와 EKF 상대속도의 지연 불일치)과 수정
 (피드포워드 저역통과 2 s + 자기 속도 정합 필터 0.3 s + 소프트 데드존 → 14.4 dB, 1.13배)은
 [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) 에 있고, 정현파 리더 SITL 시나리오 `leader_sine` 이 이를
-ArduCopter 에서 검사합니다(실측: 09-18 설계 0.72배, 수정 전 코드 1.95배로 FAIL; 현재 설계는 재실행 전). 요구도 68개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
+ArduCopter 에서 검사합니다(실측: 09-18 설계 0.72배, 수정 전 코드 1.95배로 FAIL; 현재 설계는 재실행 전). 요구도 72개 중 어느 것이 어느 검사로 검증되고 무엇이 미충족인지는
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 의 추적성 표에 있습니다.
 
 그리고 모든 시나리오는 **차등 검증**입니다 — 수정 전 코드에도 같은 시나리오를 돌려 대조군에서
@@ -306,8 +319,8 @@ LOITER로 내리면 컴패니언이 다시 뺏지 못합니다 — SITL에서 �
 | `FS_EKF_ACTION` | 1 (LAND, 기본) | 2(ALT_HOLD) 는 조종사 즉시 개입 전제 |
 | `FENCE_ENABLE` / `FENCE_TYPE` / `FENCE_ACTION` | 1 / 7 / 1(RTL) 또는 4(Brake·Land) | 리더 오인·외삽 추종으로 멀어지는 사고의 마지막 방어. `FENCE_ALT_MAX`·`FENCE_RADIUS` 는 시험장 기준 |
 | `BATT_FS_LOW_ACT` / `BATT_FS_CRT_ACT` / `BATT_LOW_VOLT` | 2(RTL) / 1(LAND) / 팩 기준 | 기본값 0 은 경고만 — 리더가 보이는 동안 컴패니언은 절대 착륙하지 않는다 |
-| `FS_GCS_ENABLE` | 운용 결정 | 컴패니언은 heartbeat 를 보내지 않아 이 값은 실제 GCS 링크에만 작용한다. 켜면 GCS 끊김 → RTL 로 추종이 끝난다 |
-| `MAV_GCS_SYSID` | 255 (기본 유지) | 컴패니언 명령이 sysid 255 로 나간다. 바꾸면 전부 묵살 |
+| `FS_GCS_ENABLE` | 운용 결정 | 컴패니언 heartbeat 는 GCS sysid(255)가 아니라 이 값은 실제 GCS 링크에만 작용한다. 켜면 GCS 끊김 → RTL 로 추종이 끝난다 |
+| `SYSID_ENFORCE` | 0 (기본 유지) | 컴패니언은 기체 sysid + compid 191 로 보낸다. 1 이면 MAV_GCS_SYSID(255)가 아닌 발신자의 명령을 전부 버린다 |
 | `SYSID_THISMAV` | 팔로워 1 / 리더 2 | 리더에 MAVLink FC 를 얹을 경우 텔레메트리가 섞이지 않게 |
 | `SERIALn_PROTOCOL` | 2 (MAVLink2) | GPS_RAW_INT 확장 필드(alt_ellipsoid 등) 수신 |
 
@@ -332,7 +345,7 @@ PX4 로 운용하면: `COM_OF_LOSS_T` 1.0 유지, `COM_OBL_RC_ACT` 기본 0(Posi
 | `camera.py` | D435i 래퍼 (depth→color 정렬, 실제 depth_scale 조회, 실외 노출 옵션·AE 측광 ROI) |
 | `utils_geometry.py` | 순수 기하 헬퍼 |
 | `logger.py` | JSONL 스트리밍 로거 (종료 시 CSV 변환) |
-| `test_fixes.py` | 단위 회귀 207개 (하드웨어·FC 불필요) |
+| `test_fixes.py` | 단위 회귀 235개 (하드웨어·FC 불필요) |
 | `test_closed_loop.py` | 폐루프 특성화 테스트 — 가짜 FC·가짜 시계로 실제 `main.main()` 결정론 실행, `--dump`/`--compare`로 리팩토링 전후 스트림 비교 |
 | `sitl/` | SITL 회귀 하네스 · 실행 안내 |
 | `docs/images/` | README 다이어그램(SVG) |
@@ -341,6 +354,6 @@ PX4 로 운용하면: `COM_OF_LOSS_T` 1.0 유지, `COM_OBL_RC_ACT` 기본 0(Posi
 
 - [VERIFICATION.md](VERIFICATION.md) — 검증 방법론과 SITL 차등 검증 이력
 - [docs/STABILITY_MARGINS.md](docs/STABILITY_MARGINS.md) — 바깥 루프 선형 모델, 위상·이득 여유, 스트링 안정성, 체인 시뮬레이션, 개선안
-- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 68개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
+- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — 요구도 72개와 검사·시나리오·분석으로의 추적성 표 (`analysis/trace_check.py` 로 자동 대조)
 - [sitl/README.md](sitl/README.md) — SITL 회귀 하네스 실행법
 - [docs/images/README.md](docs/images/README.md) — README 그림 파일과 수정 방법

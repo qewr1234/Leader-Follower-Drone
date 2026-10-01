@@ -38,6 +38,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | FCR-14 | 피드포워드·시간간격 항을 뺀 P+D 기준선은 PM ≥ 45°, GM ≥ 6 dB, Ms ≤ 1.5, 스트링 안정을 만족한다 | STABILITY_MARGINS 1절 | A | AN[kff_sweep.kff0.gm_db]; UT[분석: P+D] | 검증됨 (분석: GM 24.6 dB, \|Γ\| 1.000) |
 | FCR-16 | 명령의 시선 방향 접근 속도는 모든 거리에서 KS·(d − 2.0 m) 이하다 (연속 장벽): 바닥 밖에서는 접근 상한, 안에서는 침범량에 비례한 후퇴. 특히 피드포워드가 바닥 안에서 접근 명령을 만들지 못한다 | VERIFICATION 남은 결함(선회 시 최근접 1.59 m) | T, A, I | UT[이격:]; UT[이격 장벽:]; INSPECT[config.py:"min_separation_m": 2.0] | 검증됨 (P 항만의 경로에서는 교차점 1.0 m 위에서 P 가 더 강해 놀지만, FF 파고들기(1.8 m 에서 +0.04 → −0.12)는 이 장벽만 막는다 — 단위 검사) |
 | FCR-17 | 회피 반경(1.5 m) 안에서는 시선에 수직인 수평 방향으로 비켜선다. 보증 범위: (a) 한 방향으로 지나가는 리더는 1.0 m/s 까지 접촉 없이 비킨다, (b) 재조준하며 추격하는 리더는 hypot(MAX_VX, MAX_VY)=0.41 m/s 아래에서만 — 그 위는 순수추격 기하상 어떤 제어기로도 불가능하다 | analysis/evasion_sim.py | T, A | UT[회피:]; UT[회피 경계:]; UT[회피 경계 골든]; SITL[min_separation] | 검증됨 (범위 명시. 모의: straight 0.7 m/s → 0.60 m, pursuit 0.4 → 1.81 m, pursuit 0.7 → 접촉(골든). SITL min_separation 통과 — 사용자 실행, 수치 기록 대기) |
+| FCR-18 | 제어·미션 입력(상대 위치·속도, 리더 속도)은 카메라 마운트 자세와 기체 roll/pitch 를 편 수평(기수 정렬) 프레임이고, EKF 의 자기 속도 입력은 그 역변환으로 카메라 프레임에 들어간다 — FC 가 BODY_NED 를 yaw 만 돌리는 것과 일치 | 이전 감사 #2·#22·#38·#42·#44 | T, I | UT[레벨링:]; UT[마운트:]; INSPECT[config.py:"mount_pitch_deg"] | 검증됨 (단위; 실기 마운트 각 미측정 → config 0) |
 | FCR-15 | 리더 속도가 0.25 ± 0.05 m/s, 1.15 rad/s 정현파일 때 팔로워 속도 진폭비가 1 이하다 (실제 FC 에서의 스트링 안정성) | STABILITY_MARGINS 6절, sitl/README | T | SITL[leader_sine]; AN[sitl_like.current] | 검증됨 (SITL 실측 0.43 / 0.72, 예측 0.70. 수정 전 코드 대조군 1.95 FAIL — 차등 검증) |
 
 ### EST — 인지 / 추정
@@ -52,6 +53,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | EST-03 | 거리 측정이 끊기면 2 s 코스트 후 소실로 판정하고, bearing-only 는 거리 확보로 치지 않는다 | config `imm.range_coast_max_sec` | T, I | UT[rcoast:]; INSPECT[config.py:"range_coast_max_sec": 2.0] | 검증됨 |
 | EST-04 | 트래커는 1프레임 소실 뒤 화면 반대편 검출을 거부하고 max_lost 뒤 새 track_id 로 재초기화한다 | VERIFICATION 트래커 신원 게이트 | T | UT[tracker:] | 검증됨 |
 | EST-16 | 트랙을 버린 뒤의 재획득은 추정기가 믿을 수 있는 동안 예측 화소 위치(99 % 타원 + 60 px) 안의 검출로만 하고, 3-D 게이트가 거리 측정을 연속 3회 거부하면 트랙을 버리며, 게이트가 거부한 측정의 bearing 은 쓰지 않는다 | 감사 2026-10-01 2번 | T | UT[재획득:]; INSPECT[config.py:"reacquire_margin_px"] | 검증됨 (단위 8개) |
+| EST-17 | 카이제곱 게이트는 기본 R 로 판정하고 신뢰도로 부풀린 R 은 칼만 이득에만 쓴다(RGB-D·bearing·ESP32 위치·속도 네 경로) — 품질이 나쁜 측정일수록 게이트가 넓어지던 결합 제거 | 이전 감사 #26·#59, 신규 16 | T | UT[게이트 분리:] | 검증됨 |
 | EST-05 | 깊이 측정은 유효 화소 수·비율·MAD 한계로 걸러 깊이 절벽을 신뢰도 0 으로 만들고, 큰 ROI 서브샘플 오차는 1 cm 미만이다 | VERIFICATION C4 | T | UT[C4:]; UT[measurement:] | 검증됨 |
 | EST-06 | 검출을 건너뛴 프레임의 측정은 신뢰도를 0.55 배로 깎는다 | reliability.py | T | UT[skip:] | 검증됨 |
 | EST-07 | 검출기는 대상 클래스만 남겨 (conf, area) 순으로 정렬하고 ROI 오프셋을 적용하며 conf/iou/imgsz 를 매 호출 전달한다. 모델에 없는 클래스면 시작 시 경고한다 | detector.py | T | UT[detector:]; UT[검출:] | 검증됨 |
@@ -67,14 +69,14 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 |---|---|---|---|---|---|
 | SAF-01 | FC 모드가 GUIDED/OFFBOARD 가 아니면 모드 변경·LAND 명령을 보내지 않는다(조종사 우선) — 미션 경로와 수동 'l' 키 모두 | VERIFICATION C2 | T | SITL[pilot_takeover]; UT[키 게이트:] | 검증됨 |
 | SAF-02 | 리더를 한 번도 획득하지 않은 상태에서는 LAND 하지 않는다 | VERIFICATION C1 | T | UT[C1:]; SITL[boot_no_leader] | 검증됨 |
-| SAF-03 | 리더 소실 시 호버(LOST_HOLD) 로 버티다 총 10 s(코스트 2 + 홀드 8)에 LAND 하며, 깊이만 죽고 검출이 살아 있는 경우도 같다 | README 안전 설계 | T, I | UT[소실 후 착륙까지]; CL[4초 소실]; CL[영구 소실]; SITL[depth_loss]; INSPECT[mission_manager.py:lost_hold_sec=8.0] | 검증됨 |
+| SAF-03 | 리더 소실 시 호버(LOST_HOLD) 로 버티다 총 10 s(코스트 2 + 홀드 8)에 LAND 하며, 깊이만 죽고 검출이 살아 있는 경우도 같다. 10 s 뒤의 행동은 config `controller.lost_action` (land 기본 · rtl · hold) 로 정하며 셋 다 allow_follow=False 다 | README 안전 설계 | T, I | UT[소실 후 착륙까지]; CL[4초 소실]; CL[영구 소실]; SITL[depth_loss]; INSPECT[mission_manager.py:lost_hold_sec=8.0]; UT[소실 정책:]; INSPECT[config.py:"lost_action"] | 검증됨 |
 | SAF-04 | 절대 고도 없이 공중에서 착륙 판정을 내지 않고, 착륙 판정은 리더 절대 하강 속도로 한다 | VERIFICATION C3 | T | UT[C3:]; UT[미션: 착륙 판정도]; SITL[air_landing] | 검증됨 |
 | SAF-05 | GUIDED 진입 순간 미션·명령·피드포워드 상태를 리셋하고 출발 확인을 다시 요구한다 | README 안전 설계 | T | UT[재개: reset()]; CL[GUIDED 진입 후]; SITL[handover] | 부분 (인계 직후 LAND 없음은 확인. SITL 의 조종사 LOITER 가 RC 스로틀 없이 하강해 인계가 지상에서 일어났음 — 공중 인계는 미검증, sitl/README 6절) |
 | SAF-06 | 고도(home 기준) 1.5 m 아래이거나 고도를 모르면(LOCAL_POSITION_NED 낡음) 하강 명령을 차단한다(fail-closed) | main.py `enforce_agl_floor` | T, I | UT[AGL 바닥]; INSPECT[main.py:MIN_AGL_M = 1.5] | 검증됨 (단위; SITL 저고도 시나리오는 없음) |
 | SAF-07 | 기본값은 dry-run(명령 미송신) 이다 | main.py | I | INSPECT[main.py:SEND_MAVLINK_COMMANDS = False] | 검증됨 |
 | SAF-08 | PX4 의 3-튜플 mode_mapping 에서도 set_mode 가 예외 없이 동작하고 실패해도 루프가 죽지 않는다 | VERIFICATION C6 | T | UT[C6:]; SITL[px4_setmode] | 검증됨 |
 | SAF-09 | 재획득 시 착륙 확인 타이머를 새로 시작한다(가려진 시간 합산 금지) | mission_manager.py | T | UT[타이머:] | 검증됨 |
-| SAF-10 | 카메라·FC 링크가 30 회 연속 실패하면 HOLD 후 종료한다 | main.py | I | UT[카메라 연속 실패] | 부분 (상수 존재만) |
+| SAF-10 | 카메라 프레임이 실패해도 그 프레임의 예측·소실 타이머·미션·setpoint 는 돌고(소실로 취급), 30 회 연속이면 LOST_ACTION 을 한 번 보내고 종료한다. FC 링크 예외는 15 s 시간 기준으로 포기하되 1 s 마다 재연결을 시도하고, heartbeat 가 3 s 넘게 없으면 모드를 '모름' 으로 본다 | 감사 2026-10-01 (이전 #1·#8·#13·#53) | T, I | UT[카메라 실패 프레임:]; UT[카메라 연속 실패]; UT[FC 링크:]; INSPECT[main.py:FC_FAIL_SEC] | 검증됨 (단위·소스 검사; 폐루프 시나리오는 없음) |
 | SAF-11 | 잠깐 놓친 뒤 재획득하면 출발 확인 없이 추종을 재개하되 FAILSAFE_LAND 뒤에는 자동 재개하지 않는다 | VERIFICATION 재획득 | T | UT[재개:]; CL[재검출] | 검증됨 |
 | SAF-12 | 리더 정지 시 FOLLOW↔LEADER_HOVER 히스테리시스(0.18 / 0.25 m/s) 로 정위치를 유지한다 | VERIFICATION H2 | T | UT[H2:]; CL[리더 정지(11s)]; CL[리더 정지 후 소실]; SITL[hover_hold] | 검증됨 |
 | SAF-13 | 공분산 폭주 중에는 LOST_HOLD 이고 회복 첫 프레임에 착륙 명령이 나가지 않는다 | mission_manager.py | T | UT[타이머: 공분산] | 검증됨 |
@@ -82,6 +84,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | SAF-15 | 위 안전 동작이 폐루프 실비행(실제 공력·바람·프롭워시)에서 유지된다 | VERIFICATION 미검증 | D | — | 미검증 |
 | SAF-17 | ATTITUDE 의 yaw 가 yawspeed·Δt 로 설명되지 않게 뛰면(FC EKF yaw 재정렬) 그 프레임의 자세 보상을 건너뛴다 — 기체는 돌지 않았으므로 상대 상태는 그대로 | 감사 2026-10-01 5번 | T | UT[자세 불연속:]; INSPECT[main.py:ATT_YAW_JUMP_RAD] | 검증됨 |
 | SAF-18 | 루프·신선도·setpoint 스케줄·ESP32 age 는 단조 시계(time.monotonic)를 쓴다 — 벽시계 점프가 LAND 나 송신 정지를 만들지 않는다 | 이전 감사 #48·#49 | T, I | UT[단조 시계:] | 검증됨 |
+| SAF-19 | SIGTERM/SIGHUP 에도 종료 경로(finally: 마지막 HOLD·장치 닫기·CSV)가 실행된다 | 이전 감사 #51 | T | UT[종료:] | 검증됨 |
 | SAF-16 | 추정·명령 경로의 비유한 값(NaN/inf)은 '최대 속도' 가 아니라 '정지' 로 귀결된다: 송신부는 0 으로 치환하고, 제어기는 0 명령을 내며, NaN 공분산은 최대 불확실로 취급하고, EKF 는 재초기화 대기로 돌아간다 | 외부 레퍼런스 감사 2026-09-24 (clamp(nan)=hi 재현) | T, I | UT[NaN:]; INSPECT[utils_geometry.py:if x != x]; INSPECT[main.py:비유한 속도 명령] | 검증됨 (단위 6개: 와이어·제어기·공분산 게이트·자세 보정·재초기화) |
 
 ### IF — 인터페이스
@@ -100,6 +103,7 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | IF-10 | 실험 로그는 평탄화된 행으로 기록된다 | logger.py | T | UT[logger:] | 검증됨 |
 | IF-11 | ESP32(ESP-NOW) 송신 펌웨어가 리더 절대 위치·속도를 방송한다 | README 시스템 개요 | D | — | 미검증 (펌웨어 미존재) |
 | IF-12 | ESP32 패킷에 속도가 없으면 속도를 0 으로 꾸미지 않고 '없음' 으로 넘겨 미션은 EKF 속도로, 속도 갱신은 생략한다 | 감사 2026-10-01 9번 | T | UT[ESP32 속도 없음:] | 검증됨 |
+| IF-13 | 컴패니언은 기체와 같은 sysid 와 compid 191(ONBOARD_COMPUTER) 로 송신하고 1 Hz heartbeat 를 보내며, 자기 heartbeat 를 FC 것으로 오인하지 않는다 | 이전 감사 #14·#50 | T | UT[신원:] | 검증됨 (SYSID_ENFORCE=0 전제, README 체크리스트) |
 
 ### OPS — 운용 / 유지
 
@@ -136,7 +140,6 @@ ArduCopter SITL)이고, 분석 층은 [STABILITY_MARGINS.md](STABILITY_MARGINS.m
 | EST-02 | 부분 | 카이제곱 임계 경계값 단위 검사 추가 |
 | EST-10 | 부분 | 실외 역광·강한 빛 조건에서 노출 옵션 실기 확인 |
 | EST-11 | 부분 | Jetson FPS 로그를 저장소에 남기기 |
-| SAF-10 | 부분 | 카메라 스톨 30 회 → HOLD → 종료 폐루프 시나리오 |
 | SAF-15 | 미검증 | 폐루프 실비행(안전줄·저고도부터) |
 | SAF-05 | 부분 | 하네스 조종사 링크에 RC override 를 넣어 LOITER 중 고도를 유지하게 고치고 `handover` 재실행 (sitl/README 6절) |
 | FCR-02 | 확인 필요 | `depth_range` 를 `--duration 60` 이상으로 재실행해 평형 거리 3.63 m 수렴 확인 |

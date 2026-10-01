@@ -590,7 +590,7 @@ def apply_leader_velocity_update_to_imm(ekf, rel_vel_cam, rel, r_vel):
 
     try:
         R = rel.make_R_velocity(r_vel)
-        gate_ok, d2 = rel.gate_velocity3d(ekf, z, R)
+        gate_ok, d2 = rel.gate_velocity3d(ekf, z, rel.R_vel0)     # 게이트는 기본 R, 신뢰도는 이득에만 (main.fuse_vision 참조)
         if gate_ok:
             ekf.update_velocity3d(z, R)
         return bool(gate_ok), d2

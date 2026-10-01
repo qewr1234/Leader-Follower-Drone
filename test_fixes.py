@@ -1491,6 +1491,142 @@ check("단조 시계: 루프·신선도·setpoint 스케줄·ESP32 age 는 time.
       and "rx_time=now" in _ltl and "now = time.monotonic()" in _ltl, f"main={_msrc.count('time.time()')} mio={_mio.count('time.time(')} ltl={_ltl.count('time.time()')}")
 check("단조 시계: 폐루프 검사의 가짜 시계가 monotonic 을 제공한다", "def monotonic" in open("test_closed_loop.py", encoding="utf-8").read())
 
+
+# ================================================================ 다음 단계 5묶음 (2026-10-01 감사 2절 '첫 비행 뒤')
+# A) 소실 정책 lost_action
+import mavlink_io as _mio  # noqa: E402
+_pol_land = MissionManager(lost_action="land"); _pol_hold = MissionManager(lost_action="hold"); _pol_rtl = MissionManager(lost_action="rtl")
+for _m_ in (_pol_land, _pol_hold, _pol_rtl):
+    _t = 0.0
+    for _ in range(12):
+        _m_.update(now=_t, leader_visible=True, rel_vel_est=[0.3, 0, 0], leader_vel_body=[0.3, 0, 0], leader_alt=50.0, pos_cov_trace=1.0); _t += 0.1
+    for _ in range(90):
+        _st_fs, _p_fs = _m_.update(now=_t, leader_visible=False, pos_cov_trace=1.0); _t += 0.1
+    _m_.last_pol = _p_fs; _m_.last_st = _st_fs
+check("소실 정책: lost_action=land(기본) → 소실 8 s 뒤 FAILSAFE_LAND, failsafe='LAND', land=True",
+      _pol_land.last_st == S_FAILSAFE_LAND and _pol_land.last_pol["failsafe"] == "LAND" and _pol_land.last_pol["land"] is True)
+check("소실 정책: hold → 같은 상태지만 FC 에 아무 모드도 보내지 않고(failsafe None) 0 속도 setpoint 만, allow_follow False",
+      _pol_hold.last_pol["failsafe"] is None and _pol_hold.last_pol["land"] is False and _pol_hold.last_pol["allow_follow"] is False
+      and _pol_hold.last_pol["mode"] == "FAILSAFE_HOLD")
+check("소실 정책: rtl → failsafe='RTL', land=False", _pol_rtl.last_pol["failsafe"] == "RTL" and _pol_rtl.last_pol["land"] is False)
+try:
+    MissionManager(lost_action="crash"); _bad_ok = False
+except ValueError:
+    _bad_ok = True
+check("소실 정책: 모르는 값은 시동 시 ValueError (조용히 기본값으로 가지 않음)", _bad_ok)
+check("소실 정책: config controller.lost_action 이 main.LOST_ACTION 으로 미션에 들어간다",
+      main.LOST_ACTION == str(CONFIG["controller"]["lost_action"]).lower() and "MissionManager(lost_action=LOST_ACTION)" in open("main.py", encoding="utf-8").read())
+_pol_cl = MissionManager(lost_action="land")
+check("소실 정책: 다른 상태의 정책에도 failsafe 키가 있다 (WAIT_LEADER → None)", _pol_cl.command_policy()["failsafe"] is None)
+
+
+class _RecMaster:
+    """set_mode / command_long / heartbeat / setpoint 호출을 기록하는 가짜 master."""
+    def __init__(self, modes=("LAND", "RTL", "GUIDED")):
+        self.calls = []; self._modes = modes; self.target_system = 7; self.target_component = 1; self.mav = self
+    def mode_mapping(self): return {m: i for i, m in enumerate(self._modes)}
+    def set_mode(self, name): self.calls.append(("mode", name))
+    def command_long_send(self, *a): self.calls.append(("cmd", a[2]))
+    def heartbeat_send(self, *a): self.calls.append(("hb", a))
+    def set_position_target_local_ned_send(self, *a): self.calls.append(("sp", a[8:11]))
+
+
+_rm = _RecMaster(); main.send_failsafe(_rm, "LAND"); main.send_failsafe(_rm, "RTL"); main.send_failsafe(_rm, None)
+check("소실 정책: send_failsafe — LAND → set_mode LAND, RTL → set_mode RTL, None → 아무것도 안 보냄",
+      _rm.calls == [("mode", "LAND"), ("mode", "RTL")], f"{_rm.calls}")
+_rm2 = _RecMaster(modes=("LAND", "GUIDED")); main.send_failsafe(_rm2, "RTL")
+check("소실 정책: RTL 모드가 없는 FC 면 LAND 로 대체", _rm2.calls == [("mode", "LAND")], f"{_rm2.calls}")
+
+# B) 카메라 실패 프레임·FC 링크·종료
+_msrc2 = open("main.py", encoding="utf-8").read()
+_cam_block = _msrc2.split("frame_ok = color_image is not None")[1].split("# ---------------- IMM predict")[0]
+check("카메라 실패 프레임: continue 없이 루프가 이어진다 — 소실 타이머·미션·setpoint 가 돈다 (예전: continue 로 전부 건너뜀)",
+      not __import__("re").search(r"^\s+continue\s*$", _cam_block, __import__("re").M) and 'fatal = "camera"' in _cam_block and "if not frame_ok:" in _msrc2 and '"camera_fail"' in _msrc2)
+check("카메라 실패 프레임: 치명 종료 시 LOST_ACTION 을 한 번 보낸다 (조종사 탈환 상태면 안 보냄)",
+      'if fatal == "camera" and fc_accepts_setpoints:' in _msrc2 and "send_failsafe(master, act)" in _msrc2)
+_fc_block = _msrc2.split("# ---------------- Pixhawk 수신")[1].split("vehicle_state = get_vehicle_state()")[0]
+check("FC 링크: 예외 스트릭은 시간(FC_FAIL_SEC 15 s)으로 세고 1 s 마다 재연결을 시도한다 (예전: 30회 = 1 ms 뒤 종료, 재연결 없음)",
+      "reconnect_fc(master)" in _fc_block and "FC_FAIL_SEC" in _fc_block and main.FC_FAIL_SEC >= 5.0 and "time.sleep(0.05)" in _fc_block)
+check("FC 링크: heartbeat 가 3 s 넘게 안 오면 모드를 '모름' 으로 — 캐시된 GUIDED 로 LAND 를 보내지 않는다",
+      "mode_fresh = is_fresh(vehicle_state.get(\"mode\", {}), now, HEARTBEAT_MAX_AGE_SEC)" in _msrc2 and _mio.HEARTBEAT_MAX_AGE_SEC == 3.0
+      and main.is_fresh({"name": "GUIDED", "timestamp": 100.0}, 104.0, _mio.HEARTBEAT_MAX_AGE_SEC) is False)
+import signal as _sig  # noqa: E402
+_prev_term = _sig.getsignal(_sig.SIGTERM)
+_installed = main.install_signal_handlers()
+_h = _sig.getsignal(_sig.SIGTERM)
+try:
+    _h(_sig.SIGTERM, None); _raised = False
+except KeyboardInterrupt:
+    _raised = True
+_sig.signal(_sig.SIGTERM, _prev_term)
+check("종료: SIGTERM 핸들러가 KeyboardInterrupt 를 올려 finally(마지막 HOLD·장치 닫기·CSV)가 실행된다", _installed and _raised)
+
+# C) 컴패니언 신원·heartbeat
+_rm3 = _RecMaster(); _mio.adopt_identity(_rm3)
+check("신원: 송신 sysid 는 기체와 같고 compid 는 191(ONBOARD_COMPUTER) — pymavlink 기본 255/0 아님",
+      _rm3.srcSystem == 7 and _rm3.srcComponent == 191 and _mio.COMPANION_COMPONENT_ID == 191)
+check("신원: 1 Hz heartbeat(ONBOARD_CONTROLLER, autopilot INVALID, ACTIVE) 를 보낸다",
+      _mio.send_heartbeat(_rm3) is True and _rm3.calls[-1][0] == "hb" and _rm3.calls[-1][1][0] == 18 and _rm3.calls[-1][1][1] == 8
+      and "send_heartbeat(master)" in _msrc2 and "last_heartbeat_tx" in _msrc2)
+class _NoHB:
+    target_system = 1; mav = None
+check("신원: heartbeat_send 가 없는 스텁(폐루프 FakeFC)에서는 조용히 생략", _mio.send_heartbeat(_NoHB()) is False)
+_hb_msg = type("M", (), {"get_srcSystem": lambda s: 7, "get_srcComponent": lambda s: 191, "type": 18, "autopilot": 8})()
+class _M7:
+    target_system = 7; target_component = 1
+check("신원: 컴패니언 자신의 heartbeat 가 되돌아와도 FC heartbeat 로 오인하지 않는다(ONBOARD 유형 제외)", _mio.is_fc_heartbeat(_M7(), _hb_msg) is False)
+
+# D) 게이트는 기본 R, 신뢰도는 이득에만
+_ekb = ImmEkf(); _ekb.init([0.0, 0.0, 3.0])
+for _ in range(20):
+    _ekb.set_ego_velocity_cam([0.0, 0.0, 0.0]); _ekb.predict(1 / 30); _ekb.update_position3d([0.0, 0.0, 3.0])
+_relb = ReliabilityEstimator()
+_z_off = np3.array([0.9, 0.0, 3.0])                        # 가로 0.9 m 떨어진 측정
+_ok_inflated, _d2_inf = _relb.gate_position3d(_ekb, _z_off, _relb.make_R_rgbd(0.05, 1.0))   # 예전 방식: 신뢰도 0.05 → R 20배
+_ok_base, _d2_base = _relb.gate_position3d(_ekb, _z_off, _relb.R_rgbd0)
+check("게이트 분리: 같은 측정이 신뢰도로 부풀린 R 로는 통과하고 기본 R 로는 거부된다 — 이제 게이트는 기본 R 을 쓴다",
+      _ok_inflated is True and _ok_base is False, f"d2 inflated={_d2_inf:.1f} base={_d2_base:.1f}")
+_x_b0, _ = _ekb.get_state()
+_used_b, _ = main.fuse_vision(_ekb, _relb, {"z": _z_off}, None, 0.05, 1.0, True)
+_x_b1, _ = _ekb.get_state()
+check("게이트 분리: fuse_vision 은 신뢰도가 낮아도 기본 R 게이트로 거부해 상태가 끌리지 않는다 (예전: r 0.05 면 1.56 m 반경까지 수용)",
+      _used_b == "gate_reject_rgbd" and abs(_x_b1[0] - _x_b0[0]) < 1e-9, f"used={_used_b}")
+_ekb2 = ImmEkf(); _ekb2.init([0.0, 0.0, 3.0])
+for _ in range(20):
+    _ekb2.set_ego_velocity_cam([0.0, 0.0, 0.0]); _ekb2.predict(1 / 30); _ekb2.update_position3d([0.0, 0.0, 3.0])
+_used_b2, _ = main.fuse_vision(_ekb2, _relb, {"z": np3.array([0.1, 0.0, 3.0])}, None, 0.05, 1.0, True)
+_x_b2, _ = _ekb2.get_state()
+check("게이트 분리: 게이트 안의 측정은 신뢰도가 낮으면 이득이 작아 조금만 움직인다 (R 은 여전히 갱신에 쓰인다)",
+      _used_b2 == "rgbd" and 0.0 < _x_b2[0] < 0.02, f"x={_x_b2[0]:.4f}")
+_ltl2 = open("leader_telemetry.py", encoding="utf-8").read()
+check("게이트 분리: ESP32 위치·속도, bearing 게이트도 기본 R",
+      "rel.gate_position3d(ekf, z_esp, rel.R_gps0)" in _msrc2 and "rel.gate_velocity3d(ekf, z, rel.R_vel0)" in _ltl2
+      and 'rel.gate_bearing2d(ekf, bearing_meas["z"], rel.R_bearing0)' in _msrc2)
+
+# E) 레벨링과 카메라 마운트
+_v3 = np3.array([0.0, 0.0, 3.0])                                   # 카메라 정면 3 m
+_lv = main.camera_to_level_fru(_v3, 0.0, _math.radians(10.0))      # 기체가 10° 기수 들림(pitch +) → 카메라도 위를 봄 → 리더는 실제로 위
+check("레벨링: 기체 pitch +10°(기수 들림)에서 카메라 정면 3 m 는 수평 프레임에서 앞 2.95 m·위 +0.52 m (예전: 앞 3 m·위 0 → 수직 명령 누락)",
+      abs(_lv[0] - 3 * _math.cos(_math.radians(10))) < 1e-6 and abs(_lv[2] - 3 * _math.sin(_math.radians(10))) < 1e-6, f"{_lv.round(3)}")
+_lv_r = main.camera_to_level_fru(_v3, _math.radians(10.0), 0.0)
+check("레벨링: roll 만으로는 정면 물체의 수평 위치가 변하지 않는다", np3.allclose(_lv_r, [3.0, 0.0, 0.0], atol=1e-9), f"{_lv_r.round(3)}")
+_rt = main.level_fru_to_camera_xyz(main.camera_to_level_fru([0.4, -0.2, 2.5], 0.2, -0.3), 0.2, -0.3)
+check("레벨링: camera_to_level_fru ↔ level_fru_to_camera_xyz 왕복 항등", np3.allclose(_rt, [0.4, -0.2, 2.5], atol=1e-9))
+check("레벨링: roll=pitch=0·마운트 0 이면 예전 순열(camera_xyz_to_fru)과 같다",
+      np3.allclose(main.camera_to_level_fru([0.4, -0.2, 2.5]), main.camera_xyz_to_fru([0.4, -0.2, 2.5])) and np3.allclose(main._CAM_FROM_BODY, main._CAM_PERM))
+check("레벨링: 루프의 제어·미션 입력(rel_fru·rel_vel_fru·리더 속도)과 EKF 자기 속도 입력이 레벨링을 지난다",
+      "rel_fru = camera_to_level_fru(x_est[:3], roll_lvl, pitch_lvl)" in _msrc2 and "level_fru_to_camera_xyz(v_self_fru, roll_lvl, pitch_lvl)" in _msrc2
+      and "camera_to_level_fru(ekf.leader_velocity(), roll_lvl, pitch_lvl)" in _msrc2)
+# 마운트: config 를 바꿔 모듈을 다시 평가하지 않고 수식으로 확인 — mount_pitch −10°(아래로 숙임)이면 C = PERM @ R_mount^T
+_Rm = main.rot_body_to_ned(0.0, _math.radians(-10.0), 0.0)
+_C_m = main._CAM_PERM @ _Rm.T
+_body_from_cam = _C_m.T @ _v3                                       # 카메라 정면 3 m 를 기체 FRD 로
+check("마운트: 아래로 10° 숙여 단 카메라(mount_pitch −10°)의 정면 3 m 는 기체 기준 앞 2.95 m·아래 0.52 m (수식 검증; config 0 이면 순열)",
+      abs(_body_from_cam[0] - 3 * _math.cos(_math.radians(10))) < 1e-6 and abs(_body_from_cam[2] - 3 * _math.sin(_math.radians(10))) < 1e-6
+      and all(k in CONFIG["camera"] for k in ("mount_roll_deg", "mount_pitch_deg", "mount_yaw_deg")), f"{_body_from_cam.round(3)}")
+check("마운트: ego_rotation_cam 이 마운트를 포함한 _CAM_FROM_BODY 로 보상한다",
+      "_CAM_FROM_BODY = _CAM_PERM @ _R_BODY_FROM_MOUNT.T" in _msrc2 and "return _CAM_FROM_BODY @ d_rb @ _CAM_FROM_BODY.T" in _msrc2)
+
 print()
 print(f"{len(failures) and 'FAILED: ' + ', '.join(failures) or '모든 검사 통과'} "
       f"({len(failures)} 실패)")

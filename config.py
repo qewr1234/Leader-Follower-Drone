@@ -38,6 +38,11 @@ CONFIG = {
         "color_backlight_compensation": True,
         # AE 측광 영역을 추적 bbox(1.5배)로 옮긴다(≤1Hz). 하늘 평균이 아니라 리더에 노출을 맞춘다. 소실 시 전체로 복귀.
         "ae_roi_follow_track": True,
+        # 카메라 마운트 자세 [deg] — 기체 FRD 기준 카메라가 어느 쪽으로 기울어 붙었는가 (pitch +: 위를 봄, 아래로 숙여 달면 음수).
+        # 제어·추정이 쓰는 기체 프레임 변환(main._CAM_FROM_BODY)에 들어간다. 0 이면 카메라 축 = 기체 축(순열만).
+        "mount_roll_deg": 0.0,
+        "mount_pitch_deg": 0.0,
+        "mount_yaw_deg": 0.0,
     },
     "measurement": {
         "bbox_inner_ratio": 0.55,
@@ -87,6 +92,10 @@ CONFIG = {
     },
     "controller": {
         "uncertainty_slowdown_trace": 4.0,
+        # 리더 소실 10 s(코스트 2 + 홀드 8) 뒤의 행동: "land"(현 위치 LAND, 기본 — README·SAF-03·SITL depth_loss 로 검증),
+        # "hold"(제자리 유지 + 경보, 외부 팔로워 구현들의 관례 — 착륙은 조종사·FC 배터리 failsafe 에 맡김), "rtl".
+        # 카메라가 죽어 컴패니언이 종료할 때도 같은 행동을 한 번 보낸다(main 의 fatal 경로).
+        "lost_action": "land",
         # 최소 이격: 리더까지의 거리가 이 값 아래로 들어가면 접근 성분을 잘라내고 침범량에 비례해 물러난다.
         # 선회 중 최근접 1.59m 가 관측돼(VERIFICATION.md 「최소 이격 제약 (1단계)」) 목표 3.0m 와 충돌 사이에 바닥을 둔다.
         "min_separation_m": 2.0,

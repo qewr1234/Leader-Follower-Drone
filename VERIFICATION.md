@@ -19,7 +19,7 @@
 소스에서 이유를 찾습니다. C5가 그 사례입니다(아래).
 
 ```bash
-python3 test_fixes.py                        # 단위 207개, 하드웨어 불필요
+python3 test_fixes.py                        # 단위 235개, 하드웨어 불필요
 python3 analysis/stability_margins.py        # 안정성 여유 분석 (docs/STABILITY_MARGINS.md)
 python3 analysis/trace_check.py              # 요구도 추적성 (docs/REQUIREMENTS.md)
 python3 sitl/harness.py --all                # SITL 11개 시나리오 (px4_setmode 는 PX4 필요)
@@ -47,7 +47,7 @@ python3 sitl/harness.py --all --repo <수정전> # 차등 대조군
 
 ## 수정 완료 (2026-09-07)
 
-`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 207개). 하드웨어 없이 순수 로직만 검증합니다.
+`python3 test_fixes.py` — 당시 18개 검사 전부 통과(이후 검사가 늘어 현재 235개). 하드웨어 없이 순수 로직만 검증합니다.
 
 ### C1 — 부팅 즉시 FAILSAFE_LAND
 
@@ -509,9 +509,34 @@ pursuit 0.7 접촉)을 고정합니다. 그 위는 `MAX_V*` 인상 또는 리더
 바뀌지 않은 것: 소실 10 s 뒤 LAND 정책(감사 6번, 운용 결정 필요), 카메라/FC 예외 시 setpoint 송신을 건너뛰는 continue/break 구조,
 heartbeat·sysid, 신뢰도가 게이트를 넓히는 구조, 레벨링. 전부 `docs/AUDIT_2026-10-01.md` 2절 '다음 단계' 에 있습니다.
 
+### 다음 단계 다섯 묶음 (2026-10-01 감사 2절 '첫 비행 뒤', 같은 날 적용)
+
+단위 검사 28개 추가(총 235). 폐루프 setpoint 스트림은 첫 350개가 수정 전과 같고, **35 s 의 LAND 뒤에 0 속도 setpoint 가 계속
+나가는 것**만 다릅니다 — FC 가 setpoint 를 받지 않는 모드에서는 스트림을 끊지 않기로 했기 때문입니다(아래 B, PX4 OFFBOARD 진입 전제).
+골든을 그 스트림으로 갱신했습니다.
+
+- **A. 소실 정책 설정화.** `config.controller.lost_action` = `land`(기본) · `rtl` · `hold`. 미션 정책에 `failsafe`(None | "LAND" | "RTL") 키가
+  생겼고 `main.send_failsafe` 가 보냅니다. 기본값을 바꾸지 않은 이유: LAND 는 README·SAF-03·SITL `depth_loss` 로 검증된 설계이고, `hold`
+  는 FC 배터리 failsafe 가 설정돼 있을 때만 안전합니다(체크리스트). 선택은 운용 결정입니다(`소실 정책:` 7개).
+- **B. 예외 시 송신 유지·재연결·종료.** 카메라 프레임이 실패해도 `continue` 하지 않고 '검출 없음' 프레임으로 예측·소실 타이머·미션·setpoint 가
+  돕니다. FC drain 예외는 15 s 시간 기준(예전 30회 ≈ 1 ms)이며 1 s 마다 `mavlink_io.reconnect_fc` 를 시도합니다. heartbeat 가 3 s 넘게
+  없으면 모드를 '모름' 으로 봅니다. 카메라 사망으로 종료할 때 FC 가 GUIDED 면 `LOST_ACTION` 을 한 번 보냅니다(예전: 무한 호버). SIGTERM/SIGHUP
+  은 KeyboardInterrupt 로 바꿔 finally 가 실행됩니다. 수동 모드에서는 FAILSAFE 래치 중에도 0 속도 스트림을 흘립니다(감사 14번).
+- **C. 신원·heartbeat.** `connect_fc` 가 첫 heartbeat 뒤 송신 신원을 (기체 sysid, compid 191) 로 맞추고, 루프가 1 Hz 로 ONBOARD_CONTROLLER
+  heartbeat 를 보냅니다. `is_fc_heartbeat` 가 ONBOARD 유형을 걸러 자기 heartbeat 를 FC 것으로 보지 않습니다. ArduPilot `SYSID_ENFORCE` 는 0
+  이어야 합니다(README 체크리스트).
+- **D. 게이트와 신뢰도 분리.** RGB-D·bearing·ESP32 위치·속도 네 경로 모두 카이제곱 게이트는 기본 R(`R_rgbd0` 등)로 판정하고, 신뢰도로 부풀린
+  R 은 칼만 이득에만 씁니다. 재현: 가로 0.9 m 떨어진 측정이 신뢰도 0.05 의 R 로는 통과하고 기본 R 로는 거부됩니다.
+- **E. 레벨링·카메라 마운트.** `camera_to_level_fru(x_cam, roll, pitch)` 가 마운트(`camera.mount_*_deg`)와 기체 roll/pitch 를 편 수평 프레임으로
+  상대 위치·속도·리더 속도를 돌려 제어·미션에 넣고, 자기 속도는 역변환으로 EKF 에 들어갑니다. pitch +10° 에서 카메라 정면 3 m 는 수평 프레임에서
+  앞 2.95 m·위 0.52 m 입니다. 마운트 각은 실기에서 재야 하며 지금은 0 입니다. ESP32 상대위치의 카메라 변환은 아직 순열(수평 가정)입니다.
+
+적용하지 않은 것: 하네스 가상 카메라의 roll/pitch 무시(이전 #45), 로그 로테이션, 루프 시간 워치독, 깊이 센서 실외 설정, 최대 추종 거리 —
+`docs/AUDIT_2026-10-01.md` 3절.
+
 ## 요구도 추적성 (2026-09-18)
 
-[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 에 요구도 68개(FCR 17 · EST 16 · SAF 18 · IF 12 · OPS 5)를 ID 로 두고
+[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 에 요구도 72개(FCR 18 · EST 17 · SAF 19 · IF 13 · OPS 5)를 ID 로 두고
 각각을 `test_fixes.py` 검사 이름, `test_closed_loop.py` 검사, SITL 시나리오, 분석 결과 키, 소스 문자열로 묶었습니다.
 `analysis/trace_check.py` 가 참조가 실제로 존재하는지 대조하고(`추적성:` 단위 검사), 폐루프 검사 14개는 전부
 요구도에 연결돼 있습니다. 미충족 1개(EST-12 검출률), 미검증 2개(실비행, ESP32 펌웨어), 부분 7개(SAF-05 공중 인계 미검증, SAF-06/SAF-10 시나리오 부재, FCR-07·EST-02 단위 검사 부족, EST-10/11 실기 자료 부재)가 표 3절에

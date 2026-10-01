@@ -30,6 +30,15 @@ _POLICY = {
 }
 _POLICY_UNKNOWN = {"mode": "HOLD", "allow_follow": False, "land": False}
 
+# 소실 10 s 뒤의 행동 (config controller.lost_action). "land" 가 기본값이고 README·SAF-03·SITL depth_loss 로 검증된 설계다.
+# 외부 팔로워 구현(AP_Follow, PX4 follow-me 등)은 소실 시 제자리 유지가 관례라 "hold" 를 고를 수 있고, RTL 도 가능하다.
+# 셋 다 allow_follow=False 이며, 차이는 FC 에 보내는 모드 변경이다: land → LAND, rtl → RTL, hold → 아무것도 안 보냄(0 속도 setpoint).
+_LOST_ACTIONS = {
+    "land": {"mode": "FAILSAFE_LAND", "allow_follow": False, "land": True,  "failsafe": "LAND"},
+    "rtl":  {"mode": "FAILSAFE_RTL",  "allow_follow": False, "land": False, "failsafe": "RTL"},
+    "hold": {"mode": "FAILSAFE_HOLD", "allow_follow": False, "land": False, "failsafe": None},
+}
+
 
 class MissionManager:
     def __init__(
@@ -42,7 +51,11 @@ class MissionManager:
         landing_hspeed_thresh=0.25,
         landing_confirm_sec=1.8,
         lost_hold_sec=8.0,   # + imm.range_coast_max_sec(2.0) = 소실 후 총 10초에 착륙
+        lost_action="land",  # "land" | "rtl" | "hold" — 소실 10초 뒤 FC 에 보내는 것 (_LOST_ACTIONS)
     ):
+        if str(lost_action).lower() not in _LOST_ACTIONS:
+            raise ValueError(f"lost_action must be one of {sorted(_LOST_ACTIONS)}, got {lost_action!r}")
+        self.lost_action = str(lost_action).lower()
         self.start_speed_thresh = float(start_speed_thresh)
         self.start_confirm_sec = float(start_confirm_sec)
         self.hover_speed_thresh = float(hover_speed_thresh)
@@ -144,7 +157,13 @@ class MissionManager:
         return self._go(S_READY_HOVER)
 
     def command_policy(self):
-        return dict(_POLICY.get(self.state, _POLICY_UNKNOWN))
+        """상태별 정책 dict. 키: mode, allow_follow, land(LAND 를 보낼 것인가), failsafe(None | "LAND" | "RTL" — 소실·착륙 확정 시
+        FC 에 보낼 모드). FAILSAFE_LAND 상태의 내용은 lost_action 에 따라 다르다."""
+        if self.state == S_FAILSAFE_LAND:
+            return dict(_LOST_ACTIONS[self.lost_action])
+        pol = dict(_POLICY.get(self.state, _POLICY_UNKNOWN))
+        pol["failsafe"] = "LAND" if pol["land"] else None
+        return pol
 
     def _extract_motion(self, rel_vel_est, leader_alt, leader_vel_world, leader_vel_body=None):
         """(수평 속도, 수직 속도(up +), 착륙 판정용 고도). 속도 소스 우선순위: ESP32 절대(ENU) > EKF 상태 절대 속도(FRU) > 상대.
